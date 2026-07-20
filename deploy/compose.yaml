@@ -1,0 +1,51 @@
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      GRAPHWAR_BIND: 0.0.0.0:8080
+      DATABASE_URL: postgres://graphwar:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/graphwar
+      PUBLIC_ORIGIN: https://${DOMAIN:?set DOMAIN}
+      SESSION_TTL_DAYS: 30
+      RUST_LOG: graphwar_server=info,tower_http=info
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: graphwar
+      POSTGRES_USER: graphwar
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U graphwar -d graphwar"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.10-alpine
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  caddy-data:
+  caddy-config:
