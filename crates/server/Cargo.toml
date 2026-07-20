@@ -11,17 +11,24 @@ argon2.workspace = true
 axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
+cookie.workspace = true
 futures-util.workspace = true
 graphwar-game-core = { path = "../game-core" }
 graphwar-protocol = { path = "../protocol" }
 http.workspace = true
+password-hash.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+url.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
