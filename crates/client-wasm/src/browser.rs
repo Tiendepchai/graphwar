@@ -1,26 +1,56 @@
 use std::{cell::RefCell, rc::Rc};
 
-use gloo_timers::callback::Timeout;
+use gloo_net::http::Request;
+use gloo_timers::callback::{Interval, Timeout};
+use graphwar_protocol::{
+    AccountResponse, ClientMessage, GameMode, LoginRequest, PROTOCOL_VERSION, RegisterRequest,
+    RoomVisibility, ServerMessage,
+};
+use uuid::Uuid;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
+use wasm_bindgen_futures::spawn_local;
 use web_sys::{
-    CanvasRenderingContext2d, CloseEvent, Document, ErrorEvent, Event, HtmlCanvasElement,
-    HtmlFormElement, HtmlInputElement, MessageEvent, WebSocket, Window,
+    AbortController, CanvasRenderingContext2d, CloseEvent, Document, ErrorEvent, Event,
+    HtmlCanvasElement, HtmlFormElement, HtmlInputElement, HtmlSelectElement, MessageEvent,
+    RequestCredentials, WebSocket, Window,
 };
 
 use crate::{
+    animation::visible_points,
     geometry::{LOGICAL_HEIGHT, LOGICAL_WIDTH, Viewport},
-    state::{Action, ClientMessage, Connection, Model, Screen, ServerMessage, reduce},
+    preview::trace_preview,
+    state::{Action, Connection, Model, Screen, apply_pending_game, reduce},
 };
 
 struct App {
     window: Window,
     document: Document,
     model: Model,
-    player_name: String,
     socket: Option<WebSocket>,
+    socket_handlers: Option<SocketHandlers>,
+    connection_epoch: u64,
+    auth_epoch: u64,
+    auth_pending: bool,
+    auth_request: Option<AbortController>,
+    event_handlers: Vec<Closure<dyn FnMut(Event)>>,
+    pending_messages: Vec<ClientMessage>,
     reconnect_attempt: u32,
     reconnect_timer: Option<Timeout>,
+    clock: Option<Interval>,
+    shot_animation: Option<ShotAnimation>,
     ws_url: String,
+}
+
+struct SocketHandlers {
+    _onopen: Closure<dyn FnMut(Event)>,
+    _onmessage: Closure<dyn FnMut(MessageEvent)>,
+    _onclose: Closure<dyn FnMut(CloseEvent)>,
+    _onerror: Closure<dyn FnMut(ErrorEvent)>,
+}
+
+struct ShotAnimation {
+    sequence: u64,
+    started_at: f64,
 }
 
 type SharedApp = Rc<RefCell<App>>;
@@ -35,17 +65,54 @@ pub fn start() -> Result<(), JsValue> {
         window,
         document,
         model: Model::default(),
-        player_name: String::new(),
         socket: None,
+        socket_handlers: None,
+        connection_epoch: 0,
+        auth_epoch: 0,
+        auth_pending: false,
+        auth_request: None,
+        event_handlers: Vec::new(),
+        pending_messages: Vec::new(),
         reconnect_attempt: 0,
         reconnect_timer: None,
+        clock: None,
+        shot_animation: None,
         ws_url,
     }));
 
     render(&app)?;
     bind_events(&app)?;
-    connect(&app)?;
+    let clock_app = Rc::clone(&app);
+    app.borrow_mut().clock = Some(Interval::new(1_000, move || update_timer(&clock_app)));
+    restore_session(&app);
     Ok(())
+}
+
+fn restore_session(app: &SharedApp) {
+    let Some((auth_epoch, controller)) = begin_authentication(app) else {
+        return;
+    };
+    let app = Rc::clone(app);
+    spawn_local(async move {
+        let request = Request::get("/auth/me")
+            .credentials(RequestCredentials::SameOrigin)
+            .abort_signal(Some(&controller.signal()));
+        match request.send().await {
+            Ok(response) if response.ok() => match response.json::<AccountResponse>().await {
+                Ok(account) => authenticated(&app, auth_epoch, account),
+                Err(error) if finish_authentication_failure(&app, auth_epoch) => {
+                    log_error(&format!("account response failed: {error:?}"));
+                }
+                Err(_) => {}
+            },
+            Ok(_) if finish_authentication_failure(&app, auth_epoch) => rerender(&app),
+            Ok(_) => {}
+            Err(error) if finish_authentication_failure(&app, auth_epoch) => {
+                log_error(&format!("session restore failed: {error:?}"));
+            }
+            Err(_) => {}
+        }
+    });
 }
 
 fn websocket_url(window: &Window) -> Result<String, JsValue> {
@@ -58,89 +125,260 @@ fn websocket_url(window: &Window) -> Result<String, JsValue> {
     Ok(format!("{protocol}://{}/ws", location.host()?))
 }
 
+fn begin_authentication(app: &SharedApp) -> Option<(u64, AbortController)> {
+    let controller = AbortController::new().ok()?;
+    let (auth_epoch, socket, handlers) = {
+        let mut app = app.borrow_mut();
+        if app.auth_pending {
+            return None;
+        }
+        app.auth_epoch = app.auth_epoch.saturating_add(1);
+        app.auth_pending = true;
+        app.auth_request = Some(controller.clone());
+        app.connection_epoch = app.connection_epoch.saturating_add(1);
+        app.reconnect_timer = None;
+        app.pending_messages.clear();
+        (
+            app.auth_epoch,
+            app.socket.take(),
+            app.socket_handlers.take(),
+        )
+    };
+    if let Some(socket) = socket {
+        dispose_socket(socket, handlers);
+    }
+    Some((auth_epoch, controller))
+}
+
+fn finish_authentication_failure(app: &SharedApp, auth_epoch: u64) -> bool {
+    let mut app = app.borrow_mut();
+    if app.auth_epoch != auth_epoch || !app.auth_pending {
+        return false;
+    }
+    app.auth_pending = false;
+    app.auth_request = None;
+    true
+}
+
+fn connection_is_current(app: &App, connection_epoch: u64, auth_epoch: u64) -> bool {
+    app.connection_epoch == connection_epoch
+        && app.auth_epoch == auth_epoch
+        && !app.auth_pending
+        && app.model.player_id.is_some()
+}
+
+fn dispose_socket(socket: WebSocket, handlers: Option<SocketHandlers>) {
+    socket.set_onopen(None);
+    socket.set_onmessage(None);
+    socket.set_onclose(None);
+    socket.set_onerror(None);
+    drop(handlers);
+    let _ = socket.close();
+}
+
 fn connect(app: &SharedApp) -> Result<(), JsValue> {
-    reduce(&mut app.borrow_mut().model, Action::Connecting);
+    let (ws_url, connection_epoch, auth_epoch, previous_socket, previous_handlers) = {
+        let mut app = app.borrow_mut();
+        if app.model.player_id.is_none() || app.auth_pending {
+            return Ok(());
+        }
+        app.connection_epoch = app.connection_epoch.saturating_add(1);
+        app.reconnect_timer = None;
+        let previous_socket = app.socket.take();
+        let previous_handlers = app.socket_handlers.take();
+        reduce(&mut app.model, Action::Connecting);
+        (
+            app.ws_url.clone(),
+            app.connection_epoch,
+            app.auth_epoch,
+            previous_socket,
+            previous_handlers,
+        )
+    };
+    if let Some(socket) = previous_socket {
+        dispose_socket(socket, previous_handlers);
+    }
     rerender(app);
-    let socket = WebSocket::new(&app.borrow().ws_url)?;
+    let socket = match WebSocket::new(&ws_url) {
+        Ok(socket) => socket,
+        Err(error) => {
+            let mut app_ref = app.borrow_mut();
+            let current =
+                app_ref.connection_epoch == connection_epoch && app_ref.auth_epoch == auth_epoch;
+            if current {
+                reduce(&mut app_ref.model, Action::GiveUp);
+            }
+            drop(app_ref);
+            if current {
+                rerender(app);
+            }
+            return Err(error);
+        }
+    };
 
     let open_app = Rc::clone(app);
     let onopen = Closure::<dyn FnMut(Event)>::new(move |_| {
-        let mut app = open_app.borrow_mut();
-        app.reconnect_attempt = 0;
-        reduce(&mut app.model, Action::Connected);
-        let name = app.player_name.trim().to_owned();
-        drop(app);
-        if !name.is_empty() {
-            send(&open_app, ClientMessage::Login { name });
+        if !connection_is_current(&open_app.borrow(), connection_epoch, auth_epoch) {
+            return;
+        }
+        let pending = {
+            let mut app = open_app.borrow_mut();
+            app.reconnect_attempt = 0;
+            app.reconnect_timer = None;
+            reduce(&mut app.model, Action::Connected);
+            std::mem::take(&mut app.pending_messages)
+        };
+        send_current(
+            &open_app,
+            connection_epoch,
+            auth_epoch,
+            ClientMessage::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        );
+        send_current(
+            &open_app,
+            connection_epoch,
+            auth_epoch,
+            ClientMessage::ListRooms,
+        );
+        for message in pending {
+            send_current(&open_app, connection_epoch, auth_epoch, message);
         }
         rerender(&open_app);
     });
     socket.set_onopen(Some(onopen.as_ref().unchecked_ref()));
-    onopen.forget();
 
     let message_app = Rc::clone(app);
     let onmessage = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+        if !connection_is_current(&message_app.borrow(), connection_epoch, auth_epoch) {
+            return;
+        }
         let Some(text) = event.data().as_string() else {
             return;
         };
         match serde_json::from_str::<ServerMessage>(&text) {
             Ok(message) => {
+                let prior_sequence = message_app.borrow().model.shot_sequence;
                 reduce(
                     &mut message_app.borrow_mut().model,
-                    Action::Message(message),
+                    Action::Message(Box::new(message)),
                 );
+                let sequence = message_app.borrow().model.shot_sequence;
+                if sequence != prior_sequence {
+                    start_shot_animation(&message_app, sequence);
+                }
                 rerender(&message_app);
             }
             Err(error) => log_error(&format!("protocol error: {error}")),
         }
     });
     socket.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
-    onmessage.forget();
 
     let close_app = Rc::clone(app);
     let onclose = Closure::<dyn FnMut(CloseEvent)>::new(move |_| {
-        schedule_reconnect(&close_app);
+        schedule_reconnect(&close_app, connection_epoch, auth_epoch);
     });
     socket.set_onclose(Some(onclose.as_ref().unchecked_ref()));
-    onclose.forget();
 
+    let error_app = Rc::clone(app);
     let onerror = Closure::<dyn FnMut(ErrorEvent)>::new(move |event: ErrorEvent| {
-        log_error(&format!("WebSocket error: {}", event.message()));
+        if connection_is_current(&error_app.borrow(), connection_epoch, auth_epoch) {
+            log_error(&format!("WebSocket error: {}", event.message()));
+        }
     });
     socket.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-    onerror.forget();
 
-    app.borrow_mut().socket = Some(socket);
+    let mut app_ref = app.borrow_mut();
+    if !connection_is_current(&app_ref, connection_epoch, auth_epoch) {
+        drop(app_ref);
+        dispose_socket(socket, None);
+        return Ok(());
+    }
+    app_ref.socket = Some(socket);
+    app_ref.socket_handlers = Some(SocketHandlers {
+        _onopen: onopen,
+        _onmessage: onmessage,
+        _onclose: onclose,
+        _onerror: onerror,
+    });
     Ok(())
 }
 
-fn schedule_reconnect(app: &SharedApp) {
-    let attempt = app.borrow().reconnect_attempt.saturating_add(1).min(10);
-    {
+fn schedule_reconnect(app: &SharedApp, connection_epoch: u64, auth_epoch: u64) {
+    let (attempt, timer_epoch) = {
         let mut app = app.borrow_mut();
+        if !connection_is_current(&app, connection_epoch, auth_epoch) {
+            return;
+        }
         app.socket = None;
+        app.socket_handlers = None;
+        app.connection_epoch = app.connection_epoch.saturating_add(1);
+        let timer_epoch = app.connection_epoch;
+        let attempt = app.reconnect_attempt.saturating_add(1);
         app.reconnect_attempt = attempt;
-        reduce(&mut app.model, Action::Disconnected { attempt });
-    }
+        if attempt > 10 {
+            reduce(&mut app.model, Action::GiveUp);
+        } else {
+            reduce(&mut app.model, Action::Disconnected { attempt });
+        }
+        (attempt, timer_epoch)
+    };
     rerender(app);
+    if attempt > 10 {
+        return;
+    }
 
     let delay_ms = 500_u32.saturating_mul(2_u32.saturating_pow(attempt.min(5)));
     let reconnect_app = Rc::clone(app);
     let timer = Timeout::new(delay_ms, move || {
+        if !connection_is_current(&reconnect_app.borrow(), timer_epoch, auth_epoch) {
+            return;
+        }
         if let Err(error) = connect(&reconnect_app) {
             log_error(&format!("reconnect failed: {error:?}"));
-            schedule_reconnect(&reconnect_app);
+            let (connection_epoch, auth_epoch) = {
+                let app = reconnect_app.borrow();
+                (app.connection_epoch, app.auth_epoch)
+            };
+            schedule_reconnect(&reconnect_app, connection_epoch, auth_epoch);
         }
     });
-    app.borrow_mut().reconnect_timer = Some(timer);
+    let mut app = app.borrow_mut();
+    if connection_is_current(&app, timer_epoch, auth_epoch) {
+        app.reconnect_timer = Some(timer);
+    }
 }
 
 fn send(app: &SharedApp, message: ClientMessage) {
+    let (connection_epoch, auth_epoch, queue) = {
+        let app = app.borrow();
+        (
+            app.connection_epoch,
+            app.auth_epoch,
+            !matches!(app.model.connection, Connection::Online)
+                || app
+                    .socket
+                    .as_ref()
+                    .is_none_or(|socket| socket.ready_state() != WebSocket::OPEN),
+        )
+    };
+    if queue {
+        app.borrow_mut().pending_messages.push(message);
+        return;
+    }
+    send_current(app, connection_epoch, auth_epoch, message);
+}
+
+fn send_current(app: &SharedApp, connection_epoch: u64, auth_epoch: u64, message: ClientMessage) {
     let result = serde_json::to_string(&message)
         .map_err(|error| JsValue::from_str(&error.to_string()))
         .and_then(|json| {
-            app.borrow()
-                .socket
+            let app = app.borrow();
+            if !connection_is_current(&app, connection_epoch, auth_epoch) {
+                return Err(JsValue::from_str("connection unavailable"));
+            }
+            app.socket
                 .as_ref()
                 .ok_or_else(|| JsValue::from_str("connection unavailable"))?
                 .send_with_str(&json)
@@ -150,9 +388,158 @@ fn send(app: &SharedApp, message: ClientMessage) {
     }
 }
 
+fn login(app: &SharedApp, request: LoginRequest) {
+    let Some((auth_epoch, controller)) = begin_authentication(app) else {
+        return;
+    };
+    rerender(app);
+    let app = Rc::clone(app);
+    spawn_local(async move {
+        match post_json("/auth/login", &request, &controller).await {
+            Ok(account) => authenticated(&app, auth_epoch, account),
+            Err(message) if finish_authentication_failure(&app, auth_epoch) => {
+                notice(&app, message)
+            }
+            Err(_) => {}
+        }
+    });
+}
+
+fn register(app: &SharedApp, request: RegisterRequest) {
+    let Some((auth_epoch, controller)) = begin_authentication(app) else {
+        return;
+    };
+    rerender(app);
+    let app = Rc::clone(app);
+    spawn_local(async move {
+        match post_json("/auth/register", &request, &controller).await {
+            Ok(account) => {
+                let login = LoginRequest {
+                    email: account.email,
+                    password: request.password,
+                };
+                match post_json("/auth/login", &login, &controller).await {
+                    Ok(account) => authenticated(&app, auth_epoch, account),
+                    Err(message) if finish_authentication_failure(&app, auth_epoch) => {
+                        notice(&app, message)
+                    }
+                    Err(_) => {}
+                }
+            }
+            Err(message) if finish_authentication_failure(&app, auth_epoch) => {
+                notice(&app, message)
+            }
+            Err(_) => {}
+        }
+    });
+}
+
+fn authenticated(app: &SharedApp, auth_epoch: u64, account: AccountResponse) {
+    {
+        let mut app_ref = app.borrow_mut();
+        if app_ref.auth_epoch != auth_epoch || !app_ref.auth_pending {
+            return;
+        }
+        app_ref.auth_pending = false;
+        app_ref.auth_request = None;
+        reduce(
+            &mut app_ref.model,
+            Action::Authenticated {
+                player_id: account.id.to_string(),
+                display_name: account.display_name,
+            },
+        );
+    }
+    rerender(app);
+    if let Err(error) = connect(app) {
+        notice(app, format!("connection failed: {error:?}"));
+    }
+}
+
+fn logout(app: &SharedApp) {
+    let (auth_epoch, request, socket, handlers) = {
+        let mut app_ref = app.borrow_mut();
+        app_ref.auth_epoch = app_ref.auth_epoch.saturating_add(1);
+        app_ref.auth_pending = false;
+        app_ref.connection_epoch = app_ref.connection_epoch.saturating_add(1);
+        app_ref.reconnect_timer = None;
+        app_ref.pending_messages.clear();
+        let request = app_ref.auth_request.take();
+        let socket = app_ref.socket.take();
+        let handlers = app_ref.socket_handlers.take();
+        reduce(&mut app_ref.model, Action::LoggedOut);
+        (app_ref.auth_epoch, request, socket, handlers)
+    };
+    if let Some(request) = request {
+        request.abort();
+    }
+    if let Some(socket) = socket {
+        dispose_socket(socket, handlers);
+    }
+    rerender(app);
+    let app = Rc::clone(app);
+    spawn_local(async move {
+        let result = Request::post("/auth/logout")
+            .credentials(RequestCredentials::SameOrigin)
+            .send()
+            .await;
+        if app.borrow().auth_epoch != auth_epoch {
+            return;
+        }
+        match result {
+            Ok(response) if response.ok() => {}
+            Ok(_) => notice(&app, "logout failed".into()),
+            Err(error) => notice(&app, format!("logout failed: {error:?}")),
+        }
+    });
+}
+
+async fn post_json<T: serde::Serialize>(
+    path: &str,
+    body: &T,
+    controller: &AbortController,
+) -> Result<AccountResponse, String> {
+    let body = serde_json::to_string(body).map_err(|error| error.to_string())?;
+    let response = Request::post(path)
+        .credentials(RequestCredentials::SameOrigin)
+        .abort_signal(Some(&controller.signal()))
+        .header("content-type", "application/json")
+        .body(body)
+        .map_err(|error| format!("request setup failed: {error:?}"))?
+        .send()
+        .await
+        .map_err(|error| format!("request failed: {error:?}"))?;
+    if !response.ok() {
+        return Err(response
+            .text()
+            .await
+            .unwrap_or_else(|_| "authentication failed".into()));
+    }
+    response
+        .json()
+        .await
+        .map_err(|error| format!("invalid account response: {error:?}"))
+}
+
+fn notice(app: &SharedApp, message: String) {
+    {
+        let mut app = app.borrow_mut();
+        app.model.notices.push(message);
+        if app.model.notices.len() > 40 {
+            app.model.notices.remove(0);
+        }
+    }
+    rerender(app);
+}
+
 fn rerender(app: &SharedApp) {
-    if let Err(error) = render(app).and_then(|()| bind_events(app)) {
+    if let Err(error) = render(app) {
         log_error(&format!("render failed: {error:?}"));
+        return;
+    }
+    app.borrow_mut().event_handlers.clear();
+    if let Err(error) = bind_events(app) {
+        log_error(&format!("event binding failed: {error:?}"));
     }
 }
 
@@ -182,6 +569,11 @@ fn render(app: &SharedApp) -> Result<(), JsValue> {
 }
 
 fn header_html(model: &Model) -> String {
+    let account_action = model
+        .player_id
+        .as_ref()
+        .map(|_| "<button id=\"logout\" class=\"text-button\" type=\"button\">Log out</button>")
+        .unwrap_or("");
     let (class, label) = match model.connection {
         Connection::Connecting => ("is-waiting", "Connecting".into()),
         Connection::Online => ("is-online", "Online".into()),
@@ -190,14 +582,17 @@ fn header_html(model: &Model) -> String {
         }
         Connection::Offline => ("is-offline", "Offline".into()),
     };
+    let retry = matches!(model.connection, Connection::Offline)
+        .then_some("<button id=\"reconnect-now\" class=\"text-button\">Reconnect</button>")
+        .unwrap_or("");
     format!(
-        "<header class=\"masthead\"><a class=\"wordmark\" href=\"/\" aria-label=\"Graphwar home\"><span>GRAPH</span><strong>WAR</strong></a><p class=\"connection {class}\" role=\"status\"><i></i>{}</p></header>",
+        "<header class=\"masthead\"><a class=\"wordmark\" href=\"/\" aria-label=\"Graphwar home\"><span>GRAPH</span><strong>WAR</strong></a><div><p class=\"connection {class}\" role=\"status\"><i></i>{}</p>{retry}{account_action}</div></header>",
         escape(&label)
     )
 }
 
 fn login_html() -> String {
-    "<section class=\"login-shell reveal\" aria-labelledby=\"login-title\"><div class=\"hero-copy\"><p class=\"eyebrow\">Artillery for mathematicians</p><h1 id=\"login-title\">Draw the<br><em>winning line.</em></h1><p>Turn equations into trajectories. Outsmart the other side before the clock runs dry.</p></div><form id=\"login-form\" class=\"paper-card\"><label for=\"player-name\">Call sign</label><input id=\"player-name\" name=\"name\" autocomplete=\"nickname\" minlength=\"2\" maxlength=\"24\" required placeholder=\"e.g. Gauss\"><button class=\"primary\" type=\"submit\">Enter the lobby <span aria-hidden=\"true\">↗</span></button><small>No download. Keyboard friendly. Mildly competitive.</small></form></section>".into()
+    "<section class=\"login-shell reveal\" aria-labelledby=\"login-title\"><div class=\"hero-copy\"><p class=\"eyebrow\">Artillery for mathematicians</p><h1 id=\"login-title\">Draw the<br><em>winning line.</em></h1><p>Turn equations into trajectories. Outsmart the other side before the clock runs dry.</p></div><div class=\"auth-stack\"><form id=\"login-form\" class=\"paper-card\"><h2>Return to battle</h2><label for=\"login-email\">Email</label><input id=\"login-email\" type=\"email\" autocomplete=\"email\" maxlength=\"254\" required><label for=\"login-password\">Password</label><input id=\"login-password\" type=\"password\" autocomplete=\"current-password\" minlength=\"12\" required><button class=\"primary\" type=\"submit\">Enter the lobby <span aria-hidden=\"true\">↗</span></button></form><form id=\"register-form\" class=\"paper-card\"><h2>First deployment</h2><label for=\"register-name\">Display name</label><input id=\"register-name\" autocomplete=\"nickname\" minlength=\"2\" maxlength=\"32\" required placeholder=\"e.g. Gauss\"><label for=\"register-email\">Email</label><input id=\"register-email\" type=\"email\" autocomplete=\"email\" maxlength=\"254\" required><label for=\"register-password\">Password</label><input id=\"register-password\" type=\"password\" autocomplete=\"new-password\" minlength=\"12\" required><button class=\"secondary\" type=\"submit\">Create account</button><small>Passwords need at least 12 characters.</small></form></div></section>".into()
 }
 
 fn lobby_html(model: &Model) -> String {
@@ -214,33 +609,144 @@ fn lobby_html(model: &Model) -> String {
             .collect::<String>()
     };
     format!(
-        "<section class=\"lobby-shell reveal\" aria-labelledby=\"lobby-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Welcome, {}</p><h1 id=\"lobby-title\">Open rooms</h1></div><form id=\"create-room-form\" class=\"inline-form\"><label class=\"sr-only\" for=\"room-name\">New room name</label><input id=\"room-name\" maxlength=\"32\" required placeholder=\"Room name\"><button class=\"primary\" type=\"submit\">Create room</button></form></div><ul class=\"room-list\">{rooms}</ul></section>",
+        "<section class=\"lobby-shell reveal\" aria-labelledby=\"lobby-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Welcome, {}</p><h1 id=\"lobby-title\">Open rooms</h1></div><div class=\"lobby-actions\"><form id=\"create-room-form\" class=\"inline-form\"><label class=\"sr-only\" for=\"room-name\">New room name</label><input id=\"room-name\" maxlength=\"32\" required placeholder=\"Room name\"><select id=\"room-visibility\" aria-label=\"Room visibility\"><option value=\"public\">Public</option><option value=\"private\">Private</option></select><button class=\"primary\" type=\"submit\">Create room</button></form><form id=\"invite-room-form\" class=\"inline-form\"><label class=\"sr-only\" for=\"private-room-id\">Private room ID</label><input id=\"private-room-id\" required placeholder=\"Room ID\"><label class=\"sr-only\" for=\"invite-code\">Private invite code</label><input id=\"invite-code\" required placeholder=\"Invite code\"><button class=\"secondary\" type=\"submit\">Join private</button></form></div></div><ul class=\"room-list\">{rooms}</ul></section>",
         escape(&model.player_name)
     )
 }
 
 fn room_html(model: &Model) -> String {
+    let ready_label = if model.local_ready() {
+        "Not ready"
+    } else {
+        "I’m ready"
+    };
+    let start_disabled = (!model.can_start()).then_some(" disabled").unwrap_or("");
+    let owner_controls = model.local_owner();
+    let mode = model.game_mode.unwrap_or(GameMode::Function);
+    let mode_checked = |candidate| (mode == candidate).then_some(" checked").unwrap_or("");
     let players = model
         .players
         .iter()
-        .map(|player| format!(
-            "<li><span class=\"team team-{}\" aria-hidden=\"true\"></span><strong>{}</strong><span class=\"ready-state\">{}</span></li>",
-            player.team,
-            escape(&player.name),
-            if player.ready { "Ready" } else { "Plotting" }
-        ))
+        .map(|player| {
+            let local = model.player_id.as_deref() == Some(player.id.as_str());
+            let editable = local || (owner_controls && player.is_bot);
+            let controls = editable
+                .then(|| {
+                    format!(
+                        "<div class=\"slot-controls\"><label>Team <select class=\"player-team\" data-player-id=\"{}\"><option value=\"1\"{}>One</option><option value=\"2\"{}>Two</option></select></label><label>Soldiers <select class=\"player-soldiers\" data-player-id=\"{}\">{}</select></label>{}</div>",
+                        attr(&player.id),
+                        (player.team == 1).then_some(" selected").unwrap_or(""),
+                        (player.team == 2).then_some(" selected").unwrap_or(""),
+                        attr(&player.id),
+                        (1..=4)
+                            .map(|count| format!(
+                                "<option value=\"{count}\"{}>{count}</option>",
+                                (player.soldiers == count).then_some(" selected").unwrap_or("")
+                            ))
+                            .collect::<String>(),
+                        player
+                            .is_bot
+                            .then(|| format!(
+                                "<button class=\"remove-bot text-button\" data-player-id=\"{}\">Remove</button>",
+                                attr(&player.id)
+                            ))
+                            .unwrap_or_default()
+                    )
+                })
+                .unwrap_or_default();
+            format!(
+                "<li><span class=\"team team-{}\" aria-hidden=\"true\"></span><strong>{}</strong>{}<span class=\"ready-state\">{}</span>{}</li>",
+                player.team,
+                escape(&player.name),
+                if player.owner { "<small>Owner</small>" } else if player.is_bot { "<small>Computer</small>" } else { "" },
+                if player.ready { "Ready" } else { "Plotting" },
+                controls
+            )
+        })
         .collect::<String>();
     format!(
-        "<section class=\"room-shell reveal\" aria-labelledby=\"room-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Staging area</p><h1 id=\"room-title\">{}</h1></div><button id=\"leave-room\" class=\"text-button\">Leave room</button></div><div class=\"room-grid\"><section class=\"paper-card roster\" aria-labelledby=\"players-title\"><h2 id=\"players-title\">Players <span>{}</span></h2><ul>{players}</ul></section><aside class=\"briefing\"><p>Choose your side. Ready up. The match begins when everyone commits.</p><button id=\"ready-button\" class=\"primary wide\">I’m ready</button></aside></div></section>",
+        "<section class=\"room-shell reveal\" aria-labelledby=\"room-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Staging area</p><h1 id=\"room-title\">{}</h1></div><button id=\"leave-room\" class=\"text-button\">Leave room</button></div><div class=\"room-grid\"><section class=\"paper-card roster\" aria-labelledby=\"players-title\"><h2 id=\"players-title\">Players <span>{}</span></h2><ul>{players}</ul></section><aside class=\"briefing\"><p>Configure your slot, then ready up. The owner starts after everyone commits.</p><fieldset class=\"mode-picker\"{}><legend>Rule set</legend><label><input type=\"radio\" name=\"game-mode\" value=\"function\"{}> Function</label><label><input type=\"radio\" name=\"game-mode\" value=\"first_order\"{}> First-order</label><label><input type=\"radio\" name=\"game-mode\" value=\"second_order\"{}> Second-order</label></fieldset><button id=\"ready-button\" class=\"primary wide\">{ready_label}</button><button id=\"add-bot\" class=\"text-button wide\"{}>Add computer</button><button id=\"start-game\" class=\"secondary wide\"{}>Start match</button></aside></div>{}</section>",
         escape(&model.room_name),
-        model.players.len()
+        model.players.len(),
+        if owner_controls { "" } else { " disabled" },
+        mode_checked(GameMode::Function),
+        mode_checked(GameMode::FirstOrder),
+        mode_checked(GameMode::SecondOrder),
+        if owner_controls { "" } else { " disabled" },
+        start_disabled,
+        chat_html(model)
     )
 }
 
 fn game_html(model: &Model) -> String {
+    let local_turn = model.room_phase == Some(graphwar_protocol::Phase::Planning)
+        && model.turn_deadline_at.is_some()
+        && model.player_id == model.turn_player_id;
+    let disabled = (!local_turn).then_some(" disabled").unwrap_or("");
+    let angle_help = (model.game_mode == Some(GameMode::SecondOrder))
+        .then_some(" Focus the slider, then use Arrow Up/Down.")
+        .unwrap_or("");
     format!(
-        "<section class=\"game-shell reveal\" aria-labelledby=\"game-title\"><div class=\"game-heading\"><div><p class=\"eyebrow\">Live match</p><h1 id=\"game-title\">{}</h1></div><button id=\"leave-room\" class=\"text-button\">Retreat</button></div><div class=\"battlefield\"><canvas id=\"game-canvas\" width=\"770\" height=\"450\" aria-label=\"Graphwar battlefield, 770 by 450 logical units\"></canvas><div class=\"axis-label x-label\">x</div><div class=\"axis-label y-label\">y</div></div><form id=\"fire-form\" class=\"fire-console\"><div class=\"equation-field\"><label for=\"function-input\">Function</label><div><span aria-hidden=\"true\">y =</span><input id=\"function-input\" spellcheck=\"false\" autocomplete=\"off\" maxlength=\"160\" required value=\"sin(x)\" aria-describedby=\"function-hint\"></div><small id=\"function-hint\">Use x, sin, cos, tan, sqrt and standard operators.</small></div><div class=\"angle-field\"><label for=\"angle-input\">Angle <output id=\"angle-output\">45°</output></label><input id=\"angle-input\" type=\"range\" min=\"-90\" max=\"90\" value=\"45\" step=\"1\"></div><button class=\"fire-button\" type=\"submit\"><span>Fire</span><small>Enter ↵</small></button></form></section>",
-        escape(&model.room_name)
+        "<section class=\"game-shell reveal\" aria-labelledby=\"game-title\"><div class=\"game-heading\"><div><p class=\"eyebrow\">Live match · <span id=\"turn-timer\" role=\"timer\">{}</span></p><h1 id=\"game-title\">{}</h1></div><button id=\"leave-room\" class=\"text-button\">Retreat</button></div><div class=\"battlefield\"><canvas id=\"game-canvas\" width=\"770\" height=\"450\" aria-label=\"Graphwar battlefield, 770 by 450 logical units. Dashed paths are provisional previews.\"></canvas><div class=\"preview-key\"><i></i> Provisional</div><div class=\"axis-label x-label\">x</div><div class=\"axis-label y-label\">y</div></div><form id=\"fire-form\" class=\"fire-console\"><div class=\"equation-field\"><label for=\"function-input\">Function</label><div><span aria-hidden=\"true\">y =</span><input id=\"function-input\" spellcheck=\"false\" autocomplete=\"off\" maxlength=\"256\" required value=\"{}\" aria-describedby=\"function-hint\"{disabled}></div><small id=\"function-hint\">Use x, sin, cos, tan, sqrt and standard operators.</small></div><div class=\"angle-field\"><label for=\"angle-input\">Angle <output id=\"angle-output\" aria-live=\"polite\">{:.1}°</output></label><input id=\"angle-input\" type=\"range\" min=\"-90\" max=\"90\" value=\"{:.1}\" step=\"0.1\" aria-describedby=\"angle-hint\"{disabled}><small id=\"angle-hint\">{angle_help}</small></div><button class=\"fire-button\" type=\"submit\"{disabled}><span>{}</span><small>Enter ↵</small></button></form>{}</section>",
+        timer_text(model),
+        escape(&model.room_name),
+        escape(if model.draft_function.is_empty() {
+            "sin(x)"
+        } else {
+            &model.draft_function
+        }),
+        model.aim_angle_deg,
+        model.aim_angle_deg,
+        if local_turn { "Fire" } else { "Waiting" },
+        chat_html(model)
+    )
+}
+
+fn timer_text(model: &Model) -> String {
+    let Some(deadline) = model.turn_deadline_at else {
+        return match model.room_phase {
+            Some(graphwar_protocol::Phase::Resolving) => "Resolving shot".into(),
+            Some(graphwar_protocol::Phase::Finished) => "Match finished".into(),
+            _ => "Waiting".into(),
+        };
+    };
+    let remaining = deadline.saturating_sub((js_sys::Date::now() / 1_000.0) as i64);
+    format!("{}:{:02}", remaining / 60, remaining % 60)
+}
+
+fn update_timer(app: &SharedApp) {
+    let app = app.borrow();
+    if app.model.screen != Screen::Game {
+        return;
+    }
+    if let Some(timer) = app.document.get_element_by_id("turn-timer") {
+        timer.set_text_content(Some(&timer_text(&app.model)));
+    }
+}
+
+fn chat_html(model: &Model) -> String {
+    let messages = model
+        .chat
+        .iter()
+        .rev()
+        .take(40)
+        .rev()
+        .map(|message| {
+            let name = model
+                .players
+                .iter()
+                .find(|player| player.id == message.player_id)
+                .map(|player| player.name.as_str())
+                .unwrap_or("Player");
+            format!(
+                "<li><strong>{}</strong><span>{}</span></li>",
+                escape(name),
+                escape(&message.text)
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<section class=\"paper-card chat-panel\" aria-labelledby=\"chat-title\"><h2 id=\"chat-title\">Room chat</h2><ul aria-live=\"polite\">{messages}</ul><form id=\"chat-form\" class=\"inline-form\"><label class=\"sr-only\" for=\"chat-input\">Message</label><input id=\"chat-input\" maxlength=\"500\" autocomplete=\"off\" required placeholder=\"Message the room\"><button class=\"secondary\" type=\"submit\">Send</button></form></section>"
     )
 }
 
@@ -257,21 +763,88 @@ fn notices_html(model: &Model) -> String {
 
 fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
     let document = app.borrow().document.clone();
+    if let Some(button) = document.get_element_by_id("reconnect-now") {
+        let app = Rc::clone(app);
+        bind_click(&app.clone(), &button, move || {
+            app.borrow_mut().reconnect_attempt = 0;
+            if let Err(error) = connect(&app) {
+                notice(&app, format!("connection failed: {error:?}"));
+            }
+        });
+    }
+    if let Some(button) = document.get_element_by_id("logout") {
+        let app = Rc::clone(app);
+        bind_click(&app.clone(), &button, move || logout(&app));
+    }
     if let Some(form) = document.get_element_by_id("login-form") {
         let app = Rc::clone(app);
-        bind_submit(form.unchecked_into(), move |form| {
-            if let Some(name) = input_value(&form, "player-name") {
-                app.borrow_mut().player_name = name.clone();
-                send(&app, ClientMessage::Login { name });
-            }
+        bind_submit(&app.clone(), form.unchecked_into(), move |form| {
+            let Some(email) = input_value(&form, "login-email") else {
+                return;
+            };
+            let Some(password) = password_value(&form, "login-password") else {
+                return;
+            };
+            login(&app, LoginRequest { email, password });
+        });
+    }
+    if let Some(form) = document.get_element_by_id("register-form") {
+        let app = Rc::clone(app);
+        bind_submit(&app.clone(), form.unchecked_into(), move |form| {
+            let Some(display_name) = input_value(&form, "register-name") else {
+                return;
+            };
+            let Some(email) = input_value(&form, "register-email") else {
+                return;
+            };
+            let Some(password) = password_value(&form, "register-password") else {
+                return;
+            };
+            register(
+                &app,
+                RegisterRequest {
+                    email,
+                    display_name,
+                    password,
+                },
+            );
         });
     }
     if let Some(form) = document.get_element_by_id("create-room-form") {
         let app = Rc::clone(app);
-        bind_submit(form.unchecked_into(), move |form| {
+        bind_submit(&app.clone(), form.unchecked_into(), move |form| {
             if let Some(name) = input_value(&form, "room-name") {
-                send(&app, ClientMessage::CreateRoom { name });
+                let visibility = form
+                    .query_selector("#room-visibility")
+                    .ok()
+                    .flatten()
+                    .and_then(|input| input.dyn_into::<HtmlSelectElement>().ok())
+                    .is_some_and(|input| input.value() == "private")
+                    .then_some(RoomVisibility::Private)
+                    .unwrap_or(RoomVisibility::Public);
+                send(&app, ClientMessage::CreateRoom { name, visibility });
             }
+        });
+    }
+    if let Some(form) = document.get_element_by_id("invite-room-form") {
+        let app = Rc::clone(app);
+        bind_submit(&app.clone(), form.unchecked_into(), move |form| {
+            let Some(room_id) =
+                input_value(&form, "private-room-id").and_then(|id| Uuid::parse_str(&id).ok())
+            else {
+                notice(&app, "Invalid private room ID".into());
+                return;
+            };
+            let Some(invite) = input_value(&form, "invite-code") else {
+                return;
+            };
+            send(
+                &app,
+                ClientMessage::JoinRoom {
+                    room_id,
+                    invite: Some(invite),
+                },
+            );
         });
     }
     let room_buttons = document.query_selector_all(".join-room")?;
@@ -282,44 +855,133 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
         let element = element.unchecked_into::<web_sys::Element>();
         let room_id = element.get_attribute("data-room-id").unwrap_or_default();
         let app = Rc::clone(app);
-        bind_click(&element, move || {
-            send(
-                &app,
-                ClientMessage::JoinRoom {
-                    room_id: room_id.clone(),
-                },
-            );
+        bind_click(&app.clone(), &element, move || {
+            match Uuid::parse_str(&room_id) {
+                Ok(room_id) => send(
+                    &app,
+                    ClientMessage::JoinRoom {
+                        room_id,
+                        invite: None,
+                    },
+                ),
+                Err(_) => log_error("invalid room ID"),
+            }
         });
     }
     if let Some(button) = document.get_element_by_id("leave-room") {
         let app = Rc::clone(app);
-        bind_click(&button, move || {
+        bind_click(&app.clone(), &button, move || {
             send(&app, ClientMessage::LeaveRoom);
-            reduce(&mut app.borrow_mut().model, Action::LeftRoom);
-            rerender(&app);
         });
     }
     if let Some(button) = document.get_element_by_id("ready-button") {
         let app = Rc::clone(app);
-        bind_click(&button, move || {
-            send(&app, ClientMessage::SetReady { ready: true })
+        bind_click(&app.clone(), &button, move || {
+            let ready = !app.borrow().model.local_ready();
+            send(&app, ClientMessage::SetReady { ready });
         });
     }
+    let mode_inputs = document.query_selector_all("input[name=game-mode]")?;
+    for index in 0..mode_inputs.length() {
+        let Some(element) = mode_inputs.item(index) else {
+            continue;
+        };
+        let element = element.unchecked_into::<HtmlInputElement>();
+        let app = Rc::clone(app);
+        bind_change(&app.clone(), &element, move |input| {
+            let mode = match input.value().as_str() {
+                "first_order" => GameMode::FirstOrder,
+                "second_order" => GameMode::SecondOrder,
+                _ => GameMode::Function,
+            };
+            send(&app, ClientMessage::SetMode { mode });
+        })?;
+    }
+    if let Some(button) = document.get_element_by_id("add-bot") {
+        let app = Rc::clone(app);
+        bind_click(&app.clone(), &button, move || {
+            send(&app, ClientMessage::AddBot { level: 4 })
+        });
+    }
+    if let Some(button) = document.get_element_by_id("start-game") {
+        let app = Rc::clone(app);
+        bind_click(&app.clone(), &button, move || {
+            send(&app, ClientMessage::StartGame)
+        });
+    }
+    let bot_buttons = document.query_selector_all(".remove-bot")?;
+    for index in 0..bot_buttons.length() {
+        let Some(element) = bot_buttons.item(index) else {
+            continue;
+        };
+        let element = element.unchecked_into::<web_sys::Element>();
+        let player_id = element.get_attribute("data-player-id").unwrap_or_default();
+        let app = Rc::clone(app);
+        bind_click(&app.clone(), &element, move || {
+            if let Ok(player_id) = Uuid::parse_str(&player_id) {
+                send(&app, ClientMessage::RemoveBot { player_id });
+            }
+        });
+    }
+    for selector in [".player-team", ".player-soldiers"] {
+        let inputs = document.query_selector_all(selector)?;
+        for index in 0..inputs.length() {
+            let Some(element) = inputs.item(index) else {
+                continue;
+            };
+            let element = element.unchecked_into::<HtmlSelectElement>();
+            let player_id = element.get_attribute("data-player-id").unwrap_or_default();
+            let app = Rc::clone(app);
+            bind_select_change(&app.clone(), &element, move |input| {
+                let Ok(player_id) = Uuid::parse_str(&player_id) else {
+                    return;
+                };
+                let value = input.value().parse::<u8>().unwrap_or_default();
+                if selector == ".player-team" {
+                    send(
+                        &app,
+                        ClientMessage::SetTeam {
+                            player_id,
+                            team: value,
+                        },
+                    );
+                } else {
+                    send(
+                        &app,
+                        ClientMessage::SetSoldiers {
+                            player_id,
+                            soldiers: value,
+                        },
+                    );
+                }
+            })?;
+        }
+    }
     if let Some(input) = document.get_element_by_id("angle-input") {
-        let document = document.clone();
         let input = input.unchecked_into::<HtmlInputElement>();
         let listener_input = input.clone();
+        let angle_document = document.clone();
+        let app = Rc::clone(app);
+        let listener_app = Rc::clone(&app);
         let closure = Closure::<dyn FnMut(Event)>::new(move |_| {
-            if let Some(output) = document.get_element_by_id("angle-output") {
-                output.set_text_content(Some(&format!("{}°", listener_input.value())));
+            let value = listener_input.value_as_number().clamp(-90.0, 90.0);
+            listener_app.borrow_mut().model.aim_angle_deg = value;
+            if let Some(output) = angle_document.get_element_by_id("angle-output") {
+                output.set_text_content(Some(&format!("{value:.1}°")));
+            }
+            if let Some(function) = angle_document
+                .get_element_by_id("function-input")
+                .and_then(|input| input.dyn_into::<HtmlInputElement>().ok())
+            {
+                update_preview(&listener_app, &function);
             }
         });
         input.add_event_listener_with_callback("input", closure.as_ref().unchecked_ref())?;
-        closure.forget();
+        app.borrow_mut().event_handlers.push(closure);
     }
     if let Some(form) = document.get_element_by_id("fire-form") {
         let app = Rc::clone(app);
-        bind_submit(form.unchecked_into(), move |form| {
+        bind_submit(&app.clone(), form.unchecked_into(), move |form| {
             let Some(function) = input_value(&form, "function-input") else {
                 return;
             };
@@ -327,38 +989,174 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
                 .and_then(|value| value.parse::<f64>().ok())
                 .unwrap_or_default()
                 .clamp(-90.0, 90.0);
+            {
+                let mut app_ref = app.borrow_mut();
+                app_ref.model.draft_function.clone_from(&function);
+                app_ref.model.aim_angle_deg = angle_deg;
+            }
             send(
                 &app,
-                ClientMessage::Fire {
+                ClientMessage::FireFunction {
                     function,
                     angle_deg,
                 },
             );
         });
     }
+    if let Some(input) = document.get_element_by_id("function-input") {
+        let input = input.unchecked_into::<HtmlInputElement>();
+        let preview_app = Rc::clone(app);
+        let listener_input = input.clone();
+        let closure = Closure::<dyn FnMut(Event)>::new(move |_| {
+            update_preview(&preview_app, &listener_input);
+        });
+        input.add_event_listener_with_callback("input", closure.as_ref().unchecked_ref())?;
+        app.borrow_mut().event_handlers.push(closure);
+        if app.borrow().model.preview_path.is_empty() && !input.disabled() {
+            update_preview(app, &input);
+        }
+    }
+    if let Some(form) = document.get_element_by_id("chat-form") {
+        let app = Rc::clone(app);
+        bind_submit(&app.clone(), form.unchecked_into(), move |form| {
+            let Some(text) = input_value(&form, "chat-input") else {
+                return;
+            };
+            send(&app, ClientMessage::Chat { text });
+            if let Some(input) = form
+                .query_selector("#chat-input")
+                .ok()
+                .flatten()
+                .and_then(|input| input.dyn_into::<HtmlInputElement>().ok())
+            {
+                input.set_value("");
+            }
+        });
+    }
     Ok(())
 }
 
-fn bind_submit(form: HtmlFormElement, mut handler: impl FnMut(HtmlFormElement) + 'static) {
+fn update_preview(app: &SharedApp, function: &HtmlInputElement) {
+    let function = function.value();
+    let mut app_ref = app.borrow_mut();
+    app_ref.model.draft_function.clone_from(&function);
+    let preview =
+        trace_preview(&app_ref.model, &function, app_ref.model.aim_angle_deg).unwrap_or_default();
+    app_ref.model.preview_path = preview;
+    drop(app_ref);
+    if let Err(error) = render_canvas(app) {
+        log_error(&format!("preview render failed: {error:?}"));
+    }
+}
+
+fn start_shot_animation(app: &SharedApp, sequence: u64) {
+    let started_at = js_sys::Date::now();
+    app.borrow_mut().shot_animation = Some(ShotAnimation {
+        sequence,
+        started_at,
+    });
+    schedule_shot_frame(app, sequence);
+}
+
+fn schedule_shot_frame(app: &SharedApp, sequence: u64) {
+    let frame_app = Rc::clone(app);
+    let callback = Closure::once_into_js(move |_: f64| {
+        let app_ref = frame_app.borrow();
+        let path_len = app_ref.model.authoritative_path.len();
+        let Some(animation) = app_ref.shot_animation.as_ref() else {
+            return;
+        };
+        if animation.sequence != sequence {
+            return;
+        }
+        let complete =
+            visible_points(path_len, js_sys::Date::now() - animation.started_at) == path_len;
+        drop(app_ref);
+        if complete {
+            let mut app_ref = frame_app.borrow_mut();
+            app_ref.shot_animation = None;
+            apply_pending_game(&mut app_ref.model);
+            drop(app_ref);
+            rerender(&frame_app);
+        } else {
+            if let Err(error) = render_canvas(&frame_app) {
+                log_error(&format!("shot render failed: {error:?}"));
+            }
+            schedule_shot_frame(&frame_app, sequence);
+        }
+    });
+    let result = app
+        .borrow()
+        .window
+        .request_animation_frame(callback.unchecked_ref());
+    if let Err(error) = result {
+        log_error(&format!("animation frame failed: {error:?}"));
+        let mut app_ref = app.borrow_mut();
+        app_ref.shot_animation = None;
+        apply_pending_game(&mut app_ref.model);
+        drop(app_ref);
+        rerender(app);
+    }
+}
+
+fn retain_event_handler(app: &SharedApp, closure: Closure<dyn FnMut(Event)>) {
+    app.borrow_mut().event_handlers.push(closure);
+}
+
+fn bind_submit(
+    app: &SharedApp,
+    form: HtmlFormElement,
+    mut handler: impl FnMut(HtmlFormElement) + 'static,
+) {
     let bound_form = form.clone();
     let closure = Closure::<dyn FnMut(Event)>::new(move |event: Event| {
         event.prevent_default();
         handler(bound_form.clone());
     });
     let _ = form.add_event_listener_with_callback("submit", closure.as_ref().unchecked_ref());
-    closure.forget();
+    retain_event_handler(app, closure);
 }
 
-fn bind_click(element: &web_sys::Element, mut handler: impl FnMut() + 'static) {
+fn bind_click(app: &SharedApp, element: &web_sys::Element, mut handler: impl FnMut() + 'static) {
     let closure = Closure::<dyn FnMut(Event)>::new(move |_| handler());
     let _ = element.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref());
-    closure.forget();
+    retain_event_handler(app, closure);
+}
+
+fn bind_change(
+    app: &SharedApp,
+    input: &HtmlInputElement,
+    mut handler: impl FnMut(HtmlInputElement) + 'static,
+) -> Result<(), JsValue> {
+    let bound_input = input.clone();
+    let closure = Closure::<dyn FnMut(Event)>::new(move |_| handler(bound_input.clone()));
+    input.add_event_listener_with_callback("change", closure.as_ref().unchecked_ref())?;
+    retain_event_handler(app, closure);
+    Ok(())
+}
+
+fn bind_select_change(
+    app: &SharedApp,
+    input: &HtmlSelectElement,
+    mut handler: impl FnMut(HtmlSelectElement) + 'static,
+) -> Result<(), JsValue> {
+    let bound_input = input.clone();
+    let closure = Closure::<dyn FnMut(Event)>::new(move |_| handler(bound_input.clone()));
+    input.add_event_listener_with_callback("change", closure.as_ref().unchecked_ref())?;
+    retain_event_handler(app, closure);
+    Ok(())
 }
 
 fn input_value(form: &HtmlFormElement, id: &str) -> Option<String> {
     let input = form.query_selector(&format!("#{id}")).ok()??;
     let value = input.dyn_into::<HtmlInputElement>().ok()?.value();
     let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn password_value(form: &HtmlFormElement, id: &str) -> Option<String> {
+    let input = form.query_selector(&format!("#{id}")).ok()??;
+    let value = input.dyn_into::<HtmlInputElement>().ok()?.value();
     (!value.is_empty()).then(|| value.to_owned())
 }
 
@@ -389,14 +1187,31 @@ fn render_canvas(app: &SharedApp) -> Result<(), JsValue> {
     context.set_fill_style_str("#f3eddc");
     context.fill_rect(0.0, 0.0, LOGICAL_WIDTH, LOGICAL_HEIGHT);
     draw_grid(&context);
-    draw_terrain(&context);
+    draw_terrain(&context, &app.model);
+    let authoritative_len = app
+        .shot_animation
+        .as_ref()
+        .filter(|animation| animation.sequence == app.model.shot_sequence)
+        .map(|animation| {
+            visible_points(
+                app.model.authoritative_path.len(),
+                js_sys::Date::now() - animation.started_at,
+            )
+        })
+        .unwrap_or(app.model.authoritative_path.len());
+    draw_path(
+        &context,
+        &app.model.authoritative_path[..authoritative_len],
+        false,
+    )?;
+    draw_path(&context, &app.model.preview_path, true)?;
     for soldier in &app.model.soldiers {
         draw_soldier(
             &context,
             soldier.x,
             soldier.y,
             soldier.team,
-            soldier.health,
+            soldier.alive,
             soldier.active,
         );
     }
@@ -428,19 +1243,66 @@ fn draw_grid(context: &CanvasRenderingContext2d) {
     context.stroke();
 }
 
-fn draw_terrain(context: &CanvasRenderingContext2d) {
-    context.begin_path();
-    context.move_to(0.0, 345.0);
-    context.bezier_curve_to(130.0, 295.0, 210.0, 385.0, 330.0, 335.0);
-    context.bezier_curve_to(450.0, 285.0, 555.0, 375.0, 770.0, 315.0);
-    context.line_to(770.0, 450.0);
-    context.line_to(0.0, 450.0);
-    context.close_path();
+fn draw_terrain(context: &CanvasRenderingContext2d, model: &Model) {
     context.set_fill_style_str("#244a3b");
-    context.fill();
     context.set_stroke_style_str("#1c1f1b");
-    context.set_line_width(3.0);
+    context.set_line_width(2.0);
+    for terrain in model.terrain.iter().filter(|terrain| !terrain.cut) {
+        context.begin_path();
+        let _ = context.arc(
+            terrain.x,
+            terrain.y,
+            terrain.radius,
+            0.0,
+            std::f64::consts::TAU,
+        );
+        context.fill();
+        context.stroke();
+    }
+    for terrain in model.terrain.iter().filter(|terrain| terrain.cut) {
+        context.begin_path();
+        let _ = context.arc(
+            terrain.x,
+            terrain.y,
+            terrain.radius,
+            0.0,
+            std::f64::consts::TAU,
+        );
+        context.set_fill_style_str("#f3eddc");
+        context.fill();
+        context.save();
+        context.clip();
+        draw_grid(context);
+        context.restore();
+    }
+}
+
+fn draw_path(
+    context: &CanvasRenderingContext2d,
+    path: &[(f64, f64)],
+    provisional: bool,
+) -> Result<(), JsValue> {
+    let Some((start, rest)) = path.split_first() else {
+        return Ok(());
+    };
+    context.begin_path();
+    context.move_to(start.0, start.1);
+    for point in rest {
+        context.line_to(point.0, point.1);
+    }
+    context.set_stroke_style_str(if provisional { "#6d7168" } else { "#ff5b3d" });
+    context.set_line_width(if provisional { 1.5 } else { 2.5 });
+    if provisional {
+        context.set_line_dash(&js_sys::Array::of2(
+            &JsValue::from_f64(5.0),
+            &JsValue::from_f64(5.0),
+        ))?;
+    }
     context.stroke();
+    if provisional {
+        context.set_line_dash(&js_sys::Array::new())?;
+    }
+    Ok(())
 }
 
 fn draw_soldier(
@@ -448,30 +1310,33 @@ fn draw_soldier(
     x: f64,
     y: f64,
     team: u8,
-    health: u16,
+    alive: bool,
     active: bool,
 ) {
-    let color = if team % 2 == 0 { "#ff5b3d" } else { "#e4b83b" };
+    let color = if alive {
+        if team % 2 == 0 { "#ff5b3d" } else { "#e4b83b" }
+    } else {
+        "#6d7368"
+    };
     context.begin_path();
     let _ = context.arc(
         x,
         y - 8.0,
-        if active { 7.0 } else { 5.0 },
+        if active && alive { 7.0 } else { 5.0 },
         0.0,
         std::f64::consts::TAU,
     );
     context.set_fill_style_str(color);
     context.fill();
     context.set_stroke_style_str("#1c1f1b");
-    context.set_line_width(if active { 2.5 } else { 1.5 });
+    context.set_line_width(if active && alive { 2.5 } else { 1.5 });
     context.stroke();
-    context.set_fill_style_str("#1c1f1b");
-    context.fill_rect(
-        x - 11.0,
-        y - 22.0,
-        22.0 * f64::from(health.min(100)) / 100.0,
-        2.0,
-    );
+    if !alive {
+        context.begin_path();
+        context.move_to(x - 7.0, y - 15.0);
+        context.line_to(x + 7.0, y - 1.0);
+        context.stroke();
+    }
 }
 
 fn escape(value: &str) -> String {

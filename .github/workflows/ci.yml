@@ -28,3 +28,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker build -f deploy/Dockerfile .
+      # Image smoke needs Docker Compose plus an externally reachable TLS endpoint.
+      # GitHub-hosted runners cannot expose Caddy's localhost certificate reliably.
+      # Run this exact gate in the deploy environment before release.
+      - name: Validate deployment manifest
+        env:
+          DOMAIN: graphwar.invalid
+          POSTGRES_PASSWORD: ci-secret-not-production
+        run: |
+          test -f deploy/Caddyfile
+          grep -F 'graphwar_client_wasm.js' assets/web/index.html
+          grep -F 'graphwar_client_wasm_bg.wasm' deploy/Dockerfile
+          grep -F '/healthz' deploy/compose.yaml
+          grep -F 'condition: service_healthy' deploy/compose.yaml
+      - name: Publish release gate
+        run: |
+          printf '%s\n' 'Before publishing: DOMAIN=example.com POSTGRES_PASSWORD=... docker compose -f deploy/compose.yaml up --build --wait'
+          printf '%s\n' 'Then verify HTTPS /healthz, /, graphwar.css, graphwar_client_wasm.js, graphwar_client_wasm_bg.wasm, auth, and WSS.'
+          printf '%s\n' 'Skipped: remote deploy and Docker cleanup need explicit authorization.'

@@ -8,3 +8,5 @@
 !.env.example
 .DS_Store
 /.claude/worktrees/
+/.codegraph/
+/.tmp-compose-current/

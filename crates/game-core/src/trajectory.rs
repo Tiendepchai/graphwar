@@ -29,18 +29,24 @@ pub struct Trajectory {
     pub hits: Vec<Hit>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrajectoryError {
+    InvalidState,
+    NonFinite,
+}
+
 pub fn trace(
     expr: &Expr,
     mode: TrajectoryMode,
     terrain: &Terrain,
     game: &GameState,
     inverted: bool,
-) -> Trajectory {
+) -> Result<Trajectory, TrajectoryError> {
     let Some(shooter) = game.players.get(game.turn) else {
-        return Trajectory::default();
+        return Err(TrajectoryError::InvalidState);
     };
     let Some(soldier) = shooter.current() else {
-        return Trajectory::default();
+        return Err(TrajectoryError::InvalidState);
     };
     let mut state = State::from_screen(soldier.x, soldier.y, inverted);
     let angle = match mode {
@@ -49,14 +55,14 @@ pub fn trace(
         TrajectoryMode::SecondOrder { angle } => angle,
     };
     if !angle.is_finite() {
-        return Trajectory::default();
+        return Err(TrajectoryError::NonFinite);
     }
     let radius = PLANE_GAME_LENGTH * SOLDIER_RADIUS / PLANE_LENGTH as f64;
     state.x += radius * angle.cos();
     state.y += radius * angle.sin();
     state.dy = angle.tan();
     if !state.finite() {
-        return Trajectory::default();
+        return Err(TrajectoryError::NonFinite);
     }
     let offset = match mode {
         TrajectoryMode::Function => {
@@ -70,7 +76,7 @@ pub fn trace(
         _ => 0.0,
     };
     if !offset.is_finite() {
-        return Trajectory::default();
+        return Err(TrajectoryError::NonFinite);
     }
     let mut result = Trajectory {
         points: vec![state.screen(inverted)],
@@ -93,7 +99,9 @@ pub fn trace(
         }
         previous = next;
     }
-    result
+    (result.points.len() > 1)
+        .then_some(result)
+        .ok_or(TrajectoryError::NonFinite)
 }
 
 #[derive(Clone, Copy)]
@@ -289,17 +297,16 @@ mod tests {
     }
     #[test]
     fn nan_stops_without_poisoning_points() {
-        let path = trace(
-            &parse("sqrt(-1)").unwrap(),
-            TrajectoryMode::Function,
-            &Terrain::default(),
-            &game(),
-            false,
+        assert_eq!(
+            trace(
+                &parse("sqrt(-1)").unwrap(),
+                TrajectoryMode::Function,
+                &Terrain::default(),
+                &game(),
+                false,
+            ),
+            Err(TrajectoryError::NonFinite)
         );
-        assert!(path
-            .points
-            .iter()
-            .all(|p| p.0.is_finite() && p.1.is_finite()));
     }
     #[test]
     fn adaptive_step_enforces_distance() {
@@ -309,7 +316,8 @@ mod tests {
             &Terrain::default(),
             &game(),
             false,
-        );
+        )
+        .unwrap();
         for pair in path.points.windows(2) {
             assert!(
                 (pair[1].0 - pair[0].0).hypot(pair[1].1 - pair[0].1)
@@ -332,7 +340,8 @@ mod tests {
                 &Terrain::default(),
                 &game(),
                 false,
-            );
+            )
+            .unwrap();
             assert!(
                 p.points.len() > 1
                     && p.points

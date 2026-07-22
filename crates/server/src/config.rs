@@ -1,6 +1,6 @@
-use std::{env, net::SocketAddr, time::Duration};
+use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -10,6 +10,7 @@ pub struct Config {
     pub allowed_origins: Vec<String>,
     pub secure_cookies: bool,
     pub session_ttl: Duration,
+    pub static_dir: PathBuf,
 }
 
 impl Config {
@@ -18,7 +19,7 @@ impl Config {
             .context("ALLOWED_ORIGINS is required")?
             .split(',')
             .map(str::trim)
-            .filter(|v| !v.is_empty())
+            .filter(|value| !value.is_empty())
             .map(str::to_owned)
             .collect::<Vec<_>>();
         if allowed_origins.is_empty() {
@@ -33,12 +34,15 @@ impl Config {
                 .unwrap_or_else(|_| "10".into())
                 .parse()?,
             allowed_origins,
-            secure_cookies: env::var("SECURE_COOKIES").map_or(true, |v| v != "false"),
+            secure_cookies: env::var("SECURE_COOKIES").map_or(true, |value| value != "false"),
             session_ttl: Duration::from_secs(
                 env::var("SESSION_TTL_SECONDS")
                     .unwrap_or_else(|_| "2592000".into())
                     .parse()?,
             ),
+            static_dir: env::var_os("GRAPHWAR_STATIC_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("assets/web")),
         })
     }
 
@@ -51,6 +55,7 @@ impl Config {
             allowed_origins: vec!["http://localhost:3000".into()],
             secure_cookies: false,
             session_ttl: Duration::from_secs(60),
+            static_dir: PathBuf::from("assets/web"),
         }
     }
 }

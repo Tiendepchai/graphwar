@@ -1,4 +1,6 @@
-use graphwar_server::{app, AppState, Config};
+use std::net::SocketAddr;
+
+use graphwar_server::{AppState, Config, app};
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -18,6 +20,19 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = TcpListener::bind(config.bind_addr).await?;
     tracing::info!(address = %listener.local_addr()?, "server listening");
-    axum::serve(listener, app(AppState::new(pool, config))).await?;
+    let state = AppState::new(pool, config);
+    let expiry_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            expiry_state.expire_turns().await;
+        }
+    });
+    axum::serve(
+        listener,
+        app(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

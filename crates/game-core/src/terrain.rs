@@ -33,11 +33,11 @@ impl Terrain {
     pub fn collides_point(&self, x: f64, y: f64) -> bool {
         !(0.0..PLANE_LENGTH as f64).contains(&x)
             || !(0.0..PLANE_HEIGHT as f64).contains(&y)
-            || self
-                .circles
-                .iter()
-                .chain(&self.explosions)
-                .any(|circle| circle.contains(x, y))
+            || (self.circles.iter().any(|circle| circle.contains(x, y))
+                && !self
+                    .explosions
+                    .iter()
+                    .any(|explosion| explosion.contains(x, y)))
     }
     pub fn collides_circle(&self, x: f64, y: f64, radius: f64) -> bool {
         self.collides_point(x - radius, y)
@@ -76,9 +76,15 @@ mod tests {
         assert!(terrain.segment_collides((0.0, 20.0), (40.0, 20.0)));
     }
     #[test]
-    fn explosions_are_terrain() {
-        let mut terrain = Terrain::default();
-        terrain.explode(10.0, 10.0, 3.0);
+    fn explosions_cut_existing_terrain() {
+        let mut terrain = Terrain::new(vec![Circle {
+            x: 10.0,
+            y: 10.0,
+            radius: 8.0,
+        }]);
         assert!(terrain.collides_point(10.0, 10.0));
+        terrain.explode(10.0, 10.0, 3.0);
+        assert!(!terrain.collides_point(10.0, 10.0));
+        assert!(terrain.collides_point(17.0, 10.0));
     }
 }

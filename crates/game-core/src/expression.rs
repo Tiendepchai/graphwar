@@ -119,15 +119,27 @@ impl Token {
     }
 }
 
+const MAX_INPUT_BYTES: usize = 256;
+const MAX_TOKENS: usize = 128;
+const MAX_AST_DEPTH: usize = 64;
+
 struct Parser {
     tokens: Vec<(Token, usize)>,
     index: usize,
+    depth: usize,
 }
 
 pub fn parse(input: &str) -> Result<Expr, ParseError> {
+    if input.len() > MAX_INPUT_BYTES {
+        return Err(ParseError {
+            offset: MAX_INPUT_BYTES,
+            message: "expression is too long",
+        });
+    }
     let mut parser = Parser {
         tokens: lex_tokens(input)?,
         index: 0,
+        depth: 0,
     };
     let expression = parser.sum()?;
     if !matches!(parser.current().0, Token::End) {
@@ -235,7 +247,7 @@ fn lex_tokens(input: &str) -> Result<Vec<(Token, usize)>, ParseError> {
                 return Err(ParseError {
                     offset,
                     message: "unknown identifier",
-                })
+                });
             }
         };
         tokens.push((token, offset));
@@ -244,6 +256,12 @@ fn lex_tokens(input: &str) -> Result<Vec<(Token, usize)>, ParseError> {
         }
     }
     tokens.push((Token::End, input.len()));
+    if tokens.len() > MAX_TOKENS {
+        return Err(ParseError {
+            offset: input.len(),
+            message: "expression has too many tokens",
+        });
+    }
     Ok(tokens)
 }
 
@@ -323,7 +341,12 @@ impl Parser {
     }
 
     fn primary(&mut self) -> Result<Expr, ParseError> {
-        match self.eat() {
+        self.depth += 1;
+        if self.depth > MAX_AST_DEPTH {
+            self.depth -= 1;
+            return Err(self.error("expression is too deeply nested"));
+        }
+        let result = match self.eat() {
             Token::Number(value) | Token::Constant(value) => Ok(Expr::Number(value)),
             Token::X => Ok(Expr::X),
             Token::Y => Ok(Expr::Y),
@@ -359,7 +382,9 @@ impl Parser {
                 Ok(value)
             }
             _ => Err(self.error("expected expression")),
-        }
+        };
+        self.depth -= 1;
+        result
     }
 }
 
@@ -392,5 +417,12 @@ mod tests {
     fn precedence_and_right_associative_power() {
         assert_eq!(value("-2^2"), 4.0);
         assert_eq!(value("2^3^2"), 512.0);
+    }
+
+    #[test]
+    fn parser_budgets_reject_adversarial_input() {
+        assert!(parse(&"x+".repeat(MAX_TOKENS)).is_err());
+        assert!(parse(&format!("{}x{}", "(".repeat(65), ")".repeat(65))).is_err());
+        assert!(parse(&"x".repeat(MAX_INPUT_BYTES + 1)).is_err());
     }
 }

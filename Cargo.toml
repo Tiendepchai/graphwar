@@ -41,7 +41,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["compression-gzip", "cors", "fs", "limit", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-uuid = { version = "1.17", features = ["v4", "serde"] }
+uuid = { version = "1.17", features = ["v4", "serde", "js"] }
 url = "2"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
