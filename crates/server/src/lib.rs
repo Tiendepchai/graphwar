@@ -30,7 +30,7 @@ use tokio::sync::{RwLock, broadcast};
 use tower_http::services::ServeDir;
 
 pub use config::Config;
-use rooms::{RoomError, RoomRegistry};
+use rooms::{LeaveBroadcast, RoomError, RoomRegistry};
 
 const MAX_WS_MESSAGE_BYTES: usize = 8 * 1024;
 const MAX_WS_TRANSPORT_BYTES: usize = 16 * 1024;
@@ -200,7 +200,7 @@ impl AppState {
                 .map(|snapshot| snapshot.id)
                 .ok();
             let cleanup = match old_room {
-                Some(old_room) => match rooms.leave(player) {
+                Some(old_room) => match rooms.disconnect(player) {
                     Ok(snapshot) => Some((
                         old_room,
                         snapshot,
@@ -221,6 +221,12 @@ impl AppState {
             drop(presence);
             cleanup
         };
+        {
+            let mut presence = self.presence.write().await;
+            if presence.get(&player) == Some(&0) {
+                presence.remove(&player);
+            }
+        }
         let Some((old_room, snapshot, players, public_rooms)) = cleanup else {
             return;
         };
@@ -239,10 +245,6 @@ impl AppState {
                 rooms: public_rooms,
             },
         });
-        let mut presence = self.presence.write().await;
-        if presence.get(&player) == Some(&0) {
-            presence.remove(&player);
-        }
     }
 
     async fn cleanup_inactive_connections(&self) {
@@ -644,16 +646,28 @@ async fn dispatch(
             .with_lobby(rooms.public_snapshots()))
         }
         ClientMessage::LeaveRoom => {
-            let old_room = rooms.member_snapshot(user.id)?.id;
-            let snapshot = rooms.leave(user.id)?;
+            let leave = rooms.leave(user.id)?;
             let mut outcome = DispatchOutcome::accounts(vec![user.id], ServerMessage::LeftRoom);
-            if let Some(snapshot) = snapshot {
+            if let Some(broadcast) = leave.broadcast {
+                let message = match broadcast {
+                    LeaveBroadcast::Room(snapshot) => ServerMessage::Room { snapshot },
+                    LeaveBroadcast::StateSync { snapshot, game } => ServerMessage::StateSync {
+                        snapshot,
+                        game: Some(game),
+                    },
+                    LeaveBroadcast::TurnStarted { snapshot, game } => {
+                        ServerMessage::TurnStarted { snapshot, game }
+                    }
+                    LeaveBroadcast::GameFinished { snapshot, shot } => {
+                        ServerMessage::GameFinished { snapshot, shot }
+                    }
+                };
                 outcome.broadcasts.push(ScopedEvent {
                     audience: Audience::Room {
-                        room_id: old_room,
-                        players: rooms.member_ids(old_room),
+                        room_id: leave.room_id,
+                        players: rooms.member_ids(leave.room_id),
                     },
-                    message: ServerMessage::Room { snapshot },
+                    message,
                 });
             }
             Ok(outcome.with_lobby(rooms.public_snapshots()))
@@ -961,6 +975,80 @@ mod tests {
         state.socket_connected(player).await;
         state.cleanup_disconnected(player).await;
         assert!(state.rooms.read().await.member_snapshot(player).is_ok());
+    }
+
+    #[tokio::test]
+    async fn active_disconnect_keeps_room_membership_and_clears_presence() {
+        let state = test_state();
+        let owner = uuid::Uuid::new_v4();
+        let guest = uuid::Uuid::new_v4();
+        {
+            let mut rooms = state.rooms.write().await;
+            let room = rooms
+                .create(
+                    owner,
+                    "Owner".into(),
+                    "room".into(),
+                    graphwar_protocol::RoomVisibility::Public,
+                )
+                .unwrap()
+                .0;
+            rooms.join(guest, "Guest".into(), room.id, None).unwrap();
+            rooms.set_ready(owner, true).unwrap();
+            rooms.set_ready(guest, true).unwrap();
+            rooms.start_game(owner).unwrap();
+        }
+        state.socket_connected(owner).await;
+        assert!(state.release_socket(owner).await);
+        state.cleanup_disconnected(owner).await;
+
+        assert!(state.rooms.read().await.member_snapshot(owner).is_ok());
+        assert!(state.presence.read().await.get(&owner).is_none());
+    }
+
+    #[tokio::test]
+    async fn active_leave_sends_left_room_and_finish_to_remaining_player() {
+        let state = test_state();
+        let owner = uuid::Uuid::new_v4();
+        let guest = uuid::Uuid::new_v4();
+        let owner_user = test_user(owner, "Owner");
+        {
+            let mut rooms = state.rooms.write().await;
+            let room = rooms
+                .create(
+                    owner,
+                    "Owner".into(),
+                    "room".into(),
+                    graphwar_protocol::RoomVisibility::Public,
+                )
+                .unwrap()
+                .0;
+            rooms.join(guest, "Guest".into(), room.id, None).unwrap();
+            rooms.set_ready(owner, true).unwrap();
+            rooms.set_ready(guest, true).unwrap();
+            rooms.start_game(owner).unwrap();
+        }
+
+        let outcome = dispatch(&state, &owner_user, ClientMessage::LeaveRoom)
+            .await
+            .unwrap();
+        assert!(outcome.broadcasts.iter().any(|event| {
+            matches!(
+                &event.audience,
+                Audience::Accounts(players) if players == &[owner]
+            ) && matches!(event.message, ServerMessage::LeftRoom)
+        }));
+        assert!(outcome.broadcasts.iter().any(|event| {
+            matches!(
+                &event.audience,
+                Audience::Room { players, .. } if players == &[guest]
+            ) && matches!(
+                &event.message,
+                ServerMessage::GameFinished { snapshot, shot }
+                    if snapshot.players.iter().all(|player| player.id != owner)
+                        && shot.game.soldiers.iter().any(|soldier| soldier.player_id == owner && !soldier.alive)
+            )
+        }));
     }
 
     #[tokio::test]

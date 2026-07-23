@@ -3,8 +3,8 @@ use std::{cell::RefCell, rc::Rc};
 use gloo_net::http::Request;
 use gloo_timers::callback::{Interval, Timeout};
 use graphwar_protocol::{
-    AccountResponse, ClientMessage, GameMode, LoginRequest, PROTOCOL_VERSION, RegisterRequest,
-    RoomVisibility, ServerMessage,
+    AccountResponse, ClientMessage, GameMode, LoginRequest, PROTOCOL_VERSION, Phase,
+    RegisterRequest, RoomVisibility, ServerMessage,
 };
 use uuid::Uuid;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
@@ -1298,7 +1298,23 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
     if let Some(button) = document.get_element_by_id("leave-room") {
         let app = Rc::clone(app);
         bind_click(&app.clone(), &button, move || {
-            send(&app, ClientMessage::LeaveRoom);
+            let (active, window) = {
+                let app_ref = app.borrow();
+                (
+                    matches!(
+                        app_ref.model.room_phase,
+                        Some(Phase::Planning | Phase::Resolving)
+                    ),
+                    app_ref.window.clone(),
+                )
+            };
+            if !active
+                || window
+                    .confirm_with_message("Retreat and forfeit this match?")
+                    .unwrap_or(false)
+            {
+                send(&app, ClientMessage::LeaveRoom);
+            }
         });
     }
     if let Some(button) = document.get_element_by_id("ready-button") {
