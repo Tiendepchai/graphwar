@@ -5,7 +5,8 @@ services:
       dockerfile: deploy/Dockerfile
     environment:
       BIND_ADDR: 0.0.0.0:8080
-      DATABASE_URL: postgres://graphwar:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/graphwar
+      DATABASE_URL: postgres://graphwar@postgres:5432/graphwar
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
       DATABASE_MAX_CONNECTIONS: 10
       ALLOWED_ORIGINS: https://${DOMAIN:?set DOMAIN}
       SECURE_COOKIES: true

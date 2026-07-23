@@ -97,6 +97,10 @@ The available commands are:
 
 Just type them on the game chat to use them.
 
+## Rust/WASM deployment
+
+`deploy/compose.yaml` treats `POSTGRES_PASSWORD` as PostgreSQL bootstrap input. Changing it after the `postgres-data` volume exists does not change the database role password. Rotate an existing deployment with the old credential: run a controlled `ALTER ROLE graphwar PASSWORD ...`, update the deployment secret, then recreate the app and PostgreSQL services. Never rotate by changing only the Compose environment.
+
 ## Running The Game
 
 Compile the game using the make command (or on your favorite IDE).

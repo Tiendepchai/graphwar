@@ -92,11 +92,13 @@ pub fn trace(
         if !to.0.is_finite() || !to.1.is_finite() {
             break;
         }
-        result.points.push(to);
-        collect_hits(&mut result.hits, from, to, game, step);
-        if terrain.segment_collides(from, to) {
+        if let Some(collision) = terrain.segment_collision_point(from, to) {
+            result.points.push(collision);
+            collect_hits(&mut result.hits, from, collision, game, step);
             break;
         }
+        result.points.push(to);
+        collect_hits(&mut result.hits, from, to, game, step);
         previous = next;
     }
     (result.points.len() > 1)
@@ -241,7 +243,7 @@ fn converge_angle(mut update: impl FnMut(f64) -> f64) -> f64 {
         }
         angle = next;
     }
-    angle
+    f64::NAN
 }
 
 fn collect_hits(
@@ -256,7 +258,7 @@ fn collect_hits(
             if player_index == game.turn && soldier_index == player.current_soldier {
                 continue;
             }
-            if distance_to_segment((soldier.x, soldier.y), from, to) < SOLDIER_RADIUS
+            if distance_to_segment((soldier.x, soldier.y), from, to) <= SOLDIER_RADIUS
                 && !hits
                     .iter()
                     .any(|hit| hit.player == player_index && hit.soldier == soldier_index)
@@ -287,6 +289,7 @@ mod tests {
     use crate::{
         model::{Player, Soldier, Team},
         parse,
+        terrain::Circle,
     };
     fn game() -> GameState {
         GameState::new(vec![Player::new(
@@ -294,6 +297,13 @@ mod tests {
             Team::One,
             vec![Soldier::new(100.0, 225.0)],
         )])
+    }
+
+    fn game_with_target(x: f64, y: f64) -> GameState {
+        GameState::new(vec![
+            Player::new(1, Team::One, vec![Soldier::new(100.0, 225.0)]),
+            Player::new(2, Team::Two, vec![Soldier::new(x, y)]),
+        ])
     }
     #[test]
     fn nan_stops_without_poisoning_points() {
@@ -349,5 +359,69 @@ mod tests {
                         .all(|point| point.0.is_finite() && point.1.is_finite())
             );
         }
+    }
+
+    #[test]
+    fn terrain_clips_path_and_blocks_target_behind_it() {
+        let terrain = Terrain::new(vec![Circle {
+            x: 200.0,
+            y: 225.0,
+            radius: 10.0,
+        }]);
+        let path = trace(
+            &parse("0").unwrap(),
+            TrajectoryMode::Function,
+            &terrain,
+            &game_with_target(250.0, 225.0),
+            false,
+        )
+        .unwrap();
+        let endpoint = path.points.last().unwrap();
+        assert!((endpoint.0 - 190.0).abs() < 0.01);
+        assert!(path.hits.is_empty());
+    }
+
+    #[test]
+    fn target_before_terrain_is_hit() {
+        let terrain = Terrain::new(vec![Circle {
+            x: 250.0,
+            y: 225.0,
+            radius: 10.0,
+        }]);
+        let path = trace(
+            &parse("0").unwrap(),
+            TrajectoryMode::Function,
+            &terrain,
+            &game_with_target(180.0, 225.0),
+            false,
+        )
+        .unwrap();
+        assert!(
+            path.hits
+                .iter()
+                .any(|hit| hit.player == 1 && hit.soldier == 0)
+        );
+    }
+
+    #[test]
+    fn tangent_target_is_hit() {
+        let path = trace(
+            &parse("0").unwrap(),
+            TrajectoryMode::Function,
+            &Terrain::default(),
+            &game_with_target(180.0, 225.0 + SOLDIER_RADIUS),
+            false,
+        )
+        .unwrap();
+        assert!(
+            path.hits
+                .iter()
+                .any(|hit| hit.player == 1 && hit.soldier == 0)
+        );
+    }
+
+    #[test]
+    fn angle_non_convergence_fails() {
+        assert!(converge_angle(|angle| if angle == 0.0 { 1.0 } else { 0.0 }).is_nan());
     }
 }

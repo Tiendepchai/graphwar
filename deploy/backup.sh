@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
 case ${1:-backup} in
   backup)
     [ "$#" -le 1 ] || { printf '%s\n' 'usage: backup.sh [backup|verify FILE]' >&2; exit 64; }
@@ -9,13 +11,13 @@ case ${1:-backup} in
     case ${COMPOSE_BIN:-auto} in
       auto)
         if command -v docker-compose >/dev/null 2>&1; then
-          compose() { docker-compose -f deploy/compose.yaml "$@"; }
+          compose() { docker-compose -f "$script_dir/compose.yaml" "$@"; }
         else
-          compose() { docker compose -f deploy/compose.yaml "$@"; }
+          compose() { docker compose -f "$script_dir/compose.yaml" "$@"; }
         fi
         ;;
-      docker-compose) compose() { docker-compose -f deploy/compose.yaml "$@"; } ;;
-      docker) compose() { docker compose -f deploy/compose.yaml "$@"; } ;;
+      docker-compose) compose() { docker-compose -f "$script_dir/compose.yaml" "$@"; } ;;
+      docker) compose() { docker compose -f "$script_dir/compose.yaml" "$@"; } ;;
       *) printf '%s\n' 'COMPOSE_BIN must be auto, docker-compose, or docker' >&2; exit 64 ;;
     esac
     backup_dir=${BACKUP_DIR:-./backups}

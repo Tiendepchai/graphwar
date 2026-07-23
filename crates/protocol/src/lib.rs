@@ -174,6 +174,7 @@ pub enum ServerMessage {
         code: String,
         message: String,
     },
+    SessionExpired,
     RoomCreated {
         snapshot: RoomSnapshot,
         invite: Option<String>,
@@ -238,6 +239,16 @@ mod tests {
             serde_json::from_str::<SnapshotEnvelope<Phase>>(&serde_json::to_string(&snap).unwrap())
                 .unwrap(),
             snap
+        );
+    }
+
+    #[test]
+    fn session_expiry_message_round_trips() {
+        let json = serde_json::to_string(&ServerMessage::SessionExpired).unwrap();
+        assert_eq!(json, r#"{"type":"session_expired"}"#);
+        assert_eq!(
+            serde_json::from_str::<ServerMessage>(&json).unwrap(),
+            ServerMessage::SessionExpired
         );
     }
 

@@ -16,6 +16,13 @@ pub fn trace_preview(
         .position(|soldier| soldier.active && soldier.alive)
         .ok_or("No active soldier")?;
     let expression = parse(function).map_err(|_| "Invalid function")?;
+    let game_mode = model.game_mode.unwrap_or(GameMode::Function);
+    if !expression.variables_allowed(
+        game_mode != GameMode::Function,
+        game_mode == GameMode::SecondOrder,
+    ) {
+        return Err("Variable unavailable in this mode");
+    }
     let mut order = Vec::with_capacity(model.soldiers.len());
     order.push(active);
     order.extend((0..model.soldiers.len()).filter(|index| *index != active));
@@ -44,7 +51,7 @@ pub fn trace_preview(
             .map(circle)
             .collect(),
     };
-    let mode = match model.game_mode.unwrap_or(GameMode::Function) {
+    let mode = match game_mode {
         GameMode::Function => TrajectoryMode::Function,
         GameMode::FirstOrder => TrajectoryMode::FirstOrder,
         GameMode::SecondOrder => TrajectoryMode::SecondOrder {
@@ -85,6 +92,8 @@ mod tests {
             game_mode: Some(GameMode::Function),
             soldiers: vec![
                 SoldierView {
+                    player_id: "one".into(),
+                    index: 0,
                     x: 100.0,
                     y: 225.0,
                     team: 1,
@@ -92,6 +101,8 @@ mod tests {
                     active: true,
                 },
                 SoldierView {
+                    player_id: "two".into(),
+                    index: 0,
                     x: 650.0,
                     y: 225.0,
                     team: 2,
@@ -106,6 +117,20 @@ mod tests {
             trace_preview(&model, "garbage", 0.0),
             Err("Invalid function")
         );
+        assert_eq!(trace_preview(&model, "x+", 0.0), Err("Invalid function"));
+        assert!(trace_preview(&model, "sin(x)", 0.0).is_ok());
+        assert_eq!(
+            trace_preview(&model, "y", 0.0),
+            Err("Variable unavailable in this mode")
+        );
+        model.game_mode = Some(GameMode::FirstOrder);
+        assert!(trace_preview(&model, "y", 0.0).is_ok());
+        assert_eq!(
+            trace_preview(&model, "y'", 0.0),
+            Err("Variable unavailable in this mode")
+        );
+        model.game_mode = Some(GameMode::SecondOrder);
+        assert!(trace_preview(&model, "y + y'", 0.0).is_ok());
 
         model.soldiers[0].active = false;
         assert_eq!(trace_preview(&model, "0", 0.0), Err("No active soldier"));

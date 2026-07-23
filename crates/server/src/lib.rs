@@ -4,6 +4,7 @@ pub mod config;
 pub mod rooms;
 
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -32,12 +33,15 @@ pub use config::Config;
 use rooms::{RoomError, RoomRegistry};
 
 const MAX_WS_MESSAGE_BYTES: usize = 8 * 1024;
+const MAX_WS_TRANSPORT_BYTES: usize = 16 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 16 * 1024;
 const MAX_MESSAGES_PER_WINDOW: usize = 120;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
 const WS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const BOT_SEARCH_BUDGET: Duration = Duration::from_secs(2);
+const DISCONNECT_GRACE: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -45,6 +49,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub rooms: RoomRegistry,
     events: broadcast::Sender<ScopedEvent>,
+    presence: Arc<RwLock<HashMap<uuid::Uuid, usize>>>,
 }
 
 impl AppState {
@@ -55,6 +60,7 @@ impl AppState {
             config: Arc::new(config),
             rooms: Arc::new(RwLock::new(Default::default())),
             events,
+            presence: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -64,6 +70,7 @@ impl AppState {
             self.broadcast_turn(outcome);
         }
         self.drive_bots().await;
+        self.cleanup_inactive_connections().await;
     }
 
     async fn drive_bots(&self) {
@@ -85,7 +92,7 @@ impl AppState {
                     level,
                     seed,
                     memory,
-                    budget: Duration::from_secs(50),
+                    budget: BOT_SEARCH_BUDGET,
                 })
             })
             .await
@@ -151,6 +158,104 @@ impl AppState {
             audience: Audience::Room { room_id, players },
             message,
         });
+    }
+
+    async fn socket_connected(&self, player: uuid::Uuid) {
+        self.presence
+            .write()
+            .await
+            .entry(player)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+    }
+
+    fn socket_disconnected(&self, player: uuid::Uuid) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(DISCONNECT_GRACE).await;
+            if state.release_socket(player).await {
+                state.cleanup_disconnected(player).await;
+            }
+        });
+    }
+
+    async fn release_socket(&self, player: uuid::Uuid) -> bool {
+        let mut presence = self.presence.write().await;
+        let Some(count) = presence.get_mut(&player) else {
+            return false;
+        };
+        *count = count.saturating_sub(1);
+        *count == 0
+    }
+
+    async fn cleanup_disconnected(&self, player: uuid::Uuid) {
+        let cleanup = {
+            let presence = self.presence.write().await;
+            if presence.get(&player).is_some_and(|count| *count > 0) {
+                return;
+            }
+            let mut rooms = self.rooms.write().await;
+            let old_room = rooms
+                .member_snapshot(player)
+                .map(|snapshot| snapshot.id)
+                .ok();
+            let cleanup = match old_room {
+                Some(old_room) => match rooms.leave(player) {
+                    Ok(snapshot) => Some((
+                        old_room,
+                        snapshot,
+                        rooms.member_ids(old_room),
+                        rooms.public_snapshots(),
+                    )),
+                    Err(RoomError::WrongPhase) => None,
+                    Err(_) => None,
+                },
+                None => Some((
+                    uuid::Uuid::nil(),
+                    None,
+                    Vec::new(),
+                    rooms.public_snapshots(),
+                )),
+            };
+            drop(rooms);
+            drop(presence);
+            cleanup
+        };
+        let Some((old_room, snapshot, players, public_rooms)) = cleanup else {
+            return;
+        };
+        if let Some(snapshot) = snapshot {
+            let _ = self.events.send(ScopedEvent {
+                audience: Audience::Room {
+                    room_id: old_room,
+                    players,
+                },
+                message: ServerMessage::Room { snapshot },
+            });
+        }
+        let _ = self.events.send(ScopedEvent {
+            audience: Audience::Lobby,
+            message: ServerMessage::RoomList {
+                rooms: public_rooms,
+            },
+        });
+        let mut presence = self.presence.write().await;
+        if presence.get(&player) == Some(&0) {
+            presence.remove(&player);
+        }
+    }
+
+    async fn cleanup_inactive_connections(&self) {
+        let players = self
+            .presence
+            .read()
+            .await
+            .iter()
+            .filter_map(|(player, count)| (*count == 0).then_some(*player))
+            .collect::<Vec<_>>();
+        for player in players {
+            self.cleanup_disconnected(player).await;
+        }
     }
 }
 
@@ -236,7 +341,7 @@ async fn websocket(
         .await?
         .ok_or_else(ApiError::unauthorized)?;
     Ok(ws
-        .max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_message_size(MAX_WS_TRANSPORT_BYTES)
         .on_upgrade(move |socket| handle_socket(socket, state, user, token, peer))
         .into_response())
 }
@@ -248,6 +353,7 @@ async fn handle_socket(
     session_token: String,
     _peer: SocketAddr,
 ) {
+    state.socket_connected(user.id).await;
     let (mut sender, mut receiver) = socket.split();
     let mut events = state.events.subscribe();
     if send_message(
@@ -259,6 +365,7 @@ async fn handle_socket(
     .await
     .is_err()
     {
+        state.socket_disconnected(user.id);
         return;
     }
 
@@ -272,15 +379,49 @@ async fn handle_socket(
     loop {
         tokio::select! {
             incoming = receiver.next() => {
-                let Some(Ok(message)) = incoming else {
+                let Some(message) = incoming else {
                     break;
                 };
-                if !auth::session_is_valid(&state.pool, user.id, &session_token)
-                    .await
-                    .unwrap_or(false)
-                {
-                    break;
+                let message = match message {
+                    Ok(message) => message,
+                    Err(error) => {
+                        if error.to_string().contains("Message too long:") {
+                            let _ = send_frame(
+                                &mut sender,
+                                Message::Close(Some(axum::extract::ws::CloseFrame {
+                                    code: 1009,
+                                    reason: "message too large".into(),
+                                })),
+                            )
+                            .await;
+                        }
+                        break;
+                    }
                 };
+                let message_len = match &message {
+                    Message::Text(text) => text.len(),
+                    Message::Binary(bytes) => bytes.len(),
+                    _ => 0,
+                };
+                if message_len > MAX_WS_MESSAGE_BYTES {
+                    let _ = send_frame(
+                        &mut sender,
+                        Message::Close(Some(axum::extract::ws::CloseFrame {
+                            code: 1009,
+                            reason: "message too large".into(),
+                        })),
+                    )
+                    .await;
+                    break;
+                }
+                match auth::session_is_valid(&state.pool, user.id, &session_token).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let _ = send_message(&mut sender, &ServerMessage::SessionExpired).await;
+                        break;
+                    }
+                    Err(_) => break,
+                }
                 last_seen = Instant::now();
                 if window_started.elapsed() >= RATE_WINDOW {
                     window_started = Instant::now();
@@ -343,11 +484,13 @@ async fn handle_socket(
                 }
             }
             event = events.recv() => {
-                if !auth::session_is_valid(&state.pool, user.id, &session_token)
-                    .await
-                    .unwrap_or(false)
-                {
-                    break;
+                match auth::session_is_valid(&state.pool, user.id, &session_token).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let _ = send_message(&mut sender, &ServerMessage::SessionExpired).await;
+                        break;
+                    }
+                    Err(_) => break,
                 }
                 if !hello_complete {
                     continue;
@@ -368,10 +511,15 @@ async fn handle_socket(
                 }
             }
             _ = heartbeat.tick() => {
-                if !auth::session_is_valid(&state.pool, user.id, &session_token)
-                    .await
-                    .unwrap_or(false)
-                    || last_seen.elapsed() >= HEARTBEAT_TIMEOUT
+                match auth::session_is_valid(&state.pool, user.id, &session_token).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let _ = send_message(&mut sender, &ServerMessage::SessionExpired).await;
+                        break;
+                    }
+                    Err(_) => break,
+                }
+                if last_seen.elapsed() >= HEARTBEAT_TIMEOUT
                     || send_frame(&mut sender, Message::Ping(Vec::new().into())).await.is_err()
                 {
                     break;
@@ -379,6 +527,7 @@ async fn handle_socket(
             }
         }
     }
+    state.socket_disconnected(user.id);
 }
 
 async fn send_message<S, E>(socket: &mut S, message: &ServerMessage) -> Result<(), ()>
@@ -474,8 +623,11 @@ async fn dispatch(
         ClientMessage::CreateRoom { name, visibility } => {
             let (snapshot, invite) =
                 rooms.create(user.id, user.display_name.clone(), name, visibility)?;
-            let outcome = DispatchOutcome::private(ServerMessage::RoomCreated { snapshot, invite });
-            Ok(outcome.with_lobby(rooms.public_snapshots()))
+            Ok(DispatchOutcome::accounts(
+                vec![user.id],
+                ServerMessage::RoomCreated { snapshot, invite },
+            )
+            .with_lobby(rooms.public_snapshots()))
         }
         ClientMessage::JoinRoom { room_id, invite } => {
             let snapshot = rooms.join(
@@ -613,15 +765,22 @@ async fn send_sync<S, E>(state: &AppState, player: uuid::Uuid, sender: &mut S) -
 where
     S: Sink<Message, Error = E> + Unpin,
 {
-    let message = {
+    let messages = {
         let rooms = state.rooms.read().await;
-        match rooms.member_state(player) {
+        let room = match rooms.member_state(player) {
             Ok((snapshot, game)) => ServerMessage::StateSync { snapshot, game },
             Err(RoomError::NotMember) => ServerMessage::LeftRoom,
             Err(_) => return Err(()),
-        }
+        };
+        (
+            room,
+            ServerMessage::RoomList {
+                rooms: rooms.public_snapshots(),
+            },
+        )
     };
-    send_message(sender, &message).await
+    send_message(sender, &messages.0).await?;
+    send_message(sender, &messages.1).await
 }
 
 async fn event_visible_to(state: &AppState, player: uuid::Uuid, event: &ScopedEvent) -> bool {
@@ -736,6 +895,100 @@ mod tests {
             verify_origin(&headers, &config).unwrap_err().status,
             StatusCode::FORBIDDEN
         );
+    }
+
+    fn test_state() -> AppState {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://unused")
+            .expect("test pool");
+        AppState::new(pool, Config::test())
+    }
+
+    fn test_user(id: uuid::Uuid, display_name: &str) -> auth::User {
+        auth::User::test(id, display_name)
+    }
+
+    #[tokio::test]
+    async fn final_lobby_disconnect_removes_member_and_promotes_owner() {
+        let state = test_state();
+        let owner = uuid::Uuid::new_v4();
+        let guest = uuid::Uuid::new_v4();
+        {
+            let mut rooms = state.rooms.write().await;
+            let room = rooms
+                .create(
+                    owner,
+                    "Owner".into(),
+                    "room".into(),
+                    graphwar_protocol::RoomVisibility::Public,
+                )
+                .unwrap()
+                .0;
+            rooms.join(guest, "Guest".into(), room.id, None).unwrap();
+        }
+        state.socket_connected(owner).await;
+        assert!(state.release_socket(owner).await);
+        state.cleanup_disconnected(owner).await;
+
+        let snapshot = state.rooms.read().await.member_snapshot(guest).unwrap();
+        assert_eq!(snapshot.players.len(), 1);
+        assert_eq!(snapshot.players[0].id, guest);
+        assert!(snapshot.players[0].owner);
+    }
+
+    #[tokio::test]
+    async fn remaining_or_reconnected_socket_prevents_cleanup() {
+        let state = test_state();
+        let player = uuid::Uuid::new_v4();
+        state
+            .rooms
+            .write()
+            .await
+            .create(
+                player,
+                "Player".into(),
+                "room".into(),
+                graphwar_protocol::RoomVisibility::Public,
+            )
+            .unwrap();
+        state.socket_connected(player).await;
+        state.socket_connected(player).await;
+        assert!(!state.release_socket(player).await);
+        state.cleanup_disconnected(player).await;
+        assert!(state.rooms.read().await.member_snapshot(player).is_ok());
+
+        assert!(state.release_socket(player).await);
+        state.socket_connected(player).await;
+        state.cleanup_disconnected(player).await;
+        assert!(state.rooms.read().await.member_snapshot(player).is_ok());
+    }
+
+    #[tokio::test]
+    async fn private_room_creation_targets_every_account_socket() {
+        let state = test_state();
+        let player = uuid::Uuid::new_v4();
+        let user = test_user(player, "Player");
+        let outcome = dispatch(
+            &state,
+            &user,
+            ClientMessage::CreateRoom {
+                name: "private".into(),
+                visibility: graphwar_protocol::RoomVisibility::Private,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(outcome.private.is_none());
+        assert!(outcome.broadcasts.iter().any(|event| {
+            matches!(&event.audience, Audience::Accounts(accounts) if accounts == &[player])
+                && matches!(
+                    event.message,
+                    ServerMessage::RoomCreated {
+                        invite: Some(_),
+                        ..
+                    }
+                )
+        }));
     }
 
     #[tokio::test]

@@ -33,6 +33,18 @@ pub struct User {
     password_hash: String,
 }
 
+#[cfg(test)]
+impl User {
+    pub(crate) fn test(id: Uuid, display_name: &str) -> Self {
+        Self {
+            id,
+            email: "test@example.invalid".into(),
+            display_name: display_name.into(),
+            password_hash: String::new(),
+        }
+    }
+}
+
 pub async fn register(
     pool: &PgPool,
     email: String,

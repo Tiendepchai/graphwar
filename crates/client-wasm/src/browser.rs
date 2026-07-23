@@ -15,6 +15,26 @@ use web_sys::{
     RequestCredentials, WebSocket, Window,
 };
 
+const PRESERVED_INPUTS: &[&str] = &[
+    "login-email",
+    "login-password",
+    "register-name",
+    "register-email",
+    "register-password",
+    "room-name",
+    "private-room-id",
+    "invite-code",
+    "function-input",
+    "chat-input",
+];
+
+#[derive(Default)]
+struct FormState {
+    inputs: Vec<(String, String)>,
+    room_visibility: Option<String>,
+    focus: Option<(String, Option<u32>, Option<u32>, Option<String>)>,
+}
+
 use crate::{
     animation::visible_points,
     geometry::{LOGICAL_HEIGHT, LOGICAL_WIDTH, Viewport},
@@ -33,10 +53,11 @@ struct App {
     auth_pending: bool,
     auth_request: Option<AbortController>,
     event_handlers: Vec<Closure<dyn FnMut(Event)>>,
-    pending_messages: Vec<ClientMessage>,
     reconnect_attempt: u32,
     reconnect_timer: Option<Timeout>,
     clock: Option<Interval>,
+    viewport_handler: Option<Closure<dyn FnMut(Event)>>,
+    expired_deadline: Option<i64>,
     shot_animation: Option<ShotAnimation>,
     ws_url: String,
 }
@@ -72,16 +93,18 @@ pub fn start() -> Result<(), JsValue> {
         auth_pending: false,
         auth_request: None,
         event_handlers: Vec::new(),
-        pending_messages: Vec::new(),
         reconnect_attempt: 0,
         reconnect_timer: None,
         clock: None,
+        viewport_handler: None,
+        expired_deadline: None,
         shot_animation: None,
         ws_url,
     }));
 
     render(&app)?;
     bind_events(&app)?;
+    bind_viewport_events(&app)?;
     let clock_app = Rc::clone(&app);
     app.borrow_mut().clock = Some(Interval::new(1_000, move || update_timer(&clock_app)));
     restore_session(&app);
@@ -89,30 +112,45 @@ pub fn start() -> Result<(), JsValue> {
 }
 
 fn restore_session(app: &SharedApp) {
-    let Some((auth_epoch, controller)) = begin_authentication(app) else {
-        return;
-    };
+    let auth_epoch = app.borrow().auth_epoch;
     let app = Rc::clone(app);
     spawn_local(async move {
-        let request = Request::get("/auth/me")
+        match Request::get("/auth/me")
             .credentials(RequestCredentials::SameOrigin)
-            .abort_signal(Some(&controller.signal()));
-        match request.send().await {
+            .send()
+            .await
+        {
             Ok(response) if response.ok() => match response.json::<AccountResponse>().await {
-                Ok(account) => authenticated(&app, auth_epoch, account),
-                Err(error) if finish_authentication_failure(&app, auth_epoch) => {
-                    log_error(&format!("account response failed: {error:?}"));
-                }
-                Err(_) => {}
+                Ok(account) => restored_authenticated(&app, auth_epoch, account),
+                Err(error) => log_error(&format!("account response failed: {error:?}")),
             },
-            Ok(_) if finish_authentication_failure(&app, auth_epoch) => rerender(&app),
             Ok(_) => {}
-            Err(error) if finish_authentication_failure(&app, auth_epoch) => {
-                log_error(&format!("session restore failed: {error:?}"));
-            }
-            Err(_) => {}
+            Err(error) => log_error(&format!("session restore failed: {error:?}")),
         }
     });
+}
+
+fn restored_authenticated(app: &SharedApp, auth_epoch: u64, account: AccountResponse) {
+    {
+        let mut app_ref = app.borrow_mut();
+        if app_ref.auth_epoch != auth_epoch
+            || app_ref.auth_pending
+            || app_ref.model.player_id.is_some()
+        {
+            return;
+        }
+        reduce(
+            &mut app_ref.model,
+            Action::Authenticated {
+                player_id: account.id.to_string(),
+                display_name: account.display_name,
+            },
+        );
+    }
+    rerender(app);
+    if let Err(error) = connect(app) {
+        notice(app, format!("connection failed: {error:?}"));
+    }
 }
 
 fn websocket_url(window: &Window) -> Result<String, JsValue> {
@@ -137,7 +175,6 @@ fn begin_authentication(app: &SharedApp) -> Option<(u64, AbortController)> {
         app.auth_request = Some(controller.clone());
         app.connection_epoch = app.connection_epoch.saturating_add(1);
         app.reconnect_timer = None;
-        app.pending_messages.clear();
         (
             app.auth_epoch,
             app.socket.take(),
@@ -221,13 +258,12 @@ fn connect(app: &SharedApp) -> Result<(), JsValue> {
         if !connection_is_current(&open_app.borrow(), connection_epoch, auth_epoch) {
             return;
         }
-        let pending = {
+        {
             let mut app = open_app.borrow_mut();
             app.reconnect_attempt = 0;
             app.reconnect_timer = None;
             reduce(&mut app.model, Action::Connected);
-            std::mem::take(&mut app.pending_messages)
-        };
+        }
         send_current(
             &open_app,
             connection_epoch,
@@ -242,9 +278,6 @@ fn connect(app: &SharedApp) -> Result<(), JsValue> {
             auth_epoch,
             ClientMessage::ListRooms,
         );
-        for message in pending {
-            send_current(&open_app, connection_epoch, auth_epoch, message);
-        }
         rerender(&open_app);
     });
     socket.set_onopen(Some(onopen.as_ref().unchecked_ref()));
@@ -258,17 +291,29 @@ fn connect(app: &SharedApp) -> Result<(), JsValue> {
             return;
         };
         match serde_json::from_str::<ServerMessage>(&text) {
+            Ok(ServerMessage::SessionExpired) => session_expired(&message_app),
             Ok(message) => {
-                let prior_sequence = message_app.borrow().model.shot_sequence;
+                announce_server_message(&message_app, &message);
+                let app_ref = message_app.borrow();
+                let was_game = app_ref.model.screen == Screen::Game;
+                let prior_sequence = app_ref.model.shot_sequence;
+                drop(app_ref);
                 reduce(
                     &mut message_app.borrow_mut().model,
                     Action::Message(Box::new(message)),
                 );
-                let sequence = message_app.borrow().model.shot_sequence;
+                let app_ref = message_app.borrow();
+                let is_game = app_ref.model.screen == Screen::Game;
+                let sequence = app_ref.model.shot_sequence;
+                drop(app_ref);
                 if sequence != prior_sequence {
                     start_shot_animation(&message_app, sequence);
                 }
-                rerender(&message_app);
+                if was_game && is_game {
+                    refresh_game(&message_app);
+                } else {
+                    rerender(&message_app);
+                }
             }
             Err(error) => log_error(&format!("protocol error: {error}")),
         }
@@ -351,7 +396,7 @@ fn schedule_reconnect(app: &SharedApp, connection_epoch: u64, auth_epoch: u64) {
 }
 
 fn send(app: &SharedApp, message: ClientMessage) {
-    let (connection_epoch, auth_epoch, queue) = {
+    let (connection_epoch, auth_epoch, unavailable) = {
         let app = app.borrow();
         (
             app.connection_epoch,
@@ -363,8 +408,8 @@ fn send(app: &SharedApp, message: ClientMessage) {
                     .is_none_or(|socket| socket.ready_state() != WebSocket::OPEN),
         )
     };
-    if queue {
-        app.borrow_mut().pending_messages.push(message);
+    if unavailable {
+        notice(app, "Connection unavailable; action not sent".into());
         return;
     }
     send_current(app, connection_epoch, auth_epoch, message);
@@ -456,6 +501,25 @@ fn authenticated(app: &SharedApp, auth_epoch: u64, account: AccountResponse) {
     }
 }
 
+fn session_expired(app: &SharedApp) {
+    let (socket, handlers) = {
+        let mut app_ref = app.borrow_mut();
+        app_ref.auth_epoch = app_ref.auth_epoch.saturating_add(1);
+        app_ref.auth_pending = false;
+        app_ref.connection_epoch = app_ref.connection_epoch.saturating_add(1);
+        app_ref.reconnect_timer = None;
+        app_ref.auth_request = None;
+        let socket = app_ref.socket.take();
+        let handlers = app_ref.socket_handlers.take();
+        reduce(&mut app_ref.model, Action::SessionExpired);
+        (socket, handlers)
+    };
+    if let Some(socket) = socket {
+        dispose_socket(socket, handlers);
+    }
+    notice(app, "Session expired; sign in again".into());
+}
+
 fn logout(app: &SharedApp) {
     let (auth_epoch, request, socket, handlers) = {
         let mut app_ref = app.borrow_mut();
@@ -463,7 +527,6 @@ fn logout(app: &SharedApp) {
         app_ref.auth_pending = false;
         app_ref.connection_epoch = app_ref.connection_epoch.saturating_add(1);
         app_ref.reconnect_timer = None;
-        app_ref.pending_messages.clear();
         let request = app_ref.auth_request.take();
         let socket = app_ref.socket.take();
         let handlers = app_ref.socket_handlers.take();
@@ -521,7 +584,60 @@ async fn post_json<T: serde::Serialize>(
         .map_err(|error| format!("invalid account response: {error:?}"))
 }
 
+fn announce(app: &SharedApp, message: &str) {
+    if let Some(region) = app.borrow().document.get_element_by_id("announcements") {
+        region.set_text_content(None);
+        region.set_text_content(Some(message));
+    }
+}
+
+fn announce_server_message(app: &SharedApp, message: &ServerMessage) {
+    let message = match message {
+        ServerMessage::Chat { player_id, text } => {
+            let name = app
+                .borrow()
+                .model
+                .players
+                .iter()
+                .find(|player| player.id == player_id.to_string())
+                .map(|player| player.name.clone())
+                .unwrap_or_else(|| "Player".into());
+            Some(format!("{name}: {text}"))
+        }
+        ServerMessage::GameStarted { snapshot, .. } => {
+            Some(format!("Match started in {}", snapshot.name))
+        }
+        ServerMessage::TurnStarted { game, .. } => game
+            .turn_player_id
+            .and_then(|player_id| {
+                app.borrow()
+                    .model
+                    .players
+                    .iter()
+                    .find(|player| player.id == player_id.to_string())
+                    .map(|player| player.name.clone())
+            })
+            .map(|name| format!("{name}'s turn")),
+        ServerMessage::ShotResolved { shot, .. } => Some(if shot.hits.is_empty() {
+            "Shot resolved; no soldiers hit".into()
+        } else {
+            format!("Shot resolved; {} soldier(s) hit", shot.hits.len())
+        }),
+        ServerMessage::GameFinished { shot, .. } => Some(match shot.winner_team {
+            Some(1) => "Match finished; Team One wins".into(),
+            Some(2) => "Match finished; Team Two wins".into(),
+            _ => "Match finished; draw".into(),
+        }),
+        ServerMessage::Error { message, .. } => Some(message.clone()),
+        _ => None,
+    };
+    if let Some(message) = message {
+        announce(app, &message);
+    }
+}
+
 fn notice(app: &SharedApp, message: String) {
+    announce(app, &message);
     {
         let mut app = app.borrow_mut();
         app.model.notices.push(message);
@@ -529,17 +645,186 @@ fn notice(app: &SharedApp, message: String) {
             app.model.notices.remove(0);
         }
     }
-    rerender(app);
+    if app.borrow().model.screen == Screen::Game {
+        refresh_game(app);
+    } else {
+        rerender(app);
+    }
 }
 
 fn rerender(app: &SharedApp) {
+    let form_state = capture_form_state(app);
     if let Err(error) = render(app) {
         log_error(&format!("render failed: {error:?}"));
         return;
     }
+    restore_form_state(app, form_state);
     app.borrow_mut().event_handlers.clear();
     if let Err(error) = bind_events(app) {
         log_error(&format!("event binding failed: {error:?}"));
+    }
+}
+
+fn refresh_game(app: &SharedApp) {
+    if let Err(error) = refresh_game_dom(app) {
+        log_error(&format!("game refresh failed: {error:?}"));
+        rerender(app);
+    }
+}
+
+fn refresh_game_dom(app: &SharedApp) -> Result<(), JsValue> {
+    let preview_input = {
+        let app_ref = app.borrow();
+        let document = &app_ref.document;
+        let model = &app_ref.model;
+        if model.screen != Screen::Game {
+            return Err(JsValue::from_str("game screen unavailable"));
+        }
+
+        game_element(document, "#turn-timer")?.set_text_content(Some(&timer_text(model)));
+        game_element(document, "#game-title")?.set_text_content(Some(&model.room_name));
+        game_element(document, ".scoreboard ul")?.set_inner_html(&scoreboard_rows_html(model));
+        game_element(document, "#battlefield-summary")?
+            .set_text_content(Some(&battlefield_summary(model)));
+        game_element(document, ".chat-panel ul")?.set_inner_html(&chat_messages_html(model));
+        game_element(document, ".notices")?.set_inner_html(&notice_items_html(model));
+
+        let local_turn = local_turn(model);
+        let function_input =
+            game_element(document, "#function-input")?.dyn_into::<HtmlInputElement>()?;
+        let start_preview =
+            function_input.disabled() && local_turn && model.preview_path.is_empty();
+        function_input.set_disabled(!local_turn);
+
+        let second_order = model.game_mode == Some(GameMode::SecondOrder);
+        set_boolean_attribute(
+            &game_element(document, ".angle-field")?,
+            "hidden",
+            !second_order,
+        )?;
+        game_element(document, "#angle-input")?
+            .dyn_into::<HtmlInputElement>()?
+            .set_disabled(!second_order || !local_turn);
+        let fire_button = game_element(document, ".fire-button")?;
+        set_boolean_attribute(&fire_button, "disabled", !local_turn)?;
+        game_element(document, ".fire-button span")?.set_text_content(Some(if local_turn {
+            "Fire"
+        } else {
+            "Waiting"
+        }));
+
+        start_preview.then_some(function_input)
+    };
+
+    if let Some(input) = preview_input {
+        update_preview(app, &input);
+        Ok(())
+    } else {
+        render_canvas(app)
+    }
+}
+
+fn game_element(document: &Document, selector: &str) -> Result<web_sys::Element, JsValue> {
+    document
+        .query_selector(selector)?
+        .ok_or_else(|| JsValue::from_str(&format!("{selector} missing")))
+}
+
+fn set_boolean_attribute(
+    element: &web_sys::Element,
+    name: &str,
+    enabled: bool,
+) -> Result<(), JsValue> {
+    if enabled {
+        element.set_attribute(name, "")
+    } else {
+        element.remove_attribute(name)
+    }
+}
+
+fn capture_form_state(app: &SharedApp) -> FormState {
+    let app = app.borrow();
+    let inputs = PRESERVED_INPUTS
+        .iter()
+        .filter_map(|id| {
+            app.document
+                .get_element_by_id(id)?
+                .dyn_into::<HtmlInputElement>()
+                .ok()
+                .map(|input| ((*id).to_owned(), input.value()))
+        })
+        .collect();
+    let room_visibility = app
+        .document
+        .get_element_by_id("room-visibility")
+        .and_then(|element| element.dyn_into::<HtmlSelectElement>().ok())
+        .map(|select| select.value());
+    let focus = app.document.active_element().and_then(|element| {
+        let selector = focus_selector(&element)?;
+        let input = element.dyn_ref::<HtmlInputElement>();
+        Some((
+            selector,
+            input.and_then(|input| input.selection_start().ok().flatten()),
+            input.and_then(|input| input.selection_end().ok().flatten()),
+            input.and_then(|input| input.selection_direction().ok().flatten()),
+        ))
+    });
+    FormState {
+        inputs,
+        room_visibility,
+        focus,
+    }
+}
+
+fn focus_selector(element: &web_sys::Element) -> Option<String> {
+    let id = element.id();
+    if !id.is_empty() {
+        return Some(format!("#{id}"));
+    }
+    if let Some(player_id) = element.get_attribute("data-player-id") {
+        return Some(format!(
+            "{}[data-player-id=\"{player_id}\"]",
+            element.tag_name().to_ascii_lowercase()
+        ));
+    }
+    let input = element.dyn_ref::<HtmlInputElement>()?;
+    input
+        .get_attribute("name")
+        .map(|name| format!("input[name=\"{name}\"][value=\"{}\"]", input.value()))
+}
+
+fn restore_form_state(app: &SharedApp, state: FormState) {
+    let document = app.borrow().document.clone();
+    for (id, value) in state.inputs {
+        if let Some(input) = document
+            .get_element_by_id(&id)
+            .and_then(|element| element.dyn_into::<HtmlInputElement>().ok())
+        {
+            input.set_value(&value);
+        }
+    }
+    if let Some(value) = state.room_visibility
+        && let Some(select) = document
+            .get_element_by_id("room-visibility")
+            .and_then(|element| element.dyn_into::<HtmlSelectElement>().ok())
+    {
+        select.set_value(&value);
+    }
+    if let Some((selector, start, end, direction)) = state.focus
+        && let Ok(Some(element)) = document.query_selector(&selector)
+    {
+        if let Some(input) = element.dyn_ref::<HtmlInputElement>() {
+            let _ = input.focus();
+            if let (Some(start), Some(end)) = (start, end) {
+                let _ = input.set_selection_range_with_direction(
+                    start,
+                    end,
+                    direction.as_deref().unwrap_or("none"),
+                );
+            }
+        } else if let Ok(element) = element.dyn_into::<web_sys::HtmlElement>() {
+            let _ = element.focus();
+        }
     }
 }
 
@@ -562,8 +847,10 @@ fn render(app: &SharedApp) -> Result<(), JsValue> {
         notices_html(&app_ref.model)
     ));
     drop(app_ref);
-    if app.borrow().model.screen == Screen::Game {
-        render_canvas(app)?;
+    if app.borrow().model.screen == Screen::Game
+        && let Err(error) = render_canvas(app)
+    {
+        log_error(&format!("canvas render failed: {error:?}"));
     }
     Ok(())
 }
@@ -633,10 +920,12 @@ fn room_html(model: &Model) -> String {
             let controls = editable
                 .then(|| {
                     format!(
-                        "<div class=\"slot-controls\"><label>Team <select class=\"player-team\" data-player-id=\"{}\"><option value=\"1\"{}>One</option><option value=\"2\"{}>Two</option></select></label><label>Soldiers <select class=\"player-soldiers\" data-player-id=\"{}\">{}</select></label>{}</div>",
+                        "<div class=\"slot-controls\"><label><span class=\"sr-only\">{} </span>Team <select class=\"player-team\" data-player-id=\"{}\"><option value=\"1\"{}>One</option><option value=\"2\"{}>Two</option></select></label><label><span class=\"sr-only\">{} </span>Soldiers <select class=\"player-soldiers\" data-player-id=\"{}\">{}</select></label>{}</div>",
+                        escape(&player.name),
                         attr(&player.id),
                         (player.team == 1).then_some(" selected").unwrap_or(""),
                         (player.team == 2).then_some(" selected").unwrap_or(""),
+                        escape(&player.name),
                         attr(&player.id),
                         (1..=4)
                             .map(|count| format!(
@@ -647,17 +936,19 @@ fn room_html(model: &Model) -> String {
                         player
                             .is_bot
                             .then(|| format!(
-                                "<button class=\"remove-bot text-button\" data-player-id=\"{}\">Remove</button>",
-                                attr(&player.id)
+                                "<button class=\"remove-bot text-button\" data-player-id=\"{}\" aria-label=\"Remove {}\">Remove</button>",
+                                attr(&player.id),
+                                attr(&player.name)
                             ))
                             .unwrap_or_default()
                     )
                 })
                 .unwrap_or_default();
             format!(
-                "<li><span class=\"team team-{}\" aria-hidden=\"true\"></span><strong>{}</strong>{}<span class=\"ready-state\">{}</span>{}</li>",
+                "<li><span class=\"team team-{}\" aria-hidden=\"true\"></span><strong>{}</strong><span class=\"team-name\">{}</span>{}<span class=\"ready-state\">{}</span>{}</li>",
                 player.team,
                 escape(&player.name),
+                team_name(player.team),
                 if player.owner { "<small>Owner</small>" } else if player.is_bot { "<small>Computer</small>" } else { "" },
                 if player.ready { "Ready" } else { "Plotting" },
                 controls
@@ -679,17 +970,17 @@ fn room_html(model: &Model) -> String {
 }
 
 fn game_html(model: &Model) -> String {
-    let local_turn = model.room_phase == Some(graphwar_protocol::Phase::Planning)
-        && model.turn_deadline_at.is_some()
-        && model.player_id == model.turn_player_id;
+    let local_turn = local_turn(model);
     let disabled = (!local_turn).then_some(" disabled").unwrap_or("");
-    let angle_help = (model.game_mode == Some(GameMode::SecondOrder))
-        .then_some(" Focus the slider, then use Arrow Up/Down.")
-        .unwrap_or("");
+    let second_order = model.game_mode == Some(GameMode::SecondOrder);
+    let angle_hidden = (!second_order).then_some(" hidden").unwrap_or("");
+    let angle_disabled = (!second_order).then_some(" disabled").unwrap_or(disabled);
     format!(
-        "<section class=\"game-shell reveal\" aria-labelledby=\"game-title\"><div class=\"game-heading\"><div><p class=\"eyebrow\">Live match · <span id=\"turn-timer\" role=\"timer\">{}</span></p><h1 id=\"game-title\">{}</h1></div><button id=\"leave-room\" class=\"text-button\">Retreat</button></div><div class=\"battlefield\"><canvas id=\"game-canvas\" width=\"770\" height=\"450\" aria-label=\"Graphwar battlefield, 770 by 450 logical units. Dashed paths are provisional previews.\"></canvas><div class=\"preview-key\"><i></i> Provisional</div><div class=\"axis-label x-label\">x</div><div class=\"axis-label y-label\">y</div></div><form id=\"fire-form\" class=\"fire-console\"><div class=\"equation-field\"><label for=\"function-input\">Function</label><div><span aria-hidden=\"true\">y =</span><input id=\"function-input\" spellcheck=\"false\" autocomplete=\"off\" maxlength=\"256\" required value=\"{}\" aria-describedby=\"function-hint\"{disabled}></div><small id=\"function-hint\">Use x, sin, cos, tan, sqrt and standard operators.</small></div><div class=\"angle-field\"><label for=\"angle-input\">Angle <output id=\"angle-output\" aria-live=\"polite\">{:.1}°</output></label><input id=\"angle-input\" type=\"range\" min=\"-90\" max=\"90\" value=\"{:.1}\" step=\"0.1\" aria-describedby=\"angle-hint\"{disabled}><small id=\"angle-hint\">{angle_help}</small></div><button class=\"fire-button\" type=\"submit\"{disabled}><span>{}</span><small>Enter ↵</small></button></form>{}</section>",
+        "<section class=\"game-shell reveal\" aria-labelledby=\"game-title\"><div class=\"game-heading\"><div><p class=\"eyebrow\">Live match · <span id=\"turn-timer\" role=\"timer\">{}</span></p><h1 id=\"game-title\">{}</h1></div><button id=\"leave-room\" class=\"text-button\">Retreat</button></div><div class=\"battlefield\"><canvas id=\"game-canvas\" width=\"770\" height=\"450\" aria-label=\"Graphwar battlefield\" aria-describedby=\"battlefield-summary\"></canvas><div class=\"preview-key\"><i></i> Provisional</div><div class=\"axis-label x-label\">x</div><div class=\"axis-label y-label\">y</div></div><p id=\"battlefield-summary\" class=\"sr-only\">{}</p>{}<form id=\"fire-form\" class=\"fire-console\"><div class=\"equation-field\"><label for=\"function-input\">Function</label><div><span aria-hidden=\"true\">y =</span><input id=\"function-input\" spellcheck=\"false\" autocomplete=\"off\" maxlength=\"256\" required value=\"{}\" aria-describedby=\"function-hint function-error\"{disabled}></div><small id=\"function-hint\">Use x, sin, cos, tan, sqrt and standard operators.</small><p id=\"function-error\" class=\"function-error\" aria-live=\"polite\"></p></div><div class=\"angle-field\"{angle_hidden}><div class=\"angle-label\"><label for=\"angle-input\">Launch angle</label><output id=\"angle-output\" for=\"angle-input\">{:.1}°</output></div><input id=\"angle-input\" type=\"range\" min=\"-90\" max=\"90\" value=\"{:.1}\" step=\"0.1\" aria-describedby=\"angle-hint angle-output\"{angle_disabled}><small id=\"angle-hint\">Focus the slider, then use Arrow Up/Down.</small></div><button class=\"fire-button\" type=\"submit\"{disabled}><span>{}</span><small>Enter ↵</small></button></form>{}</section>",
         timer_text(model),
         escape(&model.room_name),
+        escape(&battlefield_summary(model)),
+        scoreboard_html(model),
         escape(if model.draft_function.is_empty() {
             "sin(x)"
         } else {
@@ -702,6 +993,49 @@ fn game_html(model: &Model) -> String {
     )
 }
 
+fn scoreboard_html(model: &Model) -> String {
+    format!(
+        "<section class=\"scoreboard paper-card\" aria-label=\"Match scoreboard\"><h2>Field report</h2><ul>{}</ul></section>",
+        scoreboard_rows_html(model)
+    )
+}
+
+fn scoreboard_rows_html(model: &Model) -> String {
+    model
+        .players
+        .iter()
+        .map(|player| {
+            let alive = model
+                .soldiers
+                .iter()
+                .filter(|soldier| soldier.player_id == player.id && soldier.alive)
+                .count();
+            let turn = (model.turn_player_id.as_deref() == Some(player.id.as_str()))
+                .then_some("<span class=\"turn-mark\">Turn</span>")
+                .unwrap_or("");
+            format!(
+                "<li><span class=\"team team-{}\" aria-hidden=\"true\"></span><strong>{}</strong><span class=\"team-name\">{}</span><span>{alive} / {}</span>{turn}</li>",
+                player.team,
+                escape(&player.name),
+                team_name(player.team),
+                player.soldiers
+            )
+        })
+        .collect()
+}
+
+fn local_turn(model: &Model) -> bool {
+    model.room_phase == Some(graphwar_protocol::Phase::Planning)
+        && model
+            .turn_deadline_at
+            .is_some_and(|deadline| deadline > unix_time())
+        && model.player_id == model.turn_player_id
+}
+
+fn unix_time() -> i64 {
+    (js_sys::Date::now() / 1_000.0) as i64
+}
+
 fn timer_text(model: &Model) -> String {
     let Some(deadline) = model.turn_deadline_at else {
         return match model.room_phase {
@@ -710,22 +1044,115 @@ fn timer_text(model: &Model) -> String {
             _ => "Waiting".into(),
         };
     };
-    let remaining = deadline.saturating_sub((js_sys::Date::now() / 1_000.0) as i64);
+    let remaining = deadline.saturating_sub(unix_time());
     format!("{}:{:02}", remaining / 60, remaining % 60)
 }
 
 fn update_timer(app: &SharedApp) {
-    let app = app.borrow();
-    if app.model.screen != Screen::Game {
+    let should_rerender = {
+        let mut app_ref = app.borrow_mut();
+        let deadline = app_ref.model.turn_deadline_at;
+        let expired = app_ref.model.screen == Screen::Game
+            && app_ref.model.room_phase == Some(graphwar_protocol::Phase::Planning)
+            && deadline.is_some_and(|deadline| deadline <= unix_time());
+        if expired && app_ref.expired_deadline != deadline {
+            app_ref.expired_deadline = deadline;
+            true
+        } else {
+            if !expired {
+                app_ref.expired_deadline = None;
+            }
+            false
+        }
+    };
+    if should_rerender {
+        refresh_game(app);
         return;
     }
-    if let Some(timer) = app.document.get_element_by_id("turn-timer") {
-        timer.set_text_content(Some(&timer_text(&app.model)));
+    let app_ref = app.borrow();
+    if app_ref.model.screen != Screen::Game {
+        return;
+    }
+    if let Some(timer) = app_ref.document.get_element_by_id("turn-timer") {
+        timer.set_text_content(Some(&timer_text(&app_ref.model)));
     }
 }
 
+fn bind_viewport_events(app: &SharedApp) -> Result<(), JsValue> {
+    let window = app.borrow().window.clone();
+    let redraw_app = Rc::clone(app);
+    let handler = Closure::<dyn FnMut(Event)>::new(move |_| {
+        if redraw_app.borrow().model.screen == Screen::Game
+            && let Err(error) = render_canvas(&redraw_app)
+        {
+            log_error(&format!("viewport render failed: {error:?}"));
+        }
+    });
+    window.add_event_listener_with_callback("resize", handler.as_ref().unchecked_ref())?;
+    app.borrow_mut().viewport_handler = Some(handler);
+    Ok(())
+}
+
+fn team_name(team: u8) -> &'static str {
+    if team == 1 { "Team One" } else { "Team Two" }
+}
+
+fn battlefield_summary(model: &Model) -> String {
+    let team_one = model
+        .soldiers
+        .iter()
+        .filter(|soldier| soldier.team == 1 && soldier.alive)
+        .count();
+    let team_two = model
+        .soldiers
+        .iter()
+        .filter(|soldier| soldier.team == 2 && soldier.alive)
+        .count();
+    let active = model
+        .soldiers
+        .iter()
+        .find(|soldier| soldier.active && soldier.alive);
+    let active = active.map_or_else(
+        || "No active soldier.".into(),
+        |soldier| {
+            let name = model
+                .players
+                .iter()
+                .find(|player| player.id == soldier.player_id)
+                .map(|player| player.name.as_str())
+                .unwrap_or("Player");
+            format!(
+                "{} active for {} at ({:.0}, {:.0}).",
+                name,
+                team_name(soldier.team),
+                soldier.x,
+                soldier.y
+            )
+        },
+    );
+    let hits = (!model.shot_hits.is_empty())
+        .then(|| format!(" {} soldier(s) hit.", model.shot_hits.len()))
+        .unwrap_or_default();
+    let explosion = model
+        .shot_explosion
+        .as_ref()
+        .map_or_else(String::new, |explosion| {
+            format!(" Explosion at ({:.0}, {:.0}).", explosion.x, explosion.y)
+        });
+    format!(
+        "Battlefield: Team One has {team_one} living soldier(s); Team Two has {team_two}. {active}{hits}{explosion}"
+    )
+}
+
 fn chat_html(model: &Model) -> String {
-    let messages = model
+    format!(
+        "<section class=\"paper-card chat-panel\" aria-labelledby=\"chat-title\"><h2 id=\"chat-title\">Room chat</h2><ul>{}</ul><form id=\"chat-form\" class=\"inline-form\"><label class=\"sr-only\" for=\"chat-input\">Message</label><input id=\"chat-input\" maxlength=\"500\" autocomplete=\"off\" required placeholder=\"Message the room\"><button class=\"secondary\" type=\"submit\">Send</button></form></section>",
+        chat_messages_html(model)
+    )
+}
+
+fn chat_messages_html(model: &Model) -> String {
+    model
         .chat
         .iter()
         .rev()
@@ -744,21 +1171,21 @@ fn chat_html(model: &Model) -> String {
                 escape(&message.text)
             )
         })
-        .collect::<String>();
-    format!(
-        "<section class=\"paper-card chat-panel\" aria-labelledby=\"chat-title\"><h2 id=\"chat-title\">Room chat</h2><ul aria-live=\"polite\">{messages}</ul><form id=\"chat-form\" class=\"inline-form\"><label class=\"sr-only\" for=\"chat-input\">Message</label><input id=\"chat-input\" maxlength=\"500\" autocomplete=\"off\" required placeholder=\"Message the room\"><button class=\"secondary\" type=\"submit\">Send</button></form></section>"
-    )
+        .collect()
 }
 
 fn notices_html(model: &Model) -> String {
-    let notices = model
+    format!("<ul class=\"notices\">{}</ul>", notice_items_html(model))
+}
+
+fn notice_items_html(model: &Model) -> String {
+    model
         .notices
         .iter()
         .rev()
         .take(3)
         .map(|notice| format!("<li>{}</li>", escape(notice)))
-        .collect::<String>();
-    format!("<ul class=\"notices\" aria-live=\"polite\">{notices}</ul>")
+        .collect()
 }
 
 fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
@@ -1037,19 +1464,43 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
 }
 
 fn update_preview(app: &SharedApp, function: &HtmlInputElement) {
-    let function = function.value();
-    let mut app_ref = app.borrow_mut();
-    app_ref.model.draft_function.clone_from(&function);
-    let preview =
-        trace_preview(&app_ref.model, &function, app_ref.model.aim_angle_deg).unwrap_or_default();
-    app_ref.model.preview_path = preview;
-    drop(app_ref);
+    let function_text = function.value();
+    let preview_model = {
+        let mut app_ref = app.borrow_mut();
+        app_ref.model.draft_function.clone_from(&function_text);
+        app_ref.model.clone()
+    };
+    let preview = trace_preview(&preview_model, &function_text, preview_model.aim_angle_deg);
+    let document = {
+        let mut app_ref = app.borrow_mut();
+        app_ref.model.preview_path = preview.clone().unwrap_or_default();
+        app_ref.document.clone()
+    };
+
+    let error = preview.err();
+    function.set_custom_validity(error.unwrap_or(""));
+    if let Some(message) = document.get_element_by_id("function-error") {
+        message.set_text_content(error);
+    }
     if let Err(error) = render_canvas(app) {
         log_error(&format!("preview render failed: {error:?}"));
     }
 }
 
 fn start_shot_animation(app: &SharedApp, sequence: u64) {
+    let reduced_motion = app
+        .borrow()
+        .window
+        .match_media("(prefers-reduced-motion: reduce)")
+        .ok()
+        .flatten()
+        .is_some_and(|query| query.matches());
+    if reduced_motion {
+        let mut app_ref = app.borrow_mut();
+        app_ref.shot_animation = None;
+        apply_pending_game(&mut app_ref.model);
+        return;
+    }
     let started_at = js_sys::Date::now();
     app.borrow_mut().shot_animation = Some(ShotAnimation {
         sequence,
@@ -1077,7 +1528,7 @@ fn schedule_shot_frame(app: &SharedApp, sequence: u64) {
             app_ref.shot_animation = None;
             apply_pending_game(&mut app_ref.model);
             drop(app_ref);
-            rerender(&frame_app);
+            refresh_game(&frame_app);
         } else {
             if let Err(error) = render_canvas(&frame_app) {
                 log_error(&format!("shot render failed: {error:?}"));
@@ -1095,7 +1546,7 @@ fn schedule_shot_frame(app: &SharedApp, sequence: u64) {
         app_ref.shot_animation = None;
         apply_pending_game(&mut app_ref.model);
         drop(app_ref);
-        rerender(app);
+        refresh_game(app);
     }
 }
 
@@ -1215,7 +1666,39 @@ fn render_canvas(app: &SharedApp) -> Result<(), JsValue> {
             soldier.active,
         );
     }
+    if authoritative_len == app.model.authoritative_path.len() {
+        draw_shot_effects(&context, &app.model);
+    }
     Ok(())
+}
+
+fn draw_shot_effects(context: &CanvasRenderingContext2d, model: &Model) {
+    context.save();
+    context.set_stroke_style_str("#ff5b3d");
+    context.set_line_width(3.0);
+    for hit in &model.shot_hits {
+        if let Some(soldier) = model
+            .soldiers
+            .iter()
+            .find(|soldier| soldier.player_id == hit.player_id && soldier.index == hit.index)
+        {
+            context.begin_path();
+            let _ = context.arc(soldier.x, soldier.y, 11.0, 0.0, std::f64::consts::TAU);
+            context.stroke();
+        }
+    }
+    if let Some(explosion) = &model.shot_explosion {
+        context.begin_path();
+        let _ = context.arc(
+            explosion.x,
+            explosion.y,
+            explosion.radius,
+            0.0,
+            std::f64::consts::TAU,
+        );
+        context.stroke();
+    }
+    context.restore();
 }
 
 fn draw_grid(context: &CanvasRenderingContext2d) {
@@ -1318,14 +1801,13 @@ fn draw_soldier(
     } else {
         "#6d7368"
     };
+    let radius = if active && alive { 7.0 } else { 5.0 };
     context.begin_path();
-    let _ = context.arc(
-        x,
-        y - 8.0,
-        if active && alive { 7.0 } else { 5.0 },
-        0.0,
-        std::f64::consts::TAU,
-    );
+    if team == 1 {
+        let _ = context.arc(x, y, radius, 0.0, std::f64::consts::TAU);
+    } else {
+        context.rect(x - radius, y - radius, radius * 2.0, radius * 2.0);
+    }
     context.set_fill_style_str(color);
     context.fill();
     context.set_stroke_style_str("#1c1f1b");
@@ -1333,8 +1815,8 @@ fn draw_soldier(
     context.stroke();
     if !alive {
         context.begin_path();
-        context.move_to(x - 7.0, y - 15.0);
-        context.line_to(x + 7.0, y - 1.0);
+        context.move_to(x - 7.0, y - 7.0);
+        context.line_to(x + 7.0, y + 7.0);
         context.stroke();
     }
 }
