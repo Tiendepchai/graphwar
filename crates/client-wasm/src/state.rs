@@ -43,6 +43,8 @@ pub struct PlayerSummary {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SoldierView {
+    pub player_id: String,
+    pub index: usize,
     pub x: f64,
     pub y: f64,
     pub team: u8,
@@ -56,6 +58,19 @@ pub struct TerrainView {
     pub y: f64,
     pub radius: f64,
     pub cut: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HitView {
+    pub player_id: String,
+    pub index: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExplosionView {
+    pub x: f64,
+    pub y: f64,
+    pub radius: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,6 +96,8 @@ pub struct Model {
     pub terrain: Vec<TerrainView>,
     pub authoritative_path: Vec<(f64, f64)>,
     pub preview_path: Vec<(f64, f64)>,
+    pub shot_hits: Vec<HitView>,
+    pub shot_explosion: Option<ExplosionView>,
     pub shot_sequence: u64,
     pub pending_game: Option<GameSnapshot>,
     pub draft_function: String,
@@ -126,6 +143,7 @@ pub enum Action {
     },
     GiveUp,
     LoggedOut,
+    SessionExpired,
     Authenticated {
         player_id: String,
         display_name: String,
@@ -142,7 +160,7 @@ pub fn reduce(model: &mut Model, action: Action) {
             model.connection = Connection::Reconnecting { attempt };
         }
         Action::GiveUp => model.connection = Connection::Offline,
-        Action::LoggedOut => *model = Model::default(),
+        Action::LoggedOut | Action::SessionExpired => *model = Model::default(),
         Action::Authenticated {
             player_id,
             display_name,
@@ -156,39 +174,55 @@ pub fn reduce(model: &mut Model, action: Action) {
             ServerMessage::Hello { .. } => {}
             ServerMessage::RoomCreated { snapshot, invite } => {
                 let room_id = snapshot.id;
-                apply_room(model, snapshot);
-                if let Some(invite) = invite {
+                if apply_room(model, snapshot)
+                    && let Some(invite) = invite
+                {
                     model
                         .notices
                         .push(format!("Private room: {room_id} · invite: {invite}"));
                     trim_notices(&mut model.notices);
                 }
             }
-            ServerMessage::Room { snapshot } => apply_room(model, snapshot),
+            ServerMessage::Room { snapshot } => {
+                apply_room(model, snapshot);
+            }
             ServerMessage::RoomList { rooms } => {
                 model.rooms = rooms.iter().map(room_summary).collect();
             }
             ServerMessage::GameStarted { snapshot, game }
             | ServerMessage::TurnStarted { snapshot, game } => {
-                apply_room(model, snapshot);
-                apply_game(model, game);
-                model.pending_game = None;
-                model.authoritative_path.clear();
-                model.preview_path.clear();
+                if apply_room(model, snapshot) && apply_game(model, game) {
+                    model.pending_game = None;
+                    model.authoritative_path.clear();
+                    model.preview_path.clear();
+                    model.shot_hits.clear();
+                    model.shot_explosion = None;
+                }
             }
             ServerMessage::ShotResolved { snapshot, shot } => {
-                apply_room(model, snapshot);
-                apply_shot(model, shot);
+                if apply_room(model, snapshot) {
+                    apply_shot(model, shot);
+                }
             }
             ServerMessage::GameFinished { snapshot, shot } => {
-                apply_room(model, snapshot);
-                apply_shot(model, shot);
+                if apply_room(model, snapshot) {
+                    apply_shot(model, shot);
+                }
             }
             ServerMessage::StateSync { snapshot, game } => {
-                apply_room(model, snapshot);
-                model.pending_game = None;
-                if let Some(game) = game {
-                    apply_game(model, game);
+                if apply_room(model, snapshot)
+                    && let Some(game) = game
+                {
+                    if model.pending_game.is_some() && !model.authoritative_path.is_empty() {
+                        if game_matches_model(model, &game) {
+                            model.pending_game = Some(game);
+                        }
+                    } else if apply_game(model, game) {
+                        model.pending_game = None;
+                        model.authoritative_path.clear();
+                        model.shot_hits.clear();
+                        model.shot_explosion = None;
+                    }
                 }
             }
             ServerMessage::LeftRoom => leave_room(model),
@@ -199,6 +233,7 @@ pub fn reduce(model: &mut Model, action: Action) {
                 });
                 trim_chat(&mut model.chat);
             }
+            ServerMessage::SessionExpired => reduce(model, Action::SessionExpired),
             ServerMessage::Error { message, .. } => {
                 model.notices.push(message);
                 trim_notices(&mut model.notices);
@@ -207,14 +242,14 @@ pub fn reduce(model: &mut Model, action: Action) {
     }
 }
 
-fn apply_room(model: &mut Model, snapshot: RoomSnapshot) {
+fn apply_room(model: &mut Model, snapshot: RoomSnapshot) -> bool {
     let room_id = snapshot.id.to_string();
     if model.room_id.as_deref() == Some(room_id.as_str())
         && model
             .room_revision
             .is_some_and(|revision| snapshot.revision < revision)
     {
-        return;
+        return false;
     }
     model.room_id = Some(room_id);
     model.room_revision = Some(snapshot.revision);
@@ -226,6 +261,7 @@ fn apply_room(model: &mut Model, snapshot: RoomSnapshot) {
         Phase::Planning | Phase::Resolving | Phase::Finished => Screen::Game,
         Phase::Lobby => Screen::Room,
     };
+    true
 }
 
 fn apply_shot(model: &mut Model, shot: graphwar_protocol::ShotResolved) {
@@ -240,6 +276,19 @@ fn apply_shot(model: &mut Model, shot: graphwar_protocol::ShotResolved) {
     let winner_team = shot.winner_team;
     model.authoritative_path = shot.path;
     model.preview_path.clear();
+    model.shot_hits = shot
+        .hits
+        .into_iter()
+        .map(|hit| HitView {
+            player_id: hit.player_id.to_string(),
+            index: hit.index,
+        })
+        .collect();
+    model.shot_explosion = shot.explosion.map(|explosion| ExplosionView {
+        x: explosion.x,
+        y: explosion.y,
+        radius: explosion.radius,
+    });
     model.shot_sequence = model.shot_sequence.wrapping_add(1);
     model.pending_game = Some(shot.game);
     if hit_count > 0 {
@@ -261,13 +310,16 @@ pub fn apply_pending_game(model: &mut Model) {
     }
 }
 
-fn apply_game(model: &mut Model, game: GameSnapshot) {
-    if model.room_id.as_deref() != Some(game.room_id.to_string().as_str())
-        || model
+fn game_matches_model(model: &Model, game: &GameSnapshot) -> bool {
+    model.room_id.as_deref() == Some(game.room_id.to_string().as_str())
+        && model
             .room_revision
-            .is_some_and(|revision| game.revision < revision)
-    {
-        return;
+            .is_none_or(|revision| game.revision >= revision)
+}
+
+fn apply_game(model: &mut Model, game: GameSnapshot) -> bool {
+    if !game_matches_model(model, &game) {
+        return false;
     }
     model.room_revision = Some(game.revision);
     model.screen = Screen::Game;
@@ -277,6 +329,8 @@ fn apply_game(model: &mut Model, game: GameSnapshot) {
         .soldiers
         .into_iter()
         .map(|soldier| SoldierView {
+            player_id: soldier.player_id.to_string(),
+            index: soldier.index,
             x: soldier.x,
             y: soldier.y,
             team: soldier.team,
@@ -300,6 +354,7 @@ fn apply_game(model: &mut Model, game: GameSnapshot) {
             cut: true,
         }))
         .collect();
+    true
 }
 
 fn room_summary(room: &RoomSnapshot) -> RoomSummary {
@@ -335,6 +390,8 @@ fn leave_room(model: &mut Model) {
     model.terrain.clear();
     model.authoritative_path.clear();
     model.preview_path.clear();
+    model.shot_hits.clear();
+    model.shot_explosion = None;
     model.shot_sequence = 0;
     model.pending_game = None;
     model.turn_player_id = None;
@@ -590,6 +647,8 @@ mod tests {
             }],
             authoritative_path: vec![(0.0, 0.0)],
             soldiers: vec![SoldierView {
+                player_id: "p1".into(),
+                index: 0,
                 x: 2.0,
                 y: 3.0,
                 team: 1,
@@ -639,6 +698,140 @@ mod tests {
     }
 
     #[test]
+    fn expired_session_clears_identity_and_room_state() {
+        let mut model = Model {
+            screen: Screen::Game,
+            connection: Connection::Online,
+            player_id: Some("player".into()),
+            room_id: Some("room".into()),
+            ..Model::default()
+        };
+        reduce(
+            &mut model,
+            Action::Message(Box::new(ServerMessage::SessionExpired)),
+        );
+        assert_eq!(model, Model::default());
+    }
+
+    #[test]
+    fn state_sync_keeps_pending_shot_board_until_animation_finishes() {
+        let room_id = Uuid::new_v4();
+        let player_id = Uuid::new_v4();
+        let mut model = Model {
+            room_id: Some(room_id.to_string()),
+            room_revision: Some(0),
+            authoritative_path: vec![(100.0, 225.0), (120.0, 225.0)],
+            pending_game: Some(GameSnapshot {
+                room_id,
+                revision: 1,
+                mode: GameMode::Function,
+                turn_player_id: None,
+                turn_deadline_at: None,
+                soldiers: Vec::new(),
+                terrain: Vec::new(),
+                terrain_cuts: Vec::new(),
+            }),
+            ..Model::default()
+        };
+        reduce(
+            &mut model,
+            Action::Message(Box::new(ServerMessage::StateSync {
+                snapshot: RoomSnapshot {
+                    id: room_id,
+                    name: "Calculus club".into(),
+                    visibility: RoomVisibility::Public,
+                    phase: Phase::Resolving,
+                    revision: 1,
+                    mode: GameMode::Function,
+                    players: Vec::new(),
+                },
+                game: Some(GameSnapshot {
+                    room_id,
+                    revision: 1,
+                    mode: GameMode::Function,
+                    turn_player_id: Some(player_id),
+                    turn_deadline_at: None,
+                    soldiers: vec![graphwar_protocol::SoldierPosition {
+                        player_id,
+                        index: 0,
+                        team: 1,
+                        x: 100.0,
+                        y: 225.0,
+                        alive: false,
+                        active: false,
+                    }],
+                    terrain: Vec::new(),
+                    terrain_cuts: Vec::new(),
+                }),
+            })),
+        );
+        assert!(model.soldiers.is_empty());
+        assert!(model.pending_game.is_some());
+        assert!(!model.authoritative_path.is_empty());
+    }
+
+    #[test]
+    fn stale_game_started_preserves_newer_shot_animation() {
+        let room_id = Uuid::new_v4();
+        let mut model = Model {
+            room_id: Some(room_id.to_string()),
+            room_revision: Some(2),
+            authoritative_path: vec![(100.0, 225.0), (120.0, 225.0)],
+            preview_path: vec![(100.0, 225.0)],
+            shot_hits: vec![HitView {
+                player_id: "player".into(),
+                index: 0,
+            }],
+            shot_explosion: Some(ExplosionView {
+                x: 120.0,
+                y: 225.0,
+                radius: 12.0,
+            }),
+            pending_game: Some(GameSnapshot {
+                room_id,
+                revision: 2,
+                mode: GameMode::Function,
+                turn_player_id: None,
+                turn_deadline_at: None,
+                soldiers: Vec::new(),
+                terrain: Vec::new(),
+                terrain_cuts: Vec::new(),
+            }),
+            ..Model::default()
+        };
+        reduce(
+            &mut model,
+            Action::Message(Box::new(ServerMessage::GameStarted {
+                snapshot: RoomSnapshot {
+                    id: room_id,
+                    name: "Calculus club".into(),
+                    visibility: RoomVisibility::Public,
+                    phase: Phase::Planning,
+                    revision: 1,
+                    mode: GameMode::Function,
+                    players: Vec::new(),
+                },
+                game: GameSnapshot {
+                    room_id,
+                    revision: 1,
+                    mode: GameMode::Function,
+                    turn_player_id: None,
+                    turn_deadline_at: None,
+                    soldiers: Vec::new(),
+                    terrain: Vec::new(),
+                    terrain_cuts: Vec::new(),
+                },
+            })),
+        );
+        assert_eq!(model.room_revision, Some(2));
+        assert!(!model.authoritative_path.is_empty());
+        assert!(!model.preview_path.is_empty());
+        assert!(!model.shot_hits.is_empty());
+        assert!(model.shot_explosion.is_some());
+        assert!(model.pending_game.is_some());
+    }
+
+    #[test]
     fn shot_keeps_pre_impact_board_until_animation_finishes() {
         let room_id = Uuid::new_v4();
         let player_id = Uuid::new_v4();
@@ -646,6 +839,8 @@ mod tests {
             room_id: Some(room_id.to_string()),
             room_revision: Some(0),
             soldiers: vec![SoldierView {
+                player_id: player_id.to_string(),
+                index: 0,
                 x: 100.0,
                 y: 225.0,
                 team: 1,

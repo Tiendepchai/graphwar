@@ -119,6 +119,9 @@ pub fn search(input: SearchInput<'_>) -> SearchOutcome {
         memory.populations.resize_with(soldier + 1, Vec::new);
     }
     let mut population = std::mem::take(&mut memory.populations[soldier]);
+    population.iter_mut().for_each(|candidate| {
+        candidate.score = f64::NEG_INFINITY;
+    });
     if population.len() != POPULATION_SIZE
         || population
             .iter()
@@ -126,7 +129,13 @@ pub fn search(input: SearchInput<'_>) -> SearchOutcome {
     {
         population = initial_population(mode, &mut rng);
     }
-    evaluate_population(&mut population, mode, terrain, state, team);
+    if !evaluate_population_until(&mut population, mode, terrain, state, team, deadline) {
+        population.iter_mut().for_each(|candidate| {
+            candidate.score = f64::NEG_INFINITY;
+        });
+        memory.populations[soldier] = population;
+        return SearchOutcome { shot: None, memory };
+    }
     sort_population(&mut population);
 
     for _ in 0..generations {
@@ -199,26 +208,17 @@ fn candidate(mode: GameMode, gene: Vec<GeneToken>, angle: f64) -> Option<Candida
         return None;
     }
     let function = render(&expression);
-    if function.len() > 256 || parse(&function).is_err() {
+    let scored_expression = parse(&function).ok()?;
+    if function.len() > 256 || !mode_allows(&scored_expression, mode) {
         return None;
     }
     Some(Candidate {
         gene,
-        expression,
+        expression: scored_expression,
         function,
         angle,
         score: f64::NEG_INFINITY,
     })
-}
-
-fn evaluate_population(
-    population: &mut [Candidate],
-    mode: GameMode,
-    terrain: &Terrain,
-    state: &GameState,
-    team: Team,
-) {
-    let _ = evaluate_population_until(population, mode, terrain, state, team, None);
 }
 
 fn evaluate_population_until(
@@ -292,16 +292,27 @@ fn select_parent<'a>(population: &'a [Candidate], rng: &mut StdRng) -> &'a Candi
 }
 
 fn score(trajectory: &graphwar_game_core::Trajectory, state: &GameState, team: Team) -> f64 {
+    let explosion = trajectory.points.last().copied();
+    let will_hit = |player: usize, soldier: usize, x: f64, y: f64| {
+        trajectory
+            .hits
+            .iter()
+            .any(|hit| hit.player == player && hit.soldier == soldier)
+            || explosion.is_some_and(|point| {
+                (point.0 - x).hypot(point.1 - y) <= graphwar_game_core::constants::EXPLOSION_RADIUS
+            })
+    };
     let mut total = 0.0;
-    for hit in &trajectory.hits {
-        let Some(target) = state.players.get(hit.player) else {
-            continue;
-        };
-        total += if target.team == team {
-            FRIENDLY_HIT_SCORE
-        } else {
-            ENEMY_HIT_SCORE
-        };
+    for (player_index, player) in state.players.iter().enumerate() {
+        for (soldier_index, soldier) in player.living() {
+            if will_hit(player_index, soldier_index, soldier.x, soldier.y) {
+                total += if player.team == team {
+                    FRIENDLY_HIT_SCORE
+                } else {
+                    ENEMY_HIT_SCORE
+                };
+            }
+        }
     }
 
     let mut nearest_enemy = DISTANCE_SCORE;
@@ -310,11 +321,7 @@ fn score(trajectory: &graphwar_game_core::Trajectory, state: &GameState, team: T
             continue;
         }
         for (soldier_index, soldier) in player.living() {
-            if trajectory
-                .hits
-                .iter()
-                .any(|hit| hit.player == player_index && hit.soldier == soldier_index)
-            {
+            if will_hit(player_index, soldier_index, soldier.x, soldier.y) {
                 continue;
             }
             for point in &trajectory.points {
@@ -523,23 +530,7 @@ fn expression_from_gene(gene: &[GeneToken], position: &mut usize) -> Option<Expr
 }
 
 fn mode_allows(expression: &Expr, mode: GameMode) -> bool {
-    match expression {
-        Expr::Y => mode != GameMode::Function,
-        Expr::Dy => mode == GameMode::SecondOrder,
-        Expr::Number(_) | Expr::X => true,
-        Expr::Neg(value)
-        | Expr::Sqrt(value)
-        | Expr::Log10(value)
-        | Expr::Ln(value)
-        | Expr::Abs(value)
-        | Expr::Sin(value)
-        | Expr::Cos(value)
-        | Expr::Tan(value) => mode_allows(value, mode),
-        Expr::Add(left, right)
-        | Expr::Mul(left, right)
-        | Expr::Div(left, right)
-        | Expr::Pow(left, right) => mode_allows(left, mode) && mode_allows(right, mode),
-    }
+    expression.variables_allowed(mode != GameMode::Function, mode == GameMode::SecondOrder)
 }
 
 fn mutate_angle(angle: f64, mode: GameMode, rng: &mut StdRng) -> f64 {
@@ -634,6 +625,31 @@ mod tests {
     }
 
     #[test]
+    fn candidate_scores_the_exact_rendered_expression() {
+        let candidate = candidate(
+            GameMode::Function,
+            vec![
+                GeneToken::Div,
+                GeneToken::Number(1.0),
+                GeneToken::Number(0.004),
+            ],
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(candidate.function, "(1.00/0.00)");
+        assert!(
+            trace(
+                &candidate.expression,
+                TrajectoryMode::Function,
+                &Terrain::default(),
+                &state(),
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn chooser_returns_deterministic_mode_valid_shots() {
         for mode in [
             GameMode::Function,
@@ -694,13 +710,14 @@ mod tests {
     fn population_has_legacy_generation_composition() {
         let mut rng = StdRng::seed_from_u64(31);
         let mut population = initial_population(GameMode::Function, &mut rng);
-        evaluate_population(
+        assert!(evaluate_population_until(
             &mut population,
             GameMode::Function,
             &Terrain::default(),
             &state(),
             Team::One,
-        );
+            None,
+        ));
         sort_population(&mut population);
         let mut next = Vec::with_capacity(POPULATION_SIZE);
         next.extend(population.iter().take(ELITE_COUNT).cloned());
@@ -769,8 +786,14 @@ mod tests {
             memory: initial.memory.clone(),
             budget: Duration::ZERO,
         });
-        assert_eq!(repeated.memory.populations, initial.memory.populations);
+        assert_eq!(repeated.shot, None);
+        assert!(
+            repeated.memory.populations[0]
+                .iter()
+                .all(|candidate| candidate.score == f64::NEG_INFINITY)
+        );
 
+        let repeated_population = repeated.memory.populations[0].clone();
         first_soldier.players[0].current_soldier = 1;
         let second_soldier = search(SearchInput {
             mode: GameMode::Function,
@@ -783,11 +806,40 @@ mod tests {
             budget: Duration::ZERO,
         });
         assert_eq!(second_soldier.memory.populations.len(), 2);
-        assert_eq!(
-            second_soldier.memory.populations[0],
-            initial.memory.populations[0]
-        );
+        assert_eq!(second_soldier.memory.populations[0], repeated_population);
         assert_eq!(second_soldier.memory.populations[1].len(), POPULATION_SIZE);
+    }
+
+    #[test]
+    fn zero_budget_does_not_evaluate_initial_population() {
+        let terrain = Terrain::default();
+        let outcome = search(SearchInput {
+            mode: GameMode::Function,
+            terrain: &terrain,
+            state: &state(),
+            team: Team::One,
+            level: 1,
+            seed: 43,
+            memory: SearchMemory::default(),
+            budget: Duration::ZERO,
+        });
+        assert!(outcome.shot.is_none());
+        assert_eq!(outcome.memory.populations[0].len(), POPULATION_SIZE);
+        assert!(
+            outcome.memory.populations[0]
+                .iter()
+                .all(|candidate| candidate.score == f64::NEG_INFINITY)
+        );
+    }
+
+    #[test]
+    fn explosion_endpoint_scores_enemy_damage() {
+        let state = state();
+        let trajectory = graphwar_game_core::Trajectory {
+            points: vec![(638.0, 225.0)],
+            hits: Vec::new(),
+        };
+        assert!(score(&trajectory, &state, Team::One) >= ENEMY_HIT_SCORE);
     }
 
     #[test]
@@ -813,8 +865,36 @@ mod tests {
             memory: initial.memory.clone(),
             budget: Duration::ZERO,
         });
-        assert_eq!(resumed.memory, initial.memory);
-        assert_eq!(resumed.shot, initial.shot);
+        assert!(resumed.shot.is_none());
+        assert_eq!(
+            resumed.memory.populations.len(),
+            initial.memory.populations.len()
+        );
+        assert_eq!(
+            resumed.memory.populations[0]
+                .iter()
+                .map(|candidate| (
+                    &candidate.gene,
+                    &candidate.expression,
+                    &candidate.function,
+                    candidate.angle
+                ))
+                .collect::<Vec<_>>(),
+            initial.memory.populations[0]
+                .iter()
+                .map(|candidate| (
+                    &candidate.gene,
+                    &candidate.expression,
+                    &candidate.function,
+                    candidate.angle
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            resumed.memory.populations[0]
+                .iter()
+                .all(|candidate| candidate.score == f64::NEG_INFINITY)
+        );
     }
 
     fn assert_valid_gene(gene: &[GeneToken], mode: GameMode) {

@@ -23,7 +23,8 @@ COPY --from=builder /app/target/release/graphwar-server /usr/local/bin/graphwar-
 COPY assets ./assets
 COPY --from=builder /app/web ./assets/web
 COPY migrations ./migrations
-ENV GRAPHWAR_STATIC_DIR=/app/assets/web
+ENV BIND_ADDR=0.0.0.0:8080 \
+    GRAPHWAR_STATIC_DIR=/app/assets/web
 EXPOSE 8080
 USER 65532:65532
 ENTRYPOINT ["graphwar-server"]

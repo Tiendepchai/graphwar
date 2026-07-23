@@ -4,7 +4,7 @@ use std::{
 };
 
 use graphwar_game_core::{
-    Circle, GameState, Player, SeededGenerator, Soldier, Team, Terrain, TrajectoryMode,
+    Circle, Expr, GameState, Player, SeededGenerator, Soldier, Team, Terrain, TrajectoryMode,
     constants::{MAX_PLAYERS, MAX_SOLDIERS_PER_PLAYER, PLANE_HEIGHT, PLANE_LENGTH, SOLDIER_RADIUS},
     parse, trace,
 };
@@ -444,6 +444,11 @@ impl Registry {
         }
         let expr = parse(function.trim()).map_err(|_| RoomError::Invalid("invalid function"))?;
         let game = room.game.as_mut().expect("checked above");
+        if !mode_allows(&expr, game.mode) {
+            return Err(RoomError::Invalid(
+                "function uses variables unavailable in this mode",
+            ));
+        }
         let mode = trajectory_mode(game.mode, angle_deg);
         let inverted = matches!(game.state.players[game.state.turn].team, Team::Two);
         let trajectory = trace(&expr, mode, &game.terrain, &game.state, inverted)
@@ -530,14 +535,18 @@ impl Registry {
         if !unchanged {
             return Ok(None);
         }
-        room.bots
-            .get_mut(&turn.player)
-            .expect("validated bot")
-            .memory = result.memory;
         let (function, angle) = result
             .shot
             .ok_or(RoomError::Invalid("bot produced no valid shot"))?;
-        self.fire(turn.player, function, angle).map(Some)
+        let outcome = self.fire(turn.player, function, angle)?;
+        self.rooms
+            .get_mut(&turn.room_id)
+            .expect("validated room")
+            .bots
+            .get_mut(&turn.player)
+            .expect("validated bot")
+            .memory = result.memory;
+        Ok(Some(outcome))
     }
 
     pub fn skip_bot_turn(&mut self, turn: BotTurn) -> Result<Option<StartOutcome>, RoomError> {
@@ -666,19 +675,18 @@ fn new_match(
     let terrain = Terrain::new(generator.terrain());
     let slots = alternating_players(players);
     let player_ids = slots.iter().map(|player| player.id).collect();
-    let players = slots
-        .into_iter()
-        .enumerate()
-        .map(|(index, player)| {
-            let team = team(player.team);
-            spawn_soldiers(&terrain, team, player.soldiers, index)
-                .map(|soldiers| Player::new(index as u32, team, soldiers))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut placed = Vec::new();
+    let mut game_players = Vec::with_capacity(slots.len());
+    for (index, player) in slots.into_iter().enumerate() {
+        let team = team(player.team);
+        let soldiers = spawn_soldiers(&terrain, team, player.soldiers, index, &placed)?;
+        placed.extend(soldiers.iter().cloned());
+        game_players.push(Player::new(index as u32, team, soldiers));
+    }
     Ok(Match {
         mode,
         terrain,
-        state: GameState::new(players),
+        state: GameState::new(game_players),
         player_ids,
         turn_deadline_at: turn_deadline(),
     })
@@ -710,6 +718,7 @@ fn spawn_soldiers(
     team: Team,
     count: u8,
     player_index: usize,
+    placed: &[Soldier],
 ) -> Result<Vec<Soldier>, RoomError> {
     let x_start = SOLDIER_RADIUS as i32;
     let x_end = PLANE_LENGTH / 2 - SOLDIER_RADIUS as i32;
@@ -725,11 +734,11 @@ fn spawn_soldiers(
             let x = if team == Team::One {
                 f64::from(x)
             } else {
-                f64::from(PLANE_LENGTH - x)
+                f64::from(PLANE_LENGTH - 1 - x)
             };
             let y = f64::from(y);
             if !terrain.collides_circle(x, y, SOLDIER_RADIUS)
-                && result.iter().all(|soldier: &Soldier| {
+                && placed.iter().chain(&result).all(|soldier: &Soldier| {
                     (soldier.x - x).abs() >= 20.0 || (soldier.y - y).abs() >= 20.0
                 })
             {
@@ -781,6 +790,10 @@ fn turn_deadline() -> i64 {
 
 fn resolution_deadline() -> i64 {
     unix_timestamp().saturating_add(3)
+}
+
+fn mode_allows(expression: &Expr, mode: GameMode) -> bool {
+    expression.variables_allowed(mode != GameMode::Function, mode == GameMode::SecondOrder)
 }
 
 fn trajectory_mode(mode: GameMode, angle_deg: f64) -> TrajectoryMode {
@@ -1015,17 +1028,27 @@ mod tests {
         assert_eq!(start.game.soldiers.len(), 5);
         let room = registry.rooms.get(&room.id).unwrap();
         let game = room.game.as_ref().unwrap();
-        for soldier in game
+        let soldiers = game
             .state
             .players
             .iter()
             .flat_map(|player| &player.soldiers)
-        {
+            .collect::<Vec<_>>();
+        for soldier in &soldiers {
             assert!(
                 !game
                     .terrain
                     .collides_circle(soldier.x, soldier.y, SOLDIER_RADIUS)
             );
+            assert!(soldier.x >= SOLDIER_RADIUS);
+            assert!(soldier.x + SOLDIER_RADIUS < f64::from(PLANE_LENGTH));
+            assert!(soldier.y >= SOLDIER_RADIUS);
+            assert!(soldier.y + SOLDIER_RADIUS < f64::from(PLANE_HEIGHT));
+        }
+        for (index, soldier) in soldiers.iter().enumerate() {
+            assert!(soldiers[index + 1..].iter().all(|other| {
+                (soldier.x - other.x).abs() >= 20.0 || (soldier.y - other.y).abs() >= 20.0
+            }));
         }
     }
 
@@ -1112,6 +1135,41 @@ mod tests {
             Err(RoomError::NotTurn)
         ));
         assert!(registry.fire(owner, "0".into(), 0.0).is_ok());
+    }
+
+    #[test]
+    fn fire_rejects_variables_unavailable_in_mode() {
+        for (mode, function, allowed) in [
+            (GameMode::Function, "y", false),
+            (GameMode::Function, "y'", false),
+            (GameMode::FirstOrder, "y", true),
+            (GameMode::FirstOrder, "y'", false),
+            (GameMode::SecondOrder, "y + y'", true),
+        ] {
+            let owner = Uuid::new_v4();
+            let guest = Uuid::new_v4();
+            let mut registry = Registry::default();
+            let room = registry
+                .create(owner, "Owner".into(), "room".into(), RoomVisibility::Public)
+                .unwrap()
+                .0;
+            registry.join(guest, "Guest".into(), room.id, None).unwrap();
+            registry.set_mode(owner, mode).unwrap();
+            registry.set_ready(owner, true).unwrap();
+            registry.set_ready(guest, true).unwrap();
+            registry.start_game(owner).unwrap();
+            let result = registry.fire(owner, function.into(), 0.0);
+            if allowed {
+                assert!(result.is_ok(), "{mode:?} should allow {function}");
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(RoomError::Invalid(
+                        "function uses variables unavailable in this mode"
+                    ))
+                ));
+            }
+        }
     }
 
     #[test]
@@ -1261,6 +1319,45 @@ mod tests {
         assert_eq!(outcome.snapshot.phase, Phase::Resolving);
         assert_eq!(registry.rooms[&room.id].snapshot.phase, Phase::Resolving);
         assert!(registry.fire(bot, "0".into(), 0.0).is_err());
+    }
+
+    #[test]
+    fn invalid_bot_shot_preserves_memory() {
+        let owner = Uuid::new_v4();
+        let mut registry = Registry::default();
+        let room = registry
+            .create(owner, "Owner".into(), "room".into(), RoomVisibility::Public)
+            .unwrap()
+            .0;
+        let snapshot = registry.add_bot(owner, 1).unwrap();
+        let bot = snapshot
+            .players
+            .iter()
+            .find(|player| player.is_bot)
+            .unwrap()
+            .id;
+        registry.set_team(owner, owner, 2).unwrap();
+        registry.set_team(owner, bot, 1).unwrap();
+        registry.set_ready(owner, true).unwrap();
+        registry.start_game(owner).unwrap();
+        let turn = registry.pending_bot_turns().pop().unwrap();
+        let stored_before = registry.rooms[&room.id].bots[&bot].memory.clone();
+        let result = crate::bot::search(crate::bot::SearchInput {
+            mode: turn.mode,
+            terrain: &turn.terrain,
+            state: &turn.state,
+            team: turn.team,
+            level: turn.level,
+            seed: turn.seed,
+            memory: turn.memory.clone(),
+            budget: Duration::ZERO,
+        });
+
+        assert!(matches!(
+            registry.apply_bot_turn(turn, result),
+            Err(RoomError::Invalid("bot produced no valid shot"))
+        ));
+        assert_eq!(registry.rooms[&room.id].bots[&bot].memory, stored_before);
     }
 
     #[test]

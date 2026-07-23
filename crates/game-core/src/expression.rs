@@ -59,6 +59,48 @@ impl Expr {
         let result = self.evaluate(vars);
         result.is_finite().then_some(result)
     }
+
+    pub fn uses_y(&self) -> bool {
+        match self {
+            Self::Y => true,
+            Self::Neg(value)
+            | Self::Sqrt(value)
+            | Self::Log10(value)
+            | Self::Ln(value)
+            | Self::Abs(value)
+            | Self::Sin(value)
+            | Self::Cos(value)
+            | Self::Tan(value) => value.uses_y(),
+            Self::Add(left, right)
+            | Self::Mul(left, right)
+            | Self::Div(left, right)
+            | Self::Pow(left, right) => left.uses_y() || right.uses_y(),
+            Self::Number(_) | Self::X | Self::Dy => false,
+        }
+    }
+
+    pub fn uses_dy(&self) -> bool {
+        match self {
+            Self::Dy => true,
+            Self::Neg(value)
+            | Self::Sqrt(value)
+            | Self::Log10(value)
+            | Self::Ln(value)
+            | Self::Abs(value)
+            | Self::Sin(value)
+            | Self::Cos(value)
+            | Self::Tan(value) => value.uses_dy(),
+            Self::Add(left, right)
+            | Self::Mul(left, right)
+            | Self::Div(left, right)
+            | Self::Pow(left, right) => left.uses_dy() || right.uses_dy(),
+            Self::Number(_) | Self::X | Self::Y => false,
+        }
+    }
+
+    pub fn variables_allowed(&self, allows_y: bool, allows_dy: bool) -> bool {
+        (!self.uses_y() || allows_y) && (!self.uses_dy() || allows_dy)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -277,7 +319,9 @@ impl Parser {
     }
     fn eat(&mut self) -> Token {
         let value = self.current().0.clone();
-        self.index += 1;
+        if !matches!(value, Token::End) {
+            self.index += 1;
+        }
         value
     }
 
@@ -414,9 +458,23 @@ mod tests {
     }
 
     #[test]
-    fn precedence_and_right_associative_power() {
-        assert_eq!(value("-2^2"), 4.0);
-        assert_eq!(value("2^3^2"), 512.0);
+    fn incomplete_expressions_return_errors_without_panicking() {
+        for input in [
+            "", "+", "-", "x+", "x*", "x/", "x^", "sin", "sin(", "sqrt(", "(",
+        ] {
+            assert!(parse(input).is_err(), "input should be rejected: {input:?}");
+        }
+    }
+
+    #[test]
+    fn eating_end_keeps_parser_at_end() {
+        let mut parser = Parser {
+            tokens: vec![(Token::End, 0)],
+            index: 0,
+            depth: 0,
+        };
+        assert_eq!(parser.eat(), Token::End);
+        assert_eq!(parser.current(), &(Token::End, 0));
     }
 
     #[test]
@@ -424,5 +482,21 @@ mod tests {
         assert!(parse(&"x+".repeat(MAX_TOKENS)).is_err());
         assert!(parse(&format!("{}x{}", "(".repeat(65), ")".repeat(65))).is_err());
         assert!(parse(&"x".repeat(MAX_INPUT_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn variable_usage_is_reported_recursively() {
+        let expression = parse("sin(y) + y'").unwrap();
+        assert!(expression.uses_y());
+        assert!(expression.uses_dy());
+        assert!(!expression.variables_allowed(false, false));
+        assert!(!expression.variables_allowed(true, false));
+        assert!(expression.variables_allowed(true, true));
+    }
+
+    #[test]
+    fn precedence_and_right_associative_power() {
+        assert_eq!(value("-2^2"), 4.0);
+        assert_eq!(value("2^3^2"), 512.0);
     }
 }

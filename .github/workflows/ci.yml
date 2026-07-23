@@ -38,7 +38,7 @@ jobs:
         run: |
           test -f deploy/Caddyfile
           grep -F 'graphwar_client_wasm.js' assets/web/index.html
-          grep -F 'graphwar_client_wasm_bg.wasm' deploy/Dockerfile
+          grep -F -- '--out-name graphwar_client_wasm' deploy/Dockerfile
           grep -F '/healthz' deploy/compose.yaml
           grep -F 'condition: service_healthy' deploy/compose.yaml
       - name: Publish release gate
