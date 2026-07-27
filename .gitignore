@@ -10,3 +10,7 @@
 /.claude/worktrees/
 /.codegraph/
 /.tmp-compose-current/
+/cloudflare-tunnel-token
+/deploy/cloudflare-tunnel-token
+/compose.env
+/deploy/compose.env

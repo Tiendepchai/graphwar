@@ -75,8 +75,20 @@ pub struct ExplosionView {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChatView {
+    pub sequence: u64,
     pub player_id: String,
+    pub display_name: String,
     pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShotHistoryView {
+    pub sequence: u64,
+    pub player_id: String,
+    pub display_name: String,
+    pub team: u8,
+    pub function: String,
+    pub angle_deg: f64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -105,6 +117,7 @@ pub struct Model {
     pub turn_player_id: Option<String>,
     pub turn_deadline_at: Option<i64>,
     pub chat: Vec<ChatView>,
+    pub shot_history: Vec<ShotHistoryView>,
     pub notices: Vec<String>,
 }
 
@@ -189,8 +202,17 @@ pub fn reduce(model: &mut Model, action: Action) {
             ServerMessage::RoomList { rooms } => {
                 model.rooms = rooms.iter().map(room_summary).collect();
             }
-            ServerMessage::GameStarted { snapshot, game }
-            | ServerMessage::TurnStarted { snapshot, game } => {
+            ServerMessage::GameStarted { snapshot, game } => {
+                if apply_room(model, snapshot) && apply_game(model, game) {
+                    model.pending_game = None;
+                    model.authoritative_path.clear();
+                    model.preview_path.clear();
+                    model.shot_hits.clear();
+                    model.shot_explosion = None;
+                    model.notices.clear();
+                }
+            }
+            ServerMessage::TurnStarted { snapshot, game } => {
                 if apply_room(model, snapshot) && apply_game(model, game) {
                     model.pending_game = None;
                     model.authoritative_path.clear();
@@ -209,29 +231,40 @@ pub fn reduce(model: &mut Model, action: Action) {
                     apply_shot(model, shot);
                 }
             }
-            ServerMessage::StateSync { snapshot, game } => {
-                if apply_room(model, snapshot)
-                    && let Some(game) = game
-                {
-                    if model.pending_game.is_some() && !model.authoritative_path.is_empty() {
-                        if game_matches_model(model, &game) {
-                            model.pending_game = Some(game);
+            ServerMessage::StateSync {
+                snapshot,
+                game,
+                chat_history,
+            } => {
+                let room_id = snapshot.id.to_string();
+                let newer_room = model.room_id.as_deref() != Some(room_id.as_str())
+                    || model
+                        .room_revision
+                        .is_none_or(|revision| snapshot.revision > revision);
+                if apply_room(model, snapshot) {
+                    replace_chat_history(model, chat_history, newer_room);
+                    if let Some(game) = game {
+                        if model.pending_game.is_some() && !model.authoritative_path.is_empty() {
+                            if game_matches_model(model, &game) {
+                                model.shot_history = shot_history_views(&game);
+                                model.pending_game = Some(game);
+                            }
+                        } else if apply_game(model, game) {
+                            model.pending_game = None;
+                            model.authoritative_path.clear();
+                            model.shot_hits.clear();
+                            model.shot_explosion = None;
                         }
-                    } else if apply_game(model, game) {
-                        model.pending_game = None;
-                        model.authoritative_path.clear();
-                        model.shot_hits.clear();
-                        model.shot_explosion = None;
+                    } else {
+                        model.shot_history.clear();
                     }
                 }
             }
             ServerMessage::LeftRoom => leave_room(model),
-            ServerMessage::Chat { player_id, text } => {
-                model.chat.push(ChatView {
-                    player_id: player_id.to_string(),
-                    text,
-                });
-                trim_chat(&mut model.chat);
+            ServerMessage::Chat { entry } => {
+                if model.room_id.as_deref() == Some(entry.room_id.to_string().as_str()) {
+                    upsert_chat(model, chat_view(entry));
+                }
             }
             ServerMessage::SessionExpired => reduce(model, Action::SessionExpired),
             ServerMessage::Error { message, .. } => {
@@ -272,8 +305,26 @@ fn apply_shot(model: &mut Model, shot: graphwar_protocol::ShotResolved) {
     {
         return;
     }
+    let newest_sequence = shot
+        .game
+        .shot_history
+        .iter()
+        .map(|entry| entry.sequence)
+        .max();
+    if newest_sequence.is_some_and(|sequence| {
+        model
+            .shot_history
+            .iter()
+            .any(|entry| entry.sequence == sequence)
+    }) {
+        model.shot_history = shot_history_views(&shot.game);
+        model.pending_game = Some(shot.game);
+        return;
+    }
     let hit_count = shot.hits.len();
+
     let winner_team = shot.winner_team;
+    model.shot_history = shot_history_views(&shot.game);
     model.authoritative_path = shot.path;
     model.preview_path.clear();
     model.shot_hits = shot
@@ -325,6 +376,7 @@ fn apply_game(model: &mut Model, game: GameSnapshot) -> bool {
     model.screen = Screen::Game;
     model.turn_player_id = game.turn_player_id.map(|id| id.to_string());
     model.turn_deadline_at = game.turn_deadline_at;
+    model.shot_history = shot_history_views(&game);
     model.soldiers = game
         .soldiers
         .into_iter()
@@ -355,6 +407,59 @@ fn apply_game(model: &mut Model, game: GameSnapshot) -> bool {
         }))
         .collect();
     true
+}
+
+fn shot_history_views(game: &GameSnapshot) -> Vec<ShotHistoryView> {
+    game.shot_history
+        .iter()
+        .map(|entry| ShotHistoryView {
+            sequence: entry.sequence,
+            player_id: entry.player_id.to_string(),
+            display_name: entry.display_name.clone(),
+            team: entry.team,
+            function: entry.function.clone(),
+            angle_deg: entry.angle_deg,
+        })
+        .collect()
+}
+
+fn chat_view(entry: graphwar_protocol::ChatEntry) -> ChatView {
+    ChatView {
+        sequence: entry.sequence,
+        player_id: entry.player_id.to_string(),
+        display_name: entry.display_name,
+        text: entry.text,
+    }
+}
+
+fn upsert_chat(model: &mut Model, entry: ChatView) {
+    if let Some(existing) = model
+        .chat
+        .iter_mut()
+        .find(|item| item.sequence == entry.sequence)
+    {
+        *existing = entry;
+    } else {
+        model.chat.push(entry);
+    }
+    model.chat.sort_by_key(|item| item.sequence);
+    trim_chat(&mut model.chat);
+}
+
+fn replace_chat_history(
+    model: &mut Model,
+    entries: Vec<graphwar_protocol::ChatEntry>,
+    authoritative: bool,
+) {
+    let incoming_sequence = entries.iter().map(|entry| entry.sequence).max();
+    let current_sequence = model.chat.iter().map(|entry| entry.sequence).max();
+    if !authoritative && incoming_sequence < current_sequence {
+        return;
+    }
+    model.chat.clear();
+    for entry in entries {
+        upsert_chat(model, chat_view(entry));
+    }
 }
 
 fn room_summary(room: &RoomSnapshot) -> RoomSummary {
@@ -397,6 +502,7 @@ fn leave_room(model: &mut Model) {
     model.turn_player_id = None;
     model.turn_deadline_at = None;
     model.chat.clear();
+    model.shot_history.clear();
 }
 
 fn trim_chat(chat: &mut Vec<ChatView>) {
@@ -413,7 +519,7 @@ fn trim_notices(notices: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use graphwar_protocol::{RoomVisibility, ServerMessage};
+    use graphwar_protocol::{ChatEntry, RoomVisibility, ServerMessage};
     use uuid::Uuid;
 
     use super::*;
@@ -509,6 +615,7 @@ mod tests {
                         is_bot: false,
                     }],
                 },
+                chat_history: Vec::new(),
                 game: Some(GameSnapshot {
                     room_id,
                     revision: 4,
@@ -530,6 +637,7 @@ mod tests {
                         radius: 40.0,
                     }],
                     terrain_cuts: Vec::new(),
+                    shot_history: Vec::new(),
                 }),
             })),
         );
@@ -624,6 +732,7 @@ mod tests {
                 soldiers: Vec::new(),
                 terrain: Vec::new(),
                 terrain_cuts: Vec::new(),
+                shot_history: Vec::new(),
             },
         );
         assert_eq!(model.screen, Screen::Lobby);
@@ -713,6 +822,187 @@ mod tests {
         assert_eq!(model, Model::default());
     }
 
+    fn active_game_message(room_id: Uuid, revision: u64, started: bool) -> ServerMessage {
+        let snapshot = RoomSnapshot {
+            id: room_id,
+            name: "Calculus club".into(),
+            visibility: RoomVisibility::Public,
+            phase: Phase::Planning,
+            revision,
+            mode: GameMode::Function,
+            players: Vec::new(),
+        };
+        let game = GameSnapshot {
+            room_id,
+            revision,
+            mode: GameMode::Function,
+            turn_player_id: None,
+            turn_deadline_at: None,
+            soldiers: Vec::new(),
+            terrain: Vec::new(),
+            terrain_cuts: Vec::new(),
+            shot_history: Vec::new(),
+        };
+        if started {
+            ServerMessage::GameStarted { snapshot, game }
+        } else {
+            ServerMessage::TurnStarted { snapshot, game }
+        }
+    }
+
+    #[test]
+    fn game_started_clears_previous_match_notices() {
+        let room_id = Uuid::new_v4();
+        let mut model = Model {
+            room_id: Some(room_id.to_string()),
+            notices: vec!["Team 1 wins".into()],
+            ..Model::default()
+        };
+        reduce(
+            &mut model,
+            Action::Message(Box::new(active_game_message(room_id, 1, true))),
+        );
+        assert!(model.notices.is_empty());
+    }
+
+    #[test]
+    fn turn_started_preserves_current_match_notices() {
+        let room_id = Uuid::new_v4();
+        let mut model = Model {
+            room_id: Some(room_id.to_string()),
+            notices: vec!["1 soldier(s) hit".into()],
+            ..Model::default()
+        };
+        reduce(
+            &mut model,
+            Action::Message(Box::new(active_game_message(room_id, 1, false))),
+        );
+        assert_eq!(model.notices, ["1 soldier(s) hit"]);
+    }
+
+    #[test]
+    fn chat_reducer_sorts_deduplicates_and_rejects_wrong_room() {
+        let room_id = Uuid::new_v4();
+        let player_id = Uuid::new_v4();
+        let mut model = Model {
+            room_id: Some(room_id.to_string()),
+            ..Model::default()
+        };
+        let entry = |sequence, text: &str, room_id| ChatEntry {
+            room_id,
+            sequence,
+            player_id,
+            display_name: "Ada".into(),
+            text: text.into(),
+        };
+        for item in [
+            entry(3, "after", room_id),
+            entry(1, "before", room_id),
+            entry(3, "after", room_id),
+        ] {
+            reduce(
+                &mut model,
+                Action::Message(Box::new(ServerMessage::Chat { entry: item })),
+            );
+        }
+        reduce(
+            &mut model,
+            Action::Message(Box::new(ServerMessage::Chat {
+                entry: entry(2, "wrong", Uuid::new_v4()),
+            })),
+        );
+        assert_eq!(
+            model
+                .chat
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert_eq!(model.chat[0].text, "before");
+        assert_eq!(model.chat[1].text, "after");
+    }
+
+    #[test]
+    fn stale_state_sync_does_not_regress_chat_history() {
+        let room_id = Uuid::new_v4();
+        let mut model = Model {
+            room_id: Some(room_id.to_string()),
+            room_revision: Some(1),
+            chat: vec![ChatView {
+                sequence: 5,
+                player_id: "current".into(),
+                display_name: "Current".into(),
+                text: "new".into(),
+            }],
+            ..Model::default()
+        };
+        reduce(
+            &mut model,
+            Action::Message(Box::new(ServerMessage::StateSync {
+                snapshot: RoomSnapshot {
+                    id: room_id,
+                    name: "Room".into(),
+                    visibility: RoomVisibility::Public,
+                    phase: Phase::Lobby,
+                    revision: 1,
+                    mode: GameMode::Function,
+                    players: Vec::new(),
+                },
+                game: None,
+                chat_history: vec![ChatEntry {
+                    room_id,
+                    sequence: 4,
+                    player_id: Uuid::new_v4(),
+                    display_name: "Old".into(),
+                    text: "old".into(),
+                }],
+            })),
+        );
+        assert_eq!(model.chat[0].sequence, 5);
+    }
+
+    #[test]
+    fn state_sync_replaces_chat_history_and_preserves_captured_name() {
+        let room_id = Uuid::new_v4();
+        let mut model = Model {
+            room_id: Some(room_id.to_string()),
+            room_revision: Some(0),
+            chat: vec![ChatView {
+                sequence: 99,
+                player_id: "old".into(),
+                display_name: "Old".into(),
+                text: "stale".into(),
+            }],
+            ..Model::default()
+        };
+        reduce(
+            &mut model,
+            Action::Message(Box::new(ServerMessage::StateSync {
+                snapshot: RoomSnapshot {
+                    id: room_id,
+                    name: "Room".into(),
+                    visibility: RoomVisibility::Public,
+                    phase: Phase::Lobby,
+                    revision: 1,
+                    mode: GameMode::Function,
+                    players: Vec::new(),
+                },
+                game: None,
+                chat_history: vec![ChatEntry {
+                    room_id,
+                    sequence: 4,
+                    player_id: Uuid::new_v4(),
+                    display_name: "Departed Ada".into(),
+                    text: "retained".into(),
+                }],
+            })),
+        );
+        assert_eq!(model.chat.len(), 1);
+        assert_eq!(model.chat[0].display_name, "Departed Ada");
+        assert_eq!(model.chat[0].sequence, 4);
+    }
+
     #[test]
     fn state_sync_keeps_pending_shot_board_until_animation_finishes() {
         let room_id = Uuid::new_v4();
@@ -730,6 +1020,7 @@ mod tests {
                 soldiers: Vec::new(),
                 terrain: Vec::new(),
                 terrain_cuts: Vec::new(),
+                shot_history: Vec::new(),
             }),
             ..Model::default()
         };
@@ -745,6 +1036,7 @@ mod tests {
                     mode: GameMode::Function,
                     players: Vec::new(),
                 },
+                chat_history: Vec::new(),
                 game: Some(GameSnapshot {
                     room_id,
                     revision: 1,
@@ -762,6 +1054,7 @@ mod tests {
                     }],
                     terrain: Vec::new(),
                     terrain_cuts: Vec::new(),
+                    shot_history: Vec::new(),
                 }),
             })),
         );
@@ -796,6 +1089,7 @@ mod tests {
                 soldiers: Vec::new(),
                 terrain: Vec::new(),
                 terrain_cuts: Vec::new(),
+                shot_history: Vec::new(),
             }),
             ..Model::default()
         };
@@ -820,6 +1114,7 @@ mod tests {
                     soldiers: Vec::new(),
                     terrain: Vec::new(),
                     terrain_cuts: Vec::new(),
+                    shot_history: Vec::new(),
                 },
             })),
         );
@@ -829,6 +1124,108 @@ mod tests {
         assert!(!model.shot_hits.is_empty());
         assert!(model.shot_explosion.is_some());
         assert!(model.pending_game.is_some());
+    }
+
+    #[test]
+    fn shot_history_updates_before_pending_board_applies() {
+        let room_id = Uuid::new_v4();
+        let player_id = Uuid::new_v4();
+        let mut model = Model {
+            room_id: Some(room_id.to_string()),
+            room_revision: Some(0),
+            ..Model::default()
+        };
+        let snapshot = RoomSnapshot {
+            id: room_id,
+            name: "Calculus club".into(),
+            visibility: RoomVisibility::Public,
+            phase: Phase::Resolving,
+            revision: 1,
+            mode: GameMode::Function,
+            players: Vec::new(),
+        };
+        reduce(
+            &mut model,
+            Action::Message(Box::new(ServerMessage::ShotResolved {
+                snapshot,
+                shot: graphwar_protocol::ShotResolved {
+                    path: vec![(100.0, 225.0), (120.0, 225.0)],
+                    hits: Vec::new(),
+                    explosion: None,
+                    winner_team: None,
+                    game: GameSnapshot {
+                        room_id,
+                        revision: 1,
+                        mode: GameMode::Function,
+                        turn_player_id: None,
+                        turn_deadline_at: None,
+                        soldiers: Vec::new(),
+                        terrain: Vec::new(),
+                        terrain_cuts: Vec::new(),
+                        shot_history: vec![graphwar_protocol::ShotHistoryEntry {
+                            sequence: 1,
+                            player_id,
+                            display_name: "Ada".into(),
+                            team: 1,
+                            function: "sin(x)".into(),
+                            angle_deg: 0.0,
+                        }],
+                    },
+                },
+            })),
+        );
+        assert!(model.pending_game.is_some());
+        assert_eq!(model.shot_history[0].function, "sin(x)");
+    }
+
+    #[test]
+    fn duplicate_shot_does_not_advance_animation_token() {
+        let room_id = Uuid::new_v4();
+        let player_id = Uuid::new_v4();
+        let message = ServerMessage::ShotResolved {
+            snapshot: RoomSnapshot {
+                id: room_id,
+                name: "Calculus club".into(),
+                visibility: RoomVisibility::Public,
+                phase: Phase::Resolving,
+                revision: 1,
+                mode: GameMode::Function,
+                players: Vec::new(),
+            },
+            shot: graphwar_protocol::ShotResolved {
+                path: vec![(100.0, 225.0)],
+                hits: Vec::new(),
+                explosion: None,
+                winner_team: None,
+                game: GameSnapshot {
+                    room_id,
+                    revision: 1,
+                    mode: GameMode::Function,
+                    turn_player_id: None,
+                    turn_deadline_at: None,
+                    soldiers: Vec::new(),
+                    terrain: Vec::new(),
+                    terrain_cuts: Vec::new(),
+                    shot_history: vec![graphwar_protocol::ShotHistoryEntry {
+                        sequence: 1,
+                        player_id,
+                        display_name: "Ada".into(),
+                        team: 1,
+                        function: "sin(x)".into(),
+                        angle_deg: 0.0,
+                    }],
+                },
+            },
+        };
+        let mut model = Model {
+            room_id: Some(room_id.to_string()),
+            room_revision: Some(0),
+            ..Model::default()
+        };
+        reduce(&mut model, Action::Message(Box::new(message.clone())));
+        let sequence = model.shot_sequence;
+        reduce(&mut model, Action::Message(Box::new(message)));
+        assert_eq!(model.shot_sequence, sequence);
     }
 
     #[test]
@@ -875,6 +1272,7 @@ mod tests {
             }],
             terrain: Vec::new(),
             terrain_cuts: Vec::new(),
+            shot_history: Vec::new(),
         };
         reduce(
             &mut model,

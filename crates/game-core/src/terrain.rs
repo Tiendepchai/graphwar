@@ -3,8 +3,9 @@
 // This file is part of Graphwar. See COPYING for license terms.
 
 use crate::constants::{PLANE_HEIGHT, PLANE_LENGTH};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Circle {
     pub x: f64,
     pub y: f64,
@@ -17,7 +18,7 @@ impl Circle {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Terrain {
     pub circles: Vec<Circle>,
     pub explosions: Vec<Circle>,
@@ -162,5 +163,19 @@ mod tests {
         }]);
         terrain.explode(20.0, 20.0, 10.0);
         assert!(!terrain.collides_circle(20.0, 20.0, 2.0));
+    }
+
+    #[test]
+    fn terrain_json_round_trip() {
+        let mut terrain = Terrain::new(vec![Circle {
+            x: 20.0,
+            y: 20.0,
+            radius: 5.0,
+        }]);
+        terrain.explode(20.0, 20.0, 2.0);
+        assert_eq!(
+            serde_json::from_str::<Terrain>(&serde_json::to_string(&terrain).unwrap()).unwrap(),
+            terrain
+        );
     }
 }

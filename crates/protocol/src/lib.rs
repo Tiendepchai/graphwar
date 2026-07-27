@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RegisterRequest {
@@ -97,6 +97,26 @@ pub struct SoldierPosition {
     pub active: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChatEntry {
+    pub room_id: Uuid,
+    pub sequence: u64,
+    pub player_id: Uuid,
+    pub display_name: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ShotHistoryEntry {
+    #[serde(default)]
+    pub sequence: u64,
+    pub player_id: Uuid,
+    pub display_name: String,
+    pub team: u8,
+    pub function: String,
+    pub angle_deg: f64,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GameSnapshot {
     pub room_id: Uuid,
@@ -107,6 +127,8 @@ pub struct GameSnapshot {
     pub soldiers: Vec<SoldierPosition>,
     pub terrain: Vec<TerrainCircle>,
     pub terrain_cuts: Vec<TerrainCircle>,
+    #[serde(default)]
+    pub shot_history: Vec<ShotHistoryEntry>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -204,11 +226,11 @@ pub enum ServerMessage {
     StateSync {
         snapshot: RoomSnapshot,
         game: Option<GameSnapshot>,
+        chat_history: Vec<ChatEntry>,
     },
     LeftRoom,
     Chat {
-        player_id: Uuid,
-        text: String,
+        entry: ChatEntry,
     },
 }
 
@@ -229,7 +251,7 @@ mod tests {
             version: PROTOCOL_VERSION,
         };
         let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(json, r#"{"type":"hello","payload":{"version":3}}"#);
+        assert_eq!(json, r#"{"type":"hello","payload":{"version":5}}"#);
         let snap = SnapshotEnvelope {
             version: PROTOCOL_VERSION,
             sequence: 3,
@@ -285,6 +307,48 @@ mod tests {
     fn old_player_snapshot_defaults_to_human() {
         let json = r#"{"id":"00000000-0000-0000-0000-000000000001","display_name":"Ada","owner":true,"ready":false,"team":1,"soldiers":2}"#;
         assert!(!serde_json::from_str::<PlayerSnapshot>(json).unwrap().is_bot);
+    }
+
+    #[test]
+    fn old_game_snapshot_defaults_to_empty_shot_history() {
+        let json = r#"{"room_id":"00000000-0000-0000-0000-000000000001","revision":1,"mode":"function","turn_player_id":null,"turn_deadline_at":null,"soldiers":[],"terrain":[],"terrain_cuts":[]}"#;
+        assert!(
+            serde_json::from_str::<GameSnapshot>(json)
+                .unwrap()
+                .shot_history
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn old_shot_history_defaults_to_zero_sequence() {
+        let json = r#"{"player_id":"00000000-0000-0000-0000-000000000001","display_name":"Ada","team":1,"function":"x","angle_deg":0.0}"#;
+        assert_eq!(
+            serde_json::from_str::<ShotHistoryEntry>(json)
+                .unwrap()
+                .sequence,
+            0
+        );
+    }
+
+    #[test]
+    fn chat_message_round_trips_authoritative_entry() {
+        let entry = ChatEntry {
+            room_id: Uuid::new_v4(),
+            sequence: 7,
+            player_id: Uuid::new_v4(),
+            display_name: "Ada".into(),
+            text: "hello".into(),
+        };
+        let message = ServerMessage::Chat {
+            entry: entry.clone(),
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ServerMessage>(&json).unwrap(),
+            message
+        );
+        assert!(json.contains("\"sequence\":7"));
     }
 
     #[test]

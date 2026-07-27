@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use graphwar_server::{AppState, Config, app};
+use graphwar_server::{AppState, Config, app, room_store};
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -18,9 +18,13 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     sqlx::migrate!("../../migrations").run(&pool).await?;
 
+    let mut registry = room_store::load(&pool).await?;
+    if registry.resume_after_restart() {
+        room_store::save(&pool, &registry).await?;
+    }
     let listener = TcpListener::bind(config.bind_addr).await?;
     tracing::info!(address = %listener.local_addr()?, "server listening");
-    let state = AppState::new(pool, config);
+    let state = AppState::from_registry(pool, config, registry);
     let expiry_state = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));

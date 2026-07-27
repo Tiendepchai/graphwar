@@ -10,27 +10,72 @@ use graphwar_game_core::{
 };
 
 use graphwar_protocol::{
-    GameMode, GameSnapshot, Phase, PlayerSnapshot, RoomSnapshot, RoomVisibility, ShotResolved,
-    SoldierPosition, SoldierSnapshot, TerrainCircle,
+    ChatEntry, GameMode, GameSnapshot, Phase, PlayerSnapshot, RoomSnapshot, RoomVisibility,
+    ShotHistoryEntry, ShotResolved, SoldierPosition, SoldierSnapshot, TerrainCircle,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+const REGISTRY_FORMAT_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct PersistedRegistry {
+    version: u32,
+    rooms: Vec<PersistedRoom>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedRoom {
+    snapshot: RoomSnapshot,
+    invite: Option<String>,
+    members: HashMap<Uuid, bool>,
+    bots: HashMap<Uuid, PersistedBot>,
+    game: Option<PersistedMatch>,
+    #[serde(default)]
+    event_sequence: u64,
+    #[serde(default)]
+    chat_history: Vec<ChatEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedBot {
+    level: u8,
+    seed: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedMatch {
+    mode: GameMode,
+    terrain: Terrain,
+    state: GameState,
+    player_ids: Vec<Uuid>,
+    turn_deadline_at: i64,
+    #[serde(default)]
+    shot_history: Vec<ShotHistoryEntry>,
+}
+
 use uuid::Uuid;
 
 pub type RoomRegistry = std::sync::Arc<tokio::sync::RwLock<Registry>>;
 
 const TURN_DURATION: Duration = Duration::from_secs(60);
+const MAX_SHOT_HISTORY: usize = 40;
+const MAX_CHAT_HISTORY: usize = 100;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Registry {
     rooms: HashMap<Uuid, Room>,
 }
 
+#[derive(Clone)]
 struct Room {
     snapshot: RoomSnapshot,
     invite: Option<String>,
     members: HashMap<Uuid, bool>,
     bots: HashMap<Uuid, BotSpec>,
     game: Option<Match>,
+    event_sequence: u64,
+    chat_history: Vec<ChatEntry>,
 }
 
 #[derive(Clone)]
@@ -40,12 +85,14 @@ struct BotSpec {
     memory: crate::bot::SearchMemory,
 }
 
+#[derive(Clone)]
 struct Match {
     mode: GameMode,
     terrain: Terrain,
     state: GameState,
     player_ids: Vec<Uuid>,
     turn_deadline_at: i64,
+    shot_history: Vec<ShotHistoryEntry>,
 }
 
 pub struct StartOutcome {
@@ -56,6 +103,28 @@ pub struct StartOutcome {
 pub struct FireOutcome {
     pub snapshot: RoomSnapshot,
     pub shot: ShotResolved,
+}
+
+pub struct LeaveOutcome {
+    pub room_id: Uuid,
+    pub broadcast: Option<LeaveBroadcast>,
+}
+
+pub enum LeaveBroadcast {
+    Room(RoomSnapshot),
+    StateSync {
+        snapshot: RoomSnapshot,
+        game: GameSnapshot,
+        chat_history: Vec<ChatEntry>,
+    },
+    TurnStarted {
+        snapshot: RoomSnapshot,
+        game: GameSnapshot,
+    },
+    GameFinished {
+        snapshot: RoomSnapshot,
+        shot: ShotResolved,
+    },
 }
 
 #[derive(Clone)]
@@ -90,6 +159,8 @@ pub enum RoomError {
     WrongPhase,
     #[error("it is not your turn")]
     NotTurn,
+    #[error("state storage unavailable")]
+    Storage,
 }
 
 impl RoomError {
@@ -103,11 +174,130 @@ impl RoomError {
             Self::NotSlotOwner => "not_slot_owner",
             Self::WrongPhase => "wrong_phase",
             Self::NotTurn => "not_turn",
+            Self::Storage => "storage_unavailable",
         }
     }
 }
 
 impl Registry {
+    pub(crate) fn from_persisted_json(input: &str) -> Result<Self, String> {
+        let persisted: PersistedRegistry =
+            serde_json::from_str(input).map_err(|error| error.to_string())?;
+        if persisted.version != REGISTRY_FORMAT_VERSION {
+            return Err(format!(
+                "unsupported registry snapshot version {}",
+                persisted.version
+            ));
+        }
+        let mut rooms = HashMap::with_capacity(persisted.rooms.len());
+        for mut persisted in persisted.rooms {
+            let id = persisted.snapshot.id;
+            if rooms.contains_key(&id) {
+                return Err("duplicate room ID".into());
+            }
+            normalize_feed_history(&mut persisted)?;
+            validate_persisted_room(&persisted)?;
+            let bots = persisted
+                .bots
+                .into_iter()
+                .map(|(id, bot)| {
+                    (
+                        id,
+                        BotSpec {
+                            level: bot.level,
+                            seed: bot.seed,
+                            memory: crate::bot::SearchMemory::default(),
+                        },
+                    )
+                })
+                .collect();
+            let game = persisted.game.map(|game| Match {
+                mode: game.mode,
+                terrain: game.terrain,
+                state: game.state,
+                player_ids: game.player_ids,
+                turn_deadline_at: game.turn_deadline_at,
+                shot_history: game.shot_history,
+            });
+            rooms.insert(
+                id,
+                Room {
+                    snapshot: persisted.snapshot,
+                    invite: persisted.invite,
+                    members: persisted.members,
+                    bots,
+                    game,
+                    event_sequence: persisted.event_sequence,
+                    chat_history: persisted.chat_history,
+                },
+            );
+        }
+        Ok(Self { rooms })
+    }
+
+    pub(crate) fn persisted_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&PersistedRegistry {
+            version: REGISTRY_FORMAT_VERSION,
+            rooms: self
+                .rooms
+                .values()
+                .map(|room| PersistedRoom {
+                    snapshot: room.snapshot.clone(),
+                    invite: room.invite.clone(),
+                    members: room.members.clone(),
+                    bots: room
+                        .bots
+                        .iter()
+                        .map(|(id, bot)| {
+                            (
+                                *id,
+                                PersistedBot {
+                                    level: bot.level,
+                                    seed: bot.seed,
+                                },
+                            )
+                        })
+                        .collect(),
+                    game: room.game.as_ref().map(|game| PersistedMatch {
+                        mode: game.mode,
+                        terrain: game.terrain.clone(),
+                        state: game.state.clone(),
+                        player_ids: game.player_ids.clone(),
+                        turn_deadline_at: game.turn_deadline_at,
+                        shot_history: game.shot_history.clone(),
+                    }),
+                    event_sequence: room.event_sequence,
+                    chat_history: room.chat_history.clone(),
+                })
+                .collect(),
+        })
+    }
+
+    pub fn resume_after_restart(&mut self) -> bool {
+        let mut changed = false;
+        for room in self.rooms.values_mut() {
+            let Some(game) = room.game.as_mut() else {
+                continue;
+            };
+            match room.snapshot.phase {
+                Phase::Planning => {
+                    game.turn_deadline_at = turn_deadline();
+                    room.snapshot.revision += 1;
+                    changed = true;
+                }
+                Phase::Resolving => {
+                    advance_turn(&mut game.state);
+                    game.turn_deadline_at = turn_deadline();
+                    room.snapshot.phase = Phase::Planning;
+                    room.snapshot.revision += 1;
+                    changed = true;
+                }
+                Phase::Lobby | Phase::Finished => {}
+            }
+        }
+        changed
+    }
+
     pub fn create(
         &mut self,
         owner: Uuid,
@@ -149,6 +339,8 @@ impl Registry {
                 members: HashMap::from([(owner, false)]),
                 bots: HashMap::new(),
                 game: None,
+                event_sequence: 0,
+                chat_history: Vec::new(),
             },
         );
         Ok((snapshot, invite))
@@ -190,7 +382,93 @@ impl Registry {
         Ok(room.snapshot.clone())
     }
 
-    pub fn leave(&mut self, player: Uuid) -> Result<Option<RoomSnapshot>, RoomError> {
+    pub fn leave(&mut self, player: Uuid) -> Result<LeaveOutcome, RoomError> {
+        let id = self.room_id_for(player).ok_or(RoomError::NotMember)?;
+        let phase = self.rooms[&id].snapshot.phase;
+        if matches!(phase, Phase::Lobby | Phase::Finished) {
+            let room = self.rooms.get_mut(&id).expect("room ID came from registry");
+            if phase == Phase::Finished {
+                room.snapshot.phase = Phase::Lobby;
+                room.game = None;
+                reset_readiness(room);
+            }
+            if remove_member(room, player) {
+                Ok(LeaveOutcome {
+                    room_id: id,
+                    broadcast: Some(LeaveBroadcast::Room(room.snapshot.clone())),
+                })
+            } else {
+                self.rooms.remove(&id);
+                Ok(LeaveOutcome {
+                    room_id: id,
+                    broadcast: None,
+                })
+            }
+        } else {
+            let room = self.rooms.get_mut(&id).expect("room ID came from registry");
+            let (current, winner_team) = {
+                let game = room.game.as_mut().ok_or(RoomError::WrongPhase)?;
+                let slot = game
+                    .player_ids
+                    .iter()
+                    .position(|id| *id == player)
+                    .ok_or(RoomError::NotMember)?;
+                for soldier in &mut game.state.players[slot].soldiers {
+                    soldier.alive = false;
+                }
+                (game.state.turn == slot, winner(&game.state))
+            };
+            if !remove_member(room, player) {
+                self.rooms.remove(&id);
+                return Ok(LeaveOutcome {
+                    room_id: id,
+                    broadcast: None,
+                });
+            }
+            if let Some(winner_team) = winner_team {
+                room.snapshot.phase = Phase::Finished;
+                let game_snapshot = snapshot_for_game(room);
+                return Ok(LeaveOutcome {
+                    room_id: id,
+                    broadcast: Some(LeaveBroadcast::GameFinished {
+                        snapshot: room.snapshot.clone(),
+                        shot: ShotResolved {
+                            path: Vec::new(),
+                            hits: Vec::new(),
+                            explosion: None,
+                            winner_team: Some(winner_team),
+                            game: game_snapshot,
+                        },
+                    }),
+                });
+            }
+            if phase == Phase::Planning && current {
+                let game = room.game.as_mut().expect("active game exists");
+                advance_turn(&mut game.state);
+                game.turn_deadline_at = turn_deadline();
+                let game_snapshot = snapshot_for_game(room);
+                Ok(LeaveOutcome {
+                    room_id: id,
+                    broadcast: Some(LeaveBroadcast::TurnStarted {
+                        snapshot: room.snapshot.clone(),
+                        game: game_snapshot,
+                    }),
+                })
+            } else {
+                let game_snapshot = snapshot_for_game(room);
+                Ok(LeaveOutcome {
+                    room_id: id,
+                    broadcast: Some(LeaveBroadcast::StateSync {
+                        snapshot: room.snapshot.clone(),
+                        game: game_snapshot,
+                        chat_history: room.chat_history.clone(),
+                    }),
+                })
+            }
+        }
+    }
+
+    pub fn disconnect(&mut self, player: Uuid) -> Result<Option<RoomSnapshot>, RoomError> {
         let id = self.room_id_for(player).ok_or(RoomError::NotMember)?;
         let room = self.rooms.get_mut(&id).expect("room ID came from registry");
         if !matches!(room.snapshot.phase, Phase::Lobby | Phase::Finished) {
@@ -201,22 +479,12 @@ impl Registry {
             room.game = None;
             reset_readiness(room);
         }
-        room.members.remove(&player);
-        room.snapshot.players.retain(|member| member.id != player);
-        room.snapshot.revision += 1;
-        if room.snapshot.players.iter().all(|member| member.is_bot) {
+        if remove_member(room, player) {
+            Ok(Some(room.snapshot.clone()))
+        } else {
             self.rooms.remove(&id);
-            return Ok(None);
+            Ok(None)
         }
-        if !room.snapshot.players.iter().any(|member| member.owner) {
-            room.snapshot
-                .players
-                .iter_mut()
-                .find(|member| !member.is_bot)
-                .expect("checked for a remaining human")
-                .owner = true;
-        }
-        Ok(Some(room.snapshot.clone()))
     }
 
     pub fn set_ready(&mut self, player: Uuid, ready: bool) -> Result<RoomSnapshot, RoomError> {
@@ -397,7 +665,11 @@ impl Registry {
         {
             return Err(RoomError::WrongPhase);
         }
-        let game_state = new_match(room.snapshot.id, &room.snapshot.players, room.snapshot.mode)?;
+        let game_state = new_match(
+            match_seed(room.snapshot.id),
+            &room.snapshot.players,
+            room.snapshot.mode,
+        )?;
         room.snapshot.phase = Phase::Planning;
         room.snapshot.revision += 1;
         room.game = Some(game_state);
@@ -442,17 +714,39 @@ impl Registry {
         if active_id != player {
             return Err(RoomError::NotTurn);
         }
-        let expr = parse(function.trim()).map_err(|_| RoomError::Invalid("invalid function"))?;
+        let normalized_function = function.trim().to_owned();
+        let expr =
+            parse(&normalized_function).map_err(|_| RoomError::Invalid("invalid function"))?;
+        let (display_name, team) = room
+            .snapshot
+            .players
+            .iter()
+            .find(|member| member.id == player)
+            .map(|member| (member.display_name.clone(), member.team))
+            .ok_or(RoomError::NotMember)?;
+        let trajectory = {
+            let game = room.game.as_ref().expect("checked above");
+            if !mode_allows(&expr, game.mode) {
+                return Err(RoomError::Invalid(
+                    "function uses variables unavailable in this mode",
+                ));
+            }
+            let mode = trajectory_mode(game.mode, angle_deg);
+            let inverted = matches!(game.state.players[game.state.turn].team, Team::Two);
+            trace(&expr, mode, &game.terrain, &game.state, inverted)
+                .map_err(|_| RoomError::Invalid("function produced no finite trajectory"))?
+        };
+        let sequence = next_event_sequence(room)?;
+        let history_entry = ShotHistoryEntry {
+            sequence,
+            player_id: player,
+            display_name,
+            team,
+            function: normalized_function,
+            angle_deg,
+        };
         let game = room.game.as_mut().expect("checked above");
-        if !mode_allows(&expr, game.mode) {
-            return Err(RoomError::Invalid(
-                "function uses variables unavailable in this mode",
-            ));
-        }
-        let mode = trajectory_mode(game.mode, angle_deg);
-        let inverted = matches!(game.state.players[game.state.turn].team, Team::Two);
-        let trajectory = trace(&expr, mode, &game.terrain, &game.state, inverted)
-            .map_err(|_| RoomError::Invalid("function produced no finite trajectory"))?;
+        append_shot_history(game, history_entry);
         let explosion = trajectory.points.last().copied().map(|(x, y)| Circle {
             x,
             y,
@@ -487,6 +781,31 @@ impl Registry {
             snapshot: room.snapshot.clone(),
             shot,
         })
+    }
+
+    pub fn chat(&mut self, player: Uuid, text: String) -> Result<(Uuid, ChatEntry), RoomError> {
+        if text.trim().is_empty() || text.len() > 500 {
+            return Err(RoomError::Invalid("chat must be 1-500 characters"));
+        }
+        let room = self.member_room_mut(player)?;
+        let display_name = room
+            .snapshot
+            .players
+            .iter()
+            .find(|member| member.id == player)
+            .map(|member| member.display_name.clone())
+            .ok_or(RoomError::NotMember)?;
+        let entry = ChatEntry {
+            room_id: room.snapshot.id,
+            sequence: next_event_sequence(room)?,
+            player_id: player,
+            display_name,
+            text,
+        };
+        room.chat_history.push(entry.clone());
+        let excess = room.chat_history.len().saturating_sub(MAX_CHAT_HISTORY);
+        room.chat_history.drain(..excess);
+        Ok((room.snapshot.id, entry))
     }
 
     pub fn pending_bot_turns(&self) -> Vec<BotTurn> {
@@ -616,12 +935,13 @@ impl Registry {
     pub fn member_state(
         &self,
         player: Uuid,
-    ) -> Result<(RoomSnapshot, Option<GameSnapshot>), RoomError> {
+    ) -> Result<(RoomSnapshot, Option<GameSnapshot>, Vec<ChatEntry>), RoomError> {
         let id = self.room_id_for(player).ok_or(RoomError::NotMember)?;
         let room = &self.rooms[&id];
         Ok((
             room.snapshot.clone(),
             room.game.as_ref().map(|_| snapshot_for_game(room)),
+            room.chat_history.clone(),
         ))
     }
 
@@ -647,7 +967,11 @@ impl Registry {
     pub fn public_snapshots(&self) -> Vec<RoomSnapshot> {
         self.rooms
             .values()
-            .filter(|room| room.snapshot.visibility == RoomVisibility::Public)
+            .filter(|room| {
+                room.snapshot.visibility == RoomVisibility::Public
+                    && room.snapshot.phase == Phase::Lobby
+                    && room.snapshot.players.len() < MAX_PLAYERS
+            })
             .map(|room| room.snapshot.clone())
             .collect()
     }
@@ -666,12 +990,153 @@ impl Registry {
     }
 }
 
-fn new_match(
-    room_id: Uuid,
-    players: &[PlayerSnapshot],
-    mode: GameMode,
-) -> Result<Match, RoomError> {
-    let mut generator = SeededGenerator::new(room_id.as_u128() as u64);
+fn normalize_feed_history(room: &mut PersistedRoom) -> Result<(), String> {
+    let mut used = std::collections::HashSet::new();
+    let mut maximum = room.event_sequence;
+    for sequence in room
+        .chat_history
+        .iter()
+        .map(|entry| entry.sequence)
+        .chain(
+            room.game
+                .iter()
+                .flat_map(|game| game.shot_history.iter().map(|entry| entry.sequence)),
+        )
+        .filter(|sequence| *sequence != 0)
+    {
+        if !used.insert(sequence) {
+            return Err("duplicate feed sequence".into());
+        }
+        maximum = maximum.max(sequence);
+    }
+    if let Some(game) = &mut room.game {
+        for shot in &mut game.shot_history {
+            if shot.sequence == 0 {
+                maximum = maximum
+                    .checked_add(1)
+                    .ok_or_else(|| "feed sequence exhausted".to_string())?;
+                shot.sequence = maximum;
+            }
+        }
+    }
+    room.event_sequence = maximum;
+    Ok(())
+}
+
+fn validate_persisted_room(room: &PersistedRoom) -> Result<(), String> {
+    let snapshot = &room.snapshot;
+    if snapshot.name.is_empty() || snapshot.name.len() > 64 || snapshot.players.is_empty() {
+        return Err("invalid room snapshot".into());
+    }
+    if snapshot.players.len() > MAX_PLAYERS
+        || snapshot
+            .players
+            .iter()
+            .filter(|player| player.owner)
+            .count()
+            != 1
+        || snapshot.players.iter().any(|player| {
+            player.display_name.is_empty()
+                || player.display_name.len() > 32
+                || !(1..=2).contains(&player.team)
+                || player.soldiers == 0
+                || usize::from(player.soldiers) > MAX_SOLDIERS_PER_PLAYER
+        })
+    {
+        return Err("invalid room players".into());
+    }
+    let player_ids = snapshot
+        .players
+        .iter()
+        .map(|player| player.id)
+        .collect::<std::collections::HashSet<_>>();
+    if player_ids.len() != snapshot.players.len()
+        || room.members.len() != player_ids.len()
+        || room.members.keys().any(|id| !player_ids.contains(id))
+        || room.bots.keys().any(|id| !player_ids.contains(id))
+        || snapshot
+            .players
+            .iter()
+            .any(|player| player.is_bot != room.bots.contains_key(&player.id))
+        || room.bots.values().any(|bot| !(1..=8).contains(&bot.level))
+    {
+        return Err("inconsistent room membership".into());
+    }
+    if snapshot.visibility == RoomVisibility::Private
+        && room.invite.as_deref().is_none_or(str::is_empty)
+    {
+        return Err("private room missing invite".into());
+    }
+    if room.chat_history.len() > MAX_CHAT_HISTORY
+        || room.chat_history.iter().any(|entry| {
+            entry.room_id != snapshot.id
+                || entry.sequence == 0
+                || entry.sequence > room.event_sequence
+                || entry.display_name.is_empty()
+                || entry.display_name.len() > 32
+                || entry.text.trim().is_empty()
+                || entry.text.len() > 500
+        })
+    {
+        return Err("invalid chat history".into());
+    }
+    match (&snapshot.phase, &room.game) {
+        (Phase::Lobby, None) | (Phase::Finished, None) => return Ok(()),
+        (Phase::Planning | Phase::Resolving | Phase::Finished, Some(game)) => {
+            if game.mode != snapshot.mode
+                || game.state.players.len() != game.player_ids.len()
+                || game.state.turn >= game.state.players.len()
+                || game
+                    .player_ids
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    != game.player_ids.len()
+                || game.shot_history.len() > MAX_SHOT_HISTORY
+                || game.shot_history.iter().any(|shot| {
+                    shot.sequence == 0
+                        || shot.sequence > room.event_sequence
+                        || !(1..=2).contains(&shot.team)
+                        || shot.display_name.is_empty()
+                        || shot.display_name.len() > 32
+                        || shot.function.is_empty()
+                        || shot.function.len() > 256
+                        || !shot.angle_deg.is_finite()
+                })
+            {
+                return Err("invalid match state".into());
+            }
+            if game
+                .terrain
+                .circles
+                .iter()
+                .chain(&game.terrain.explosions)
+                .any(|circle| {
+                    !circle.x.is_finite()
+                        || !circle.y.is_finite()
+                        || !circle.radius.is_finite()
+                        || circle.radius <= 0.0
+                })
+                || game.state.players.iter().any(|player| {
+                    player.current_soldier >= player.soldiers.len()
+                        || player.soldiers.is_empty()
+                        || player.soldiers.len() > MAX_SOLDIERS_PER_PLAYER
+                        || player
+                            .soldiers
+                            .iter()
+                            .any(|soldier| !soldier.x.is_finite() || !soldier.y.is_finite())
+                })
+            {
+                return Err("invalid terrain or soldiers".into());
+            }
+        }
+        _ => return Err("inconsistent room phase".into()),
+    }
+    Ok(())
+}
+
+fn new_match(seed: u64, players: &[PlayerSnapshot], mode: GameMode) -> Result<Match, RoomError> {
+    let mut generator = SeededGenerator::new(seed);
     let terrain = Terrain::new(generator.terrain());
     let slots = alternating_players(players);
     let player_ids = slots.iter().map(|player| player.id).collect();
@@ -679,7 +1144,7 @@ fn new_match(
     let mut game_players = Vec::with_capacity(slots.len());
     for (index, player) in slots.into_iter().enumerate() {
         let team = team(player.team);
-        let soldiers = spawn_soldiers(&terrain, team, player.soldiers, index, &placed)?;
+        let soldiers = spawn_soldiers(&terrain, team, player.soldiers, index, seed, &placed)?;
         placed.extend(soldiers.iter().cloned());
         game_players.push(Player::new(index as u32, team, soldiers));
     }
@@ -689,6 +1154,7 @@ fn new_match(
         state: GameState::new(game_players),
         player_ids,
         turn_deadline_at: turn_deadline(),
+        shot_history: Vec::new(),
     })
 }
 
@@ -718,19 +1184,29 @@ fn spawn_soldiers(
     team: Team,
     count: u8,
     player_index: usize,
+    match_seed: u64,
     placed: &[Soldier],
 ) -> Result<Vec<Soldier>, RoomError> {
     let x_start = SOLDIER_RADIUS as i32;
     let x_end = PLANE_LENGTH / 2 - SOLDIER_RADIUS as i32;
     let y_start = SOLDIER_RADIUS as i32;
     let y_end = PLANE_HEIGHT - SOLDIER_RADIUS as i32;
+    let x_span = (x_end - x_start) as u64;
+    let y_span = (y_end - y_start) as u64;
     let mut result = Vec::with_capacity(usize::from(count));
     for soldier_index in 0..count {
-        let seed = player_index * MAX_SOLDIERS_PER_PLAYER + usize::from(soldier_index);
+        let seed = match_seed
+            .wrapping_add((player_index as u64).wrapping_mul(MAX_SOLDIERS_PER_PLAYER as u64))
+            .wrapping_add(u64::from(soldier_index));
         let mut found = None;
-        for attempt in 0..10_000 {
-            let x = x_start + ((seed * 97 + attempt * 53) as i32).rem_euclid(x_end - x_start);
-            let y = y_start + ((seed * 193 + attempt * 89) as i32).rem_euclid(y_end - y_start);
+        for attempt in 0..10_000_u64 {
+            let x = x_start
+                + (seed.wrapping_mul(97).wrapping_add(attempt.wrapping_mul(53)) % x_span) as i32;
+            let y = y_start
+                + (seed
+                    .wrapping_mul(193)
+                    .wrapping_add(attempt.wrapping_mul(89))
+                    % y_span) as i32;
             let x = if team == Team::One {
                 f64::from(x)
             } else {
@@ -751,8 +1227,39 @@ fn spawn_soldiers(
     Ok(result)
 }
 
+fn match_seed(room_id: Uuid) -> u64 {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let room = room_id.as_u128();
+    (timestamp as u64)
+        ^ ((timestamp >> 64) as u64).rotate_left(32)
+        ^ (room as u64)
+        ^ ((room >> 64) as u64).rotate_left(17)
+}
+
 fn team(value: u8) -> Team {
     if value == 1 { Team::One } else { Team::Two }
+}
+
+fn remove_member(room: &mut Room, player: Uuid) -> bool {
+    room.members.remove(&player);
+    room.bots.remove(&player);
+    room.snapshot.players.retain(|member| member.id != player);
+    room.snapshot.revision += 1;
+    if room.snapshot.players.iter().all(|member| member.is_bot) {
+        return false;
+    }
+    if !room.snapshot.players.iter().any(|member| member.owner) {
+        room.snapshot
+            .players
+            .iter_mut()
+            .find(|member| !member.is_bot)
+            .expect("remaining room has a human")
+            .owner = true;
+    }
+    true
 }
 
 fn is_owner(room: &Room, player: Uuid) -> bool {
@@ -773,6 +1280,14 @@ fn reset_readiness(room: &mut Room) {
     for player in &mut room.snapshot.players {
         player.ready = player.is_bot;
     }
+}
+
+fn next_event_sequence(room: &mut Room) -> Result<u64, RoomError> {
+    room.event_sequence = room
+        .event_sequence
+        .checked_add(1)
+        .ok_or(RoomError::Invalid("feed sequence exhausted"))?;
+    Ok(room.event_sequence)
 }
 
 fn unix_timestamp() -> i64 {
@@ -804,6 +1319,12 @@ fn trajectory_mode(mode: GameMode, angle_deg: f64) -> TrajectoryMode {
             angle: angle_deg.to_radians(),
         },
     }
+}
+
+fn append_shot_history(game: &mut Match, entry: ShotHistoryEntry) {
+    game.shot_history.push(entry);
+    let excess = game.shot_history.len().saturating_sub(MAX_SHOT_HISTORY);
+    game.shot_history.drain(..excess);
 }
 
 fn apply_hits(game: &mut Match, hits: &[graphwar_game_core::Hit]) {
@@ -923,6 +1444,7 @@ fn snapshot_for_game(room: &Room) -> GameSnapshot {
             .copied()
             .map(circle_snapshot)
             .collect(),
+        shot_history: game.shot_history.clone(),
     }
 }
 
@@ -975,6 +1497,163 @@ mod tests {
         let start = registry.start_game(owner).unwrap();
         assert_eq!(start.snapshot.phase, Phase::Planning);
         assert_eq!(start.game.soldiers.len(), 4);
+    }
+
+    #[test]
+    fn persisted_active_match_round_trips_and_resets_bot_memory() {
+        let owner = Uuid::new_v4();
+        let mut registry = Registry::default();
+        let room = registry
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Private,
+            )
+            .unwrap()
+            .0;
+        let bot = registry
+            .add_bot(owner, 2)
+            .unwrap()
+            .players
+            .into_iter()
+            .find(|player| player.is_bot)
+            .unwrap()
+            .id;
+        registry.set_ready(owner, true).unwrap();
+        registry.start_game(owner).unwrap();
+        let memory = {
+            let game = registry.rooms[&room.id].game.as_ref().unwrap();
+            crate::bot::search(crate::bot::SearchInput {
+                mode: game.mode,
+                terrain: &game.terrain,
+                state: &game.state,
+                team: Team::Two,
+                level: 2,
+                seed: 0,
+                memory: crate::bot::SearchMemory::default(),
+                budget: Duration::ZERO,
+            })
+            .memory
+        };
+        assert_ne!(memory, crate::bot::SearchMemory::default());
+        registry
+            .rooms
+            .get_mut(&room.id)
+            .unwrap()
+            .bots
+            .get_mut(&bot)
+            .unwrap()
+            .memory = memory;
+
+        let restored = Registry::from_persisted_json(&registry.persisted_json().unwrap()).unwrap();
+        let (restored_snapshot, restored_game, restored_chat) =
+            restored.member_state(owner).unwrap();
+        let (snapshot, game, chat) = registry.member_state(owner).unwrap();
+        assert_eq!(restored_chat, chat);
+        assert_eq!(restored_snapshot, snapshot);
+        let (Some(restored_game), Some(game)) = (restored_game, game) else {
+            panic!("active match missing after restore");
+        };
+        assert_eq!(restored_game.room_id, game.room_id);
+        assert_eq!(restored_game.revision, game.revision);
+        assert_eq!(restored_game.mode, game.mode);
+        assert_eq!(restored_game.turn_player_id, game.turn_player_id);
+        assert_eq!(restored_game.shot_history, game.shot_history);
+        assert_eq!(restored_game.soldiers.len(), game.soldiers.len());
+        assert!(restored_game.soldiers.iter().zip(game.soldiers.iter()).all(
+            |(restored, original)| {
+                restored.player_id == original.player_id
+                    && restored.index == original.index
+                    && restored.team == original.team
+                    && restored.alive == original.alive
+                    && restored.active == original.active
+                    && (restored.x - original.x).abs() < 1e-9
+                    && (restored.y - original.y).abs() < 1e-9
+            }
+        ));
+        assert_eq!(restored_game.terrain.len(), game.terrain.len());
+        assert!(restored_game.terrain.iter().zip(game.terrain.iter()).all(
+            |(restored, original)| {
+                (restored.x - original.x).abs() < 1e-9
+                    && (restored.y - original.y).abs() < 1e-9
+                    && (restored.radius - original.radius).abs() < 1e-9
+            }
+        ));
+        assert_eq!(restored_game.terrain_cuts, game.terrain_cuts);
+        assert_eq!(restored.rooms[&room.id].bots[&bot].level, 2);
+        assert_eq!(
+            restored.rooms[&room.id].bots[&bot].memory,
+            crate::bot::SearchMemory::default()
+        );
+        assert_eq!(
+            restored.rooms[&room.id].bots[&bot].memory,
+            crate::bot::SearchMemory::default()
+        );
+    }
+
+    #[test]
+    fn restart_keeps_planning_turn_and_settles_resolving_once() {
+        let (mut registry, room_id, owner, guest) = started_registry();
+        let before = registry
+            .member_state(owner)
+            .unwrap()
+            .1
+            .unwrap()
+            .turn_player_id;
+        assert!(registry.resume_after_restart());
+        let resumed = registry.member_state(owner).unwrap().1.unwrap();
+        assert_eq!(resumed.turn_player_id, before);
+        assert!(resumed.turn_deadline_at.unwrap() > unix_timestamp());
+
+        registry.fire(owner, "0".into(), 0.0).unwrap();
+        assert!(registry.resume_after_restart());
+        let resolved = registry.member_state(guest).unwrap().1.unwrap();
+        assert_eq!(resolved.turn_player_id, Some(guest));
+        assert_eq!(registry.rooms[&room_id].snapshot.phase, Phase::Planning);
+    }
+
+    #[test]
+    fn corrupt_persisted_registry_is_rejected() {
+        assert!(Registry::from_persisted_json(r#"{"version":1,"rooms":[{"snapshot":{"id":"00000000-0000-0000-0000-000000000000","name":"","visibility":"public","phase":"lobby","revision":0,"mode":"function","players":[]},"invite":null,"members":{},"bots":{},"game":null}]}"#).is_err());
+    }
+
+    #[test]
+    fn fixed_match_seed_reproduces_layout() {
+        let players = [
+            PlayerSnapshot {
+                id: Uuid::new_v4(),
+                display_name: "One".into(),
+                owner: true,
+                ready: true,
+                team: 1,
+                soldiers: 1,
+                is_bot: false,
+            },
+            PlayerSnapshot {
+                id: Uuid::new_v4(),
+                display_name: "Two".into(),
+                owner: false,
+                ready: true,
+                team: 2,
+                soldiers: 1,
+                is_bot: false,
+            },
+        ];
+        let first = new_match(123, &players, GameMode::Function).unwrap();
+        let second = new_match(123, &players, GameMode::Function).unwrap();
+
+        assert_eq!(first.terrain, second.terrain);
+        assert_eq!(first.state, second.state);
+    }
+
+    #[test]
+    fn spawn_seed_changes_first_soldier_position() {
+        let terrain = Terrain::default();
+        let first = spawn_soldiers(&terrain, Team::One, 1, 0, 0, &[]).unwrap();
+        let second = spawn_soldiers(&terrain, Team::One, 1, 0, 1, &[]).unwrap();
+
+        assert_ne!((first[0].x, first[0].y), (second[0].x, second[0].y));
     }
 
     #[test]
@@ -1083,7 +1762,10 @@ mod tests {
         registry.join(guest, "Guest".into(), room.id, None).unwrap();
         registry.add_bot(owner, 1).unwrap();
 
-        let snapshot = registry.leave(owner).unwrap().unwrap();
+        let outcome = registry.leave(owner).unwrap();
+        let LeaveBroadcast::Room(snapshot) = outcome.broadcast.unwrap() else {
+            panic!("lobby leave should broadcast room");
+        };
         assert!(
             snapshot
                 .players
@@ -1096,12 +1778,11 @@ mod tests {
                 .iter()
                 .all(|player| !player.is_bot || !player.owner)
         );
-        assert!(registry.leave(guest).unwrap().is_none());
+        assert!(registry.leave(guest).unwrap().broadcast.is_none());
         assert!(!registry.rooms.contains_key(&room.id));
     }
 
-    #[test]
-    fn active_game_roster_cannot_change() {
+    fn started_registry() -> (Registry, Uuid, Uuid, Uuid) {
         let owner = Uuid::new_v4();
         let guest = Uuid::new_v4();
         let mut registry = Registry::default();
@@ -1113,8 +1794,177 @@ mod tests {
         registry.set_ready(owner, true).unwrap();
         registry.set_ready(guest, true).unwrap();
         registry.start_game(owner).unwrap();
+        (registry, room.id, owner, guest)
+    }
 
-        assert!(matches!(registry.leave(guest), Err(RoomError::WrongPhase)));
+    fn started_three_player_registry() -> (Registry, Uuid, Uuid, Uuid, Uuid) {
+        let owner = Uuid::new_v4();
+        let guest = Uuid::new_v4();
+        let third = Uuid::new_v4();
+        let mut registry = Registry::default();
+        let room = registry
+            .create(owner, "Owner".into(), "room".into(), RoomVisibility::Public)
+            .unwrap()
+            .0;
+        registry.join(guest, "Guest".into(), room.id, None).unwrap();
+        registry.join(third, "Third".into(), room.id, None).unwrap();
+        registry.set_ready(owner, true).unwrap();
+        registry.set_ready(guest, true).unwrap();
+        registry.set_ready(third, true).unwrap();
+        registry.start_game(owner).unwrap();
+        (registry, room.id, owner, guest, third)
+    }
+
+    fn started_four_player_registry() -> (Registry, Uuid, Uuid, Uuid, Uuid, Uuid) {
+        let (mut registry, room_id, owner, guest, third) = started_three_player_registry();
+        let fourth = Uuid::new_v4();
+        {
+            let room = registry.rooms.get_mut(&room_id).unwrap();
+            room.snapshot.phase = Phase::Lobby;
+            room.game = None;
+        }
+        registry
+            .join(fourth, "Fourth".into(), room_id, None)
+            .unwrap();
+        registry.set_team(fourth, fourth, 1).unwrap();
+        registry.set_ready(owner, true).unwrap();
+        registry.set_ready(guest, true).unwrap();
+        registry.set_ready(third, true).unwrap();
+        registry.set_ready(fourth, true).unwrap();
+        registry.start_game(owner).unwrap();
+        (registry, room_id, owner, guest, third, fourth)
+    }
+
+    #[test]
+    fn planning_leave_advances_only_when_current_player_leaves() {
+        let (mut registry, room_id, owner, _guest, _third, _fourth) =
+            started_four_player_registry();
+        let current = registry
+            .member_state(owner)
+            .unwrap()
+            .1
+            .unwrap()
+            .turn_player_id
+            .unwrap();
+        let outcome = registry.leave(current).unwrap();
+        let LeaveBroadcast::TurnStarted { snapshot, game } = outcome.broadcast.unwrap() else {
+            panic!("current planning leave should start the next turn");
+        };
+        let next_turn = game.turn_player_id;
+        let deadline = game.turn_deadline_at;
+        assert_eq!(snapshot.phase, Phase::Planning);
+        assert_ne!(next_turn, Some(current));
+        assert!(deadline.unwrap() > unix_timestamp());
+        assert_eq!(snapshot.players.len(), 3);
+        assert!(
+            game.soldiers
+                .iter()
+                .filter(|soldier| soldier.player_id == current)
+                .all(|soldier| !soldier.alive)
+        );
+
+        let non_current = registry
+            .member_state(next_turn.unwrap())
+            .unwrap()
+            .0
+            .players
+            .iter()
+            .map(|player| player.id)
+            .find(|player| *player != next_turn.unwrap())
+            .unwrap();
+        let outcome = registry.leave(non_current).unwrap();
+        let LeaveBroadcast::StateSync { snapshot, game, .. } = outcome.broadcast.unwrap() else {
+            panic!("non-current planning leave should sync without advancing");
+        };
+        assert_eq!(snapshot.phase, Phase::Planning);
+        assert_eq!(game.turn_player_id, next_turn);
+        assert_eq!(game.turn_deadline_at, deadline);
+        assert_eq!(snapshot.players.len(), 2);
+        assert!(registry.rooms.contains_key(&room_id));
+    }
+
+    #[test]
+    fn resolving_nonterminal_leave_syncs_without_advancing_turn() {
+        let (mut registry, room_id, owner, guest, third) = started_three_player_registry();
+        let active = registry
+            .member_state(owner)
+            .unwrap()
+            .1
+            .unwrap()
+            .turn_player_id
+            .unwrap();
+        registry.fire(active, "0".into(), 0.0).unwrap();
+        let before = registry.member_state(third).unwrap().1.unwrap();
+        let leaver = [owner, guest, third]
+            .into_iter()
+            .find(|player| *player != active && *player != owner)
+            .unwrap();
+
+        let outcome = registry.leave(leaver).unwrap();
+        let LeaveBroadcast::StateSync { snapshot, game, .. } = outcome.broadcast.unwrap() else {
+            panic!("nonterminal resolving leave should sync");
+        };
+        assert_eq!(snapshot.phase, Phase::Resolving);
+        assert_eq!(game.turn_player_id, before.turn_player_id);
+        assert_eq!(game.turn_deadline_at, before.turn_deadline_at);
+        assert_eq!(
+            registry.rooms[&room_id].game.as_ref().unwrap().state.turn,
+            0
+        );
+        assert!(
+            game.soldiers
+                .iter()
+                .filter(|soldier| soldier.player_id == leaver)
+                .all(|soldier| !soldier.alive)
+        );
+    }
+
+    #[test]
+    fn current_turn_leave_forfeits_and_finishes_two_player_match() {
+        let (mut registry, room_id, owner, guest) = started_registry();
+
+        let outcome = registry.leave(owner).unwrap();
+        let LeaveBroadcast::GameFinished { snapshot, shot } = outcome.broadcast.unwrap() else {
+            panic!("sole opposing player should win");
+        };
+
+        assert_eq!(snapshot.phase, Phase::Finished);
+        assert_eq!(snapshot.players.len(), 1);
+        assert_eq!(snapshot.players[0].id, guest);
+        assert!(snapshot.players[0].owner);
+        assert_eq!(shot.winner_team, Some(2));
+        assert!(shot.path.is_empty());
+        assert!(
+            shot.game
+                .soldiers
+                .iter()
+                .filter(|soldier| soldier.player_id == owner)
+                .all(|soldier| !soldier.alive)
+        );
+        assert_eq!(
+            registry.rooms[&room_id]
+                .game
+                .as_ref()
+                .unwrap()
+                .player_ids
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn disconnect_during_active_match_preserves_membership_and_soldiers() {
+        let (mut registry, room_id, _owner, guest) = started_registry();
+        let before = registry.member_state(guest).unwrap().1.unwrap();
+
+        assert!(matches!(
+            registry.disconnect(guest),
+            Err(RoomError::WrongPhase)
+        ));
+
+        let after = registry.member_state(guest).unwrap().1.unwrap();
+        assert_eq!(after.soldiers, before.soldiers);
+        assert!(registry.is_member_of(guest, room_id));
     }
 
     #[test]
@@ -1135,6 +1985,175 @@ mod tests {
             Err(RoomError::NotTurn)
         ));
         assert!(registry.fire(owner, "0".into(), 0.0).is_ok());
+    }
+
+    #[test]
+    fn accepted_shots_are_authoritative_and_bounded() {
+        let (mut registry, room_id, owner, _) = started_registry();
+        let outcome = registry.fire(owner, " sin(x) ".into(), 0.0).unwrap();
+        assert_eq!(outcome.shot.game.shot_history.len(), 1);
+        assert_eq!(outcome.shot.game.shot_history[0].display_name, "Owner");
+        assert_eq!(outcome.shot.game.shot_history[0].function, "sin(x)");
+
+        let game = registry
+            .rooms
+            .get_mut(&room_id)
+            .unwrap()
+            .game
+            .as_mut()
+            .unwrap();
+        for index in 0..MAX_SHOT_HISTORY {
+            append_shot_history(
+                game,
+                ShotHistoryEntry {
+                    sequence: index as u64 + 2,
+                    player_id: owner,
+                    display_name: "Owner".into(),
+                    team: 1,
+                    function: format!("x+{index}"),
+                    angle_deg: 0.0,
+                },
+            );
+        }
+        assert_eq!(game.shot_history.len(), MAX_SHOT_HISTORY);
+        assert_eq!(game.shot_history[0].function, "x+0");
+    }
+
+    #[test]
+    fn invalid_shots_do_not_enter_history() {
+        let (mut registry, room_id, owner, _) = started_registry();
+        assert!(registry.fire(owner, "x+".into(), 0.0).is_err());
+        assert_eq!(registry.rooms[&room_id].event_sequence, 0);
+        assert!(
+            registry.rooms[&room_id]
+                .game
+                .as_ref()
+                .unwrap()
+                .shot_history
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn chat_and_shot_share_monotonic_sequence() {
+        let (mut registry, room_id, owner, guest) = started_registry();
+        let (_, before) = registry.chat(owner, "before".into()).unwrap();
+        let shot = registry.fire(owner, "sin(x)".into(), 0.0).unwrap();
+        let (_, after) = registry.chat(guest, "after".into()).unwrap();
+        assert_eq!(
+            (
+                before.sequence,
+                shot.shot.game.shot_history[0].sequence,
+                after.sequence
+            ),
+            (1, 2, 3)
+        );
+        assert_eq!(registry.rooms[&room_id].event_sequence, 3);
+        assert_eq!(registry.member_state(owner).unwrap().2, vec![before, after]);
+    }
+
+    #[test]
+    fn invalid_chat_does_not_consume_sequence() {
+        let (mut registry, room_id, owner, _) = started_registry();
+        assert!(matches!(
+            registry.chat(owner, "   ".into()),
+            Err(RoomError::Invalid(_))
+        ));
+        assert_eq!(registry.rooms[&room_id].event_sequence, 0);
+        let (_, entry) = registry.chat(owner, "accepted".into()).unwrap();
+        assert_eq!(entry.sequence, 1);
+    }
+
+    #[test]
+    fn departed_player_name_remains_in_history() {
+        let (mut registry, _room_id, owner, guest) = started_registry();
+        let (_, entry) = registry.chat(owner, "hello".into()).unwrap();
+        registry.leave(owner).unwrap();
+        let history = registry.member_state(guest).unwrap().2;
+        assert_eq!(history, vec![entry]);
+        assert_eq!(history[0].display_name, "Owner");
+    }
+
+    #[test]
+    fn persisted_active_match_without_legacy_shot_history_is_accepted() {
+        let (registry, _room_id, owner, _) = started_registry();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&registry.persisted_json().unwrap()).unwrap();
+        json["rooms"][0]["game"]
+            .as_object_mut()
+            .unwrap()
+            .remove("shot_history");
+        let restored = Registry::from_persisted_json(&json.to_string()).unwrap();
+        assert!(
+            restored
+                .member_state(owner)
+                .unwrap()
+                .1
+                .unwrap()
+                .shot_history
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn persisted_chat_with_wrong_room_id_is_rejected() {
+        let (mut registry, _room_id, owner, _) = started_registry();
+        registry.chat(owner, "chat".into()).unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&registry.persisted_json().unwrap()).unwrap();
+        json["rooms"][0]["chat_history"][0]["room_id"] =
+            serde_json::Value::String(Uuid::new_v4().to_string());
+        assert!(Registry::from_persisted_json(&json.to_string()).is_err());
+    }
+
+    #[test]
+    fn persisted_legacy_zero_shot_sequence_is_normalized() {
+        let (mut registry, room_id, owner, _) = started_registry();
+        registry.fire(owner, "sin(x)".into(), 0.0).unwrap();
+        registry.rooms.get_mut(&room_id).unwrap().event_sequence = 0;
+        registry
+            .rooms
+            .get_mut(&room_id)
+            .unwrap()
+            .game
+            .as_mut()
+            .unwrap()
+            .shot_history[0]
+            .sequence = 0;
+        let restored = Registry::from_persisted_json(&registry.persisted_json().unwrap()).unwrap();
+        let room = &restored.rooms[&room_id];
+        assert_eq!(room.event_sequence, 1);
+        assert_eq!(room.game.as_ref().unwrap().shot_history[0].sequence, 1);
+    }
+
+    #[test]
+    fn persisted_duplicate_feed_sequence_is_rejected() {
+        let (mut registry, room_id, owner, _) = started_registry();
+        registry.chat(owner, "chat".into()).unwrap();
+        registry.fire(owner, "sin(x)".into(), 0.0).unwrap();
+        registry
+            .rooms
+            .get_mut(&room_id)
+            .unwrap()
+            .game
+            .as_mut()
+            .unwrap()
+            .shot_history[0]
+            .sequence = 1;
+        assert!(Registry::from_persisted_json(&registry.persisted_json().unwrap()).is_err());
+    }
+
+    #[test]
+    fn chat_history_is_bounded_and_persisted() {
+        let (mut registry, _room_id, owner, _) = started_registry();
+        for index in 0..(MAX_CHAT_HISTORY + 1) {
+            registry.chat(owner, format!("chat-{index}")).unwrap();
+        }
+        let history = registry.member_state(owner).unwrap().2;
+        assert_eq!(history.len(), MAX_CHAT_HISTORY);
+        assert_eq!(history[0].text, "chat-1");
+        let restored = Registry::from_persisted_json(&registry.persisted_json().unwrap()).unwrap();
+        assert_eq!(restored.member_state(owner).unwrap().2, history);
     }
 
     #[test]
@@ -1229,26 +2248,29 @@ mod tests {
     }
 
     #[test]
-    fn shot_resolves_before_next_turn() {
-        let owner = Uuid::new_v4();
-        let guest = Uuid::new_v4();
-        let mut registry = Registry::default();
-        let room = registry
-            .create(owner, "Owner".into(), "room".into(), RoomVisibility::Public)
-            .unwrap()
-            .0;
-        registry.join(guest, "Guest".into(), room.id, None).unwrap();
-        registry.set_ready(owner, true).unwrap();
-        registry.set_ready(guest, true).unwrap();
-        registry.start_game(owner).unwrap();
-
+    fn resolving_leave_forfeits_without_advancing_turn() {
+        let (mut registry, room_id, owner, guest) = started_registry();
         registry.fire(owner, "0".into(), 0.0).unwrap();
-        assert!(matches!(registry.leave(owner), Err(RoomError::WrongPhase)));
-        assert!(matches!(registry.leave(guest), Err(RoomError::WrongPhase)));
+        let turn = registry.rooms[&room_id].game.as_ref().unwrap().state.turn;
 
-        let room = registry.rooms.get(&room.id).unwrap();
-        assert_eq!(room.snapshot.phase, Phase::Resolving);
-        assert_eq!(room.game.as_ref().unwrap().state.turn, 0);
+        let outcome = registry.leave(guest).unwrap();
+        let LeaveBroadcast::GameFinished { snapshot, shot } = outcome.broadcast.unwrap() else {
+            panic!("sole remaining team should win");
+        };
+
+        assert_eq!(snapshot.phase, Phase::Finished);
+        assert_eq!(shot.winner_team, Some(1));
+        assert_eq!(
+            registry.rooms[&room_id].game.as_ref().unwrap().state.turn,
+            turn
+        );
+        assert!(
+            shot.game
+                .soldiers
+                .iter()
+                .filter(|soldier| soldier.player_id == guest)
+                .all(|soldier| !soldier.alive)
+        );
     }
 
     #[test]
