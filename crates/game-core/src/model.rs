@@ -3,14 +3,15 @@
 // This file is part of Graphwar. See COPYING for license terms.
 
 use crate::constants::{INITIAL_NUM_SOLDIERS, MAX_SOLDIERS_PER_PLAYER};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Team {
     One,
     Two,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Soldier {
     pub x: f64,
     pub y: f64,
@@ -23,7 +24,7 @@ impl Soldier {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Player {
     pub id: u32,
     pub team: Team,
@@ -55,7 +56,7 @@ impl Player {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GameState {
     pub players: Vec<Player>,
     pub turn: usize,
@@ -73,5 +74,23 @@ impl GameState {
                 .map(|i| Soldier::new(x + i as f64 * 20.0, y))
                 .collect(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_json_round_trip() {
+        let state = GameState::new(vec![Player::new(
+            7,
+            Team::One,
+            vec![Soldier::new(1.5, 2.5)],
+        )]);
+        assert_eq!(
+            serde_json::from_str::<GameState>(&serde_json::to_string(&state).unwrap()).unwrap(),
+            state
+        );
     }
 }

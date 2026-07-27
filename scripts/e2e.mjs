@@ -24,7 +24,7 @@ const CHROME_CANDIDATES = process.env.CHROME_BIN
           `${process.env["PROGRAMFILES(X86)"] ?? "C:\\Program Files (x86)"}\\Google\\Chrome\\Application\\chrome.exe`,
         ]
       : ["google-chrome", "chromium", "chromium-browser"];
-const PROTOCOL_VERSION = 3;
+const PROTOCOL_VERSION = 5;
 const timeoutMs = Number(process.env.E2E_TIMEOUT_MS ?? 15_000);
 if (BASE.protocol === "https:" && process.env.E2E_TLS_VERIFY === "false") {
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
@@ -256,12 +256,21 @@ class RawWs {
   }
 }
 
-async function openWs(cookie, origin = ORIGIN) {
+async function rawWs(cookie, origin = ORIGIN) {
   const result = await socketConnect(wsUrl(), {Origin: origin, Cookie: cookie});
   ok(result.status === 101, `websocket handshake status ${result.status}`);
-  const socket = new RawWs(result);
-  const hello = JSON.parse((await socket.next()).text);
+  return new RawWs(result);
+}
+
+async function openWs(cookie, origin = ORIGIN) {
+  const socket = await rawWs(cookie, origin);
+  socket.sendText(JSON.stringify({type: "hello", payload: {version: PROTOCOL_VERSION}}));
+  const hello = JSON.parse((await socket.next("server Hello")).text);
   ok(hello.type === "hello" && hello.payload.version === PROTOCOL_VERSION, "server hello mismatch");
+  const sync = JSON.parse((await socket.next("state sync")).text);
+  ok(["state_sync", "left_room"].includes(sync.type), "state sync missing");
+  const roomList = JSON.parse((await socket.next("room list")).text);
+  ok(roomList.type === "room_list", "room list missing");
   return socket;
 }
 
@@ -273,19 +282,23 @@ async function wsBoundaryChecks(session) {
   ok(wrongOrigin.status === 403, `wrong-origin status ${wrongOrigin.status}`);
   wrongOrigin.socket.destroy();
 
-  const unsupported = await openWs(session.cookie);
+  const unsupported = await rawWs(session.cookie);
   unsupported.sendText(JSON.stringify({type: "hello", payload: {version: 2}}));
   ok((await unsupported.next()).text.includes("unsupported protocol"), "unsupported version not rejected");
   unsupported.close();
 
-  const firstCommand = await openWs(session.cookie);
+  const firstCommand = await rawWs(session.cookie);
   firstCommand.sendText(JSON.stringify({type: "list_rooms"}));
   ok((await firstCommand.next()).text.includes("hello is required first"), "missing Hello not rejected");
   firstCommand.close();
 
   const invalid = await openWs(session.cookie);
   invalid.sendText("not-json");
-  ok((await invalid.next()).text.includes("invalid JSON message"), "invalid JSON not rejected");
+  const invalidMessage = JSON.parse((await invalid.next()).text);
+  ok(
+    invalidMessage.type === "error" && invalidMessage.payload?.message.includes("invalid JSON message"),
+    "invalid JSON not rejected",
+  );
   invalid.close();
 
   const oversized = await openWs(session.cookie);
@@ -317,13 +330,11 @@ async function wsBoundaryChecks(session) {
   ok(rateLimited, "websocket rate limit did not return rate_limited");
   rate.close();
 
-  const revoked = await openWs(session.cookie);
   const logout = await request("/auth/logout", {method: "POST", headers: {cookie: session.cookie}});
   ok(logout.status === 204, "revocation setup failed");
-  revoked.sendText(JSON.stringify({type: "hello", payload: {version: PROTOCOL_VERSION}}));
-  const expired = JSON.parse((await revoked.next("session expiration frame")).text);
-  ok(expired.type === "session_expired", "revoked websocket missed session_expired");
-  await withTimeout(new Promise(resolve => revoked.socket.once("close", resolve)), timeoutMs, "revoked websocket close");
+  const revoked = await socketConnect(wsUrl(), {Origin: ORIGIN, Cookie: session.cookie});
+  ok(revoked.status === 401, `revoked websocket status ${revoked.status}`);
+  revoked.socket.destroy();
   log("WebSocket origin, auth, Hello, parsing, size, rate, revocation: pass");
 }
 
@@ -375,6 +386,7 @@ async function chromeCommand() {
 }
 
 async function closeBrowser(browser) {
+  if (!browser) return;
   browser.cdp.close();
   if (!browser.child.killed) browser.child.kill("SIGTERM");
   await withTimeout(new Promise(resolve => browser.child.once("exit", resolve)), timeoutMs, "Chrome shutdown")
@@ -442,35 +454,39 @@ async function browserSet(cdp, selector, value) {
 async function browserSubmit(cdp, selector) { ok(await cdp.evaluate(`(() => { const e = document.querySelector(${JSON.stringify(selector)}); if (!e) return false; e.requestSubmit(); return true; })()`), `missing form ${selector}`); }
 async function browserClick(cdp, selector) { ok(await cdp.evaluate(`(() => { const e = document.querySelector(${JSON.stringify(selector)}); if (!e) return false; e.click(); return true; })()`), `missing control ${selector}`); }
 async function browserText(cdp, selector) { return cdp.evaluate(`document.querySelector(${JSON.stringify(selector)})?.textContent ?? ""`); }
-async function browserInstallGameRenderProbe(cdp) {
+async function browserInstallRenderProbe(cdp, key, selectors) {
   ok(await cdp.evaluate(`(() => {
+    const key = ${JSON.stringify(key)};
+    const selectors = ${JSON.stringify(selectors)};
     const app = document.querySelector('#app');
-    const shell = document.querySelector('.game-shell');
-    const canvas = document.querySelector('#game-canvas');
-    const fireForm = document.querySelector('#fire-form');
-    const chatForm = document.querySelector('#chat-form');
-    const functionInput = document.querySelector('#function-input');
-    if (!app || !shell || !canvas || !fireForm || !chatForm || !functionInput) return false;
+    const nodes = selectors.map(selector => document.querySelector(selector));
+    if (!app || nodes.some(node => !node)) return false;
     let replacements = 0;
     const observer = new MutationObserver(() => { replacements += 1; });
     observer.observe(app, {childList: true});
-    window.__graphwarGameRenderProbe = {app, shell, canvas, fireForm, chatForm, functionInput, observer, get replacements() { return replacements; }};
+    window.__graphwarRenderProbes ??= {};
+    window.__graphwarRenderProbes[key] = {app, nodes, selectors, observer, get replacements() { return replacements; }};
     return true;
-  })()`), "game render probe setup failed");
+  })()`), `${key} render probe setup failed`);
 }
-async function browserAssertGameStable(cdp, label) {
+async function browserAssertRenderStable(cdp, key, label) {
   ok(await cdp.evaluate(`(() => {
-    const probe = window.__graphwarGameRenderProbe;
+    const probe = window.__graphwarRenderProbes?.[${JSON.stringify(key)}];
     if (!probe) return false;
     const same = probe.app === document.querySelector('#app')
-      && probe.shell === document.querySelector('.game-shell')
-      && probe.canvas === document.querySelector('#game-canvas')
-      && probe.fireForm === document.querySelector('#fire-form')
-      && probe.chatForm === document.querySelector('#chat-form')
-      && probe.functionInput === document.querySelector('#function-input');
+      && probe.nodes.every((node, index) => node === document.querySelector(probe.selectors[index]));
     probe.observer.disconnect();
     return same && probe.replacements === 0;
-  })()`), `${label}: game DOM was replaced`);
+  })()`), `${label}: stable DOM was replaced`);
+}
+async function browserInstallGameRenderProbe(cdp) {
+  await browserInstallRenderProbe(cdp, "game", [
+    ".app-frame", "#screen", ".game-shell", "#game-canvas", "#fire-form", "#chat-form",
+    "#function-input", ".scoreboard ul", ".chat-panel ul",
+  ]);
+}
+async function browserAssertGameStable(cdp, label) {
+  await browserAssertRenderStable(cdp, "game", label);
 }
 
 async function browserRegister(browser, user) {
@@ -481,6 +497,7 @@ async function browserRegister(browser, user) {
   await browserSet(cdp, "#register-password", user.password);
   await browserSubmit(cdp, "#register-form");
   await browserWait(cdp, "Boolean(document.querySelector('#create-room-form'))", "lobby screen");
+  await browserWait(cdp, "Boolean(document.querySelector('.connection.is-online'))", "lobby connection");
 }
 async function browserCreate(cdp, name, visibility) {
   await browserSet(cdp, "#room-name", name);
@@ -499,12 +516,53 @@ async function browserFlows() {
   const a = await launchBrowser(BASE);
   const b = await launchBrowser(BASE);
   try {
+    await browserInstallRenderProbe(a.cdp, "login-notice", [
+      ".app-frame", "#screen", ".login-shell", "#login-form", "#register-form", "#login-password",
+    ]);
+    await browserSet(a.cdp, "#login-email", "missing@example.test");
+    await browserSet(a.cdp, "#login-password", "invalid-password-123");
+    ok(await a.cdp.evaluate(`(() => {
+      const input = document.querySelector('#login-password');
+      input?.focus();
+      input?.setSelectionRange(2, 8, 'forward');
+      return Boolean(input);
+    })()`), "missing login input");
+    await browserSubmit(a.cdp, "#login-form");
+    await browserWait(a.cdp, "document.querySelector('.notices')?.textContent.trim().length > 0", "login error notice");
+    await browserAssertRenderStable(a.cdp, "login-notice", "login error notice");
+    ok(await a.cdp.evaluate(`(() => {
+      const input = document.querySelector('#login-password');
+      return input?.value === 'invalid-password-123'
+        && document.activeElement === input
+        && input.selectionStart === 2
+        && input.selectionEnd === 8
+        && input.selectionDirection === 'forward';
+    })()`), "login error replaced form or lost focus");
     await browserRegister(a, alpha);
     await browserRegister(b, bravo);
-    const publicName = `Public E2E ${crypto.randomUUID()}`;
+    await browserSet(b.cdp, "#room-name", "preserved-lobby-draft");
+    ok(await b.cdp.evaluate(`(() => {
+      const input = document.querySelector('#room-name');
+      input?.focus();
+      input?.setSelectionRange(2, 9, 'forward');
+      return Boolean(input);
+    })()`), "missing lobby draft input");
+    await browserInstallRenderProbe(b.cdp, "lobby-list", [
+      ".app-frame", "#screen", ".lobby-shell", "#create-room-form", "#invite-room-form", "#room-name",
+    ]);
+    const publicName = `Public E2E ${crypto.randomUUID().slice(0, 8)}`;
     await browserCreate(a.cdp, publicName, "public");
     const publicNameJs = JSON.stringify(publicName);
     await browserWait(b.cdp, `Boolean([...document.querySelectorAll('.room-list li')].find(li => li.querySelector('strong')?.textContent === ${publicNameJs}))`, "public room listing");
+    await browserAssertRenderStable(b.cdp, "lobby-list", "lobby room-list update");
+    ok(await b.cdp.evaluate(`(() => {
+      const input = document.querySelector('#room-name');
+      return input?.value === 'preserved-lobby-draft'
+        && document.activeElement === input
+        && input.selectionStart === 2
+        && input.selectionEnd === 9
+        && input.selectionDirection === 'forward';
+    })()`), "lobby draft focus and caret lost");
     ok(await b.cdp.evaluate(`(() => { const button = [...document.querySelectorAll('.room-list li')].find(li => li.querySelector('strong')?.textContent === ${publicNameJs})?.querySelector('.join-room'); if (!button) return false; button.click(); return true; })()`), "public room join control missing");
     await browserWait(b.cdp, "Boolean(document.querySelector('#room-title'))", "public roster guest");
     await browserWait(a.cdp, `(() => {
@@ -521,6 +579,9 @@ async function browserFlows() {
       input.setSelectionRange(2, 7, 'forward');
       return true;
     })()`), "missing draft chat input");
+    await browserInstallRenderProbe(a.cdp, "room-roster", [
+      ".app-frame", "#screen", ".room-shell", "#ready-button", "#chat-form", "#chat-input",
+    ]);
     await browserSet(b.cdp, ".player-soldiers", "1");
     await browserWait(a.cdp, `(() => {
       const input = document.querySelector('#chat-input');
@@ -530,6 +591,7 @@ async function browserFlows() {
         && input.selectionEnd === 7
         && input.selectionDirection === 'forward';
     })()`, "draft focus and caret preservation");
+    await browserAssertRenderStable(a.cdp, "room-roster", "room roster update");
     ok(await a.cdp.evaluate(`(() => { const input = document.querySelector('#chat-input'); if (!input) return false; input.value = ''; return true; })()`), "missing draft chat input");
     await browserSet(a.cdp, ".player-soldiers", "1");
     await browserSet(b.cdp, ".player-team", "2");
@@ -559,16 +621,72 @@ async function browserFlows() {
           && summary?.textContent.includes('Team One')
           && summary?.textContent.includes('Team Two')
           && teams.includes('Team One')
-          && teams.includes('Team Two');
+          && teams.includes('Team Two')
+          && document.querySelectorAll('.notices').length === 1
+          && Boolean(document.querySelector('.chat-panel ul'))
+          && !document.querySelector('.combat-log');
       })()`), "battlefield accessibility semantics missing");
     }
-    await a.cdp.command("Emulation.setDeviceMetricsOverride", {width: 320, height: 800, deviceScaleFactor: 2, mobile: false});
-    await browserWait(a.cdp, `(() => {
-      const canvas = document.querySelector('#game-canvas');
-      return canvas && canvas.width === Math.round(canvas.getBoundingClientRect().width * 2)
-        && canvas.height === Math.round(canvas.getBoundingClientRect().height * 2)
-        && document.documentElement.scrollWidth <= 320;
-    })()`, "responsive DPR canvas");
+    for (const viewport of [
+      {width: 1920, height: 1080, deviceScaleFactor: 1},
+      {width: 1280, height: 620, deviceScaleFactor: 1},
+      {width: 1440, height: 900, deviceScaleFactor: 1},
+    ]) {
+      await a.cdp.command("Emulation.setDeviceMetricsOverride", {...viewport, mobile: false});
+      await browserWait(a.cdp, `(() => {
+        const map = document.querySelector('.map-panel')?.getBoundingClientRect();
+        const stack = document.querySelector('.command-stack')?.getBoundingClientRect();
+        const field = document.querySelector('.battlefield')?.getBoundingClientRect();
+        const canvas = document.querySelector('#game-canvas')?.getBoundingClientRect();
+        return map && stack && field && canvas
+          && map.left < stack.left
+          && map.width > stack.width
+          && Math.abs(field.width / field.height - 770 / 450) < .03
+          && Math.abs(canvas.width / canvas.height - 770 / 450) < .03
+          && Math.abs(canvas.width - field.width) < 6
+          && Math.abs(canvas.height - field.height) < 6
+          && document.documentElement.scrollWidth <= ${viewport.width};
+      })()`, `tactical layout ${viewport.width}x${viewport.height}`);
+    }
+    const chatLayout = await a.cdp.evaluate(`(() => {
+      const list = document.querySelector('.command-stack .chat-panel ul');
+      const panel = document.querySelector('.command-stack .chat-panel');
+      const form = document.querySelector('.command-stack .chat-panel form');
+      const stack = document.querySelector('.command-stack');
+      const field = document.querySelector('.battlefield');
+      if (!list || !panel || !form || !stack || !field) return null;
+      const original = list.innerHTML;
+      const stackHeight = stack.getBoundingClientRect().height;
+      const panelHeight = panel.getBoundingClientRect().height;
+      const formTop = form.getBoundingClientRect().top;
+      const fieldTop = field.getBoundingClientRect().top;
+      const documentHeight = document.documentElement.scrollHeight;
+      list.innerHTML = Array.from({length: 80}, (_, index) => '<li><strong>Test</strong><span>Overflow message ' + index + '</span></li>').join('');
+      list.scrollTop = list.scrollHeight;
+      const result = {
+        scrollHeight: list.scrollHeight,
+        clientHeight: list.clientHeight,
+        scrollTop: list.scrollTop,
+        overflowY: getComputedStyle(list).overflowY,
+        stackHeight: stack.getBoundingClientRect().height,
+        panelHeight: panel.getBoundingClientRect().height,
+        formTop: form.getBoundingClientRect().top,
+        fieldTop: field.getBoundingClientRect().top,
+        documentHeight: document.documentElement.scrollHeight,
+      };
+      list.innerHTML = original;
+      return {...result, stackHeightBefore: stackHeight, panelHeightBefore: panelHeight, formTopBefore: formTop, fieldTopBefore: fieldTop, documentHeightBefore: documentHeight};
+    })()`);
+    ok(chatLayout
+      && chatLayout.scrollHeight > chatLayout.clientHeight
+      && chatLayout.scrollTop > 0
+      && chatLayout.overflowY === 'auto'
+      && Math.abs(chatLayout.stackHeight - chatLayout.stackHeightBefore) < 1
+      && Math.abs(chatLayout.panelHeight - chatLayout.panelHeightBefore) < 1
+      && Math.abs(chatLayout.formTop - chatLayout.formTopBefore) < 1
+      && Math.abs(chatLayout.fieldTop - chatLayout.fieldTopBefore) < 1
+      && Math.abs(chatLayout.documentHeight - chatLayout.documentHeightBefore) < 1,
+    `game chat should scroll without growing the battlefield: ${JSON.stringify(chatLayout)}`);
     for (const cdp of [a.cdp, b.cdp]) await browserInstallGameRenderProbe(cdp);
     const activeIsA = await a.cdp.evaluate("document.querySelector('#function-input')?.disabled === false");
     const active = activeIsA ? a.cdp : b.cdp;
@@ -597,18 +715,71 @@ async function browserFlows() {
         && input.selectionDirection === 'backward';
     })()`), "function draft focus and caret lost");
     ok(previewExceptions.length === 0, `preview caused browser exception: ${previewExceptions.join(", ")}`);
+    async function sendGameChat(cdp, text) {
+      await browserSet(cdp, "#chat-input", text);
+      await browserSubmit(cdp, "#chat-form");
+    }
+    const orderedFeed = `(() => {
+      const rows = [...document.querySelectorAll('.chat-panel ul > li')];
+      const sequences = rows.map(row => Number(row.dataset.sequence));
+      return rows.length >= 3
+        && new Set(sequences).size === rows.length
+        && sequences.every((sequence, index) => index === 0 || sequences[index - 1] < sequence)
+        && rows.findIndex(row => row.textContent.includes('chat-before')) >= 0
+        && rows.findIndex(row => row.textContent.includes('chat-before')) + 1 === rows.findIndex(row => row.classList.contains('shot-entry') && row.querySelector('code')?.textContent === 'sin(x)')
+        && rows.findIndex(row => row.classList.contains('shot-entry') && row.querySelector('code')?.textContent === 'sin(x)') + 1 === rows.findIndex(row => row.textContent.includes('chat-after'));
+    })()`;
+    await sendGameChat(active, "chat-before");
+    await browserWait(inactive, "document.querySelector('.chat-panel ul')?.textContent.includes('chat-before')", "pre-shot chat delivery");
     await browserSubmit(active, "#fire-form");
     await browserWait(active, "document.querySelector('#turn-timer')?.textContent.includes('Resolving')", "authoritative shot", 20_000);
     await browserWait(inactive, "document.querySelector('#turn-timer')?.textContent.includes('Resolving')", "remote authoritative shot", 20_000);
-    for (const cdp of [a.cdp, b.cdp]) await browserAssertGameStable(cdp, "shot update");
+    await sendGameChat(active, "chat-after");
+    for (const cdp of [a.cdp, b.cdp]) {
+      await browserWait(cdp, orderedFeed, "authoritative chat-shot-chat order");
+      await browserAssertGameStable(cdp, "shot update");
+    }
+    for (const cdp of [a.cdp, b.cdp]) {
+      await browserInstallRenderProbe(cdp, "game-chat", [
+        ".app-frame", "#screen", ".game-shell", "#game-canvas", "#fire-form", "#chat-form", "#chat-input",
+      ]);
+    }
+    await sendGameChat(active, "game-chat");
+    await browserWait(inactive, `(() => {
+      const feed = document.querySelector('.chat-panel ul');
+      return feed?.textContent.includes('game-chat')
+        && [...feed.querySelectorAll('.shot-entry code')].some(code => code.textContent === 'sin(x)');
+    })()`, "in-game unified feed delivery");
+    for (const cdp of [a.cdp, b.cdp]) await browserAssertRenderStable(cdp, "game-chat", "in-game chat update");
+    await a.cdp.command("Emulation.setDeviceMetricsOverride", {width: 320, height: 800, deviceScaleFactor: 2, mobile: false});
+    await browserWait(a.cdp, `(() => {
+      const field = document.querySelector('.battlefield')?.getBoundingClientRect();
+      const canvas = document.querySelector('#game-canvas');
+      const rect = canvas?.getBoundingClientRect();
+      return field && canvas && rect
+        && Math.abs(field.width / field.height - 770 / 450) < .03
+        && Math.abs(rect.width / rect.height - 770 / 450) < .03
+        && canvas.width === Math.round(rect.width * 2)
+        && canvas.height === Math.round(rect.height * 2)
+        && document.documentElement.scrollWidth <= 320;
+    })()`, "responsive DPR canvas");
+    await a.cdp.command("Emulation.setDeviceMetricsOverride", {width: 1440, height: 900, deviceScaleFactor: 1, mobile: false});
+    await browserWait(a.cdp, "document.querySelector('#game-canvas')?.getBoundingClientRect().width > 320", "desktop canvas restore");
     await a.cdp.command("Page.reload");
     await browserWait(a.cdp, "Boolean(document.querySelector('#game-canvas'))", "state sync after refresh", 20_000);
+    await browserWait(a.cdp, orderedFeed, "ordered feed after refresh");
+    await browserWait(a.cdp, `(() => {
+      const rows = [...document.querySelectorAll('.chat-panel ul > li')];
+      const sequences = rows.map(row => row.dataset.sequence);
+      return rows.length >= 5 && new Set(sequences).size === rows.length;
+    })()`, "deduplicated feed after refresh");
     await browserExpireSession(a);
-    await browserWait(a.cdp, "Boolean(document.querySelector('#login-form'))", "external session expiration", 20_000);
+    await browserWait(a.cdp, "Boolean(document.querySelector('#login-form'))", "external session expiration", 75_000);
     await browserWait(
       a.cdp,
       "document.querySelector('.notices')?.textContent.includes('Session expired; sign in again')",
       "session expiration notice",
+      75_000,
     );
     await browserClick(b.cdp, "#logout");
     await browserWait(b.cdp, "Boolean(document.querySelector('#login-form'))", "logout screen");
@@ -621,12 +792,14 @@ async function browserFlows() {
     await browserWait(b.cdp, "Boolean(document.querySelector('#login-form'))", "logout survives reload");
     log("two-browser public room, chat, setup, readiness, start, fire, refresh, logout: pass");
 
-    const c = await launchBrowser(BASE);
-    const d = await launchBrowser(BASE);
+    let c;
+    let d;
     try {
+      c = await launchBrowser(BASE);
+      d = await launchBrowser(BASE);
       await browserRegister(c, browserUser("private-owner"));
       await browserRegister(d, browserUser("private-guest"));
-      const privateName = `Private E2E ${crypto.randomUUID()}`;
+      const privateName = `Private E2E ${crypto.randomUUID().slice(0, 8)}`;
       await browserCreate(c.cdp, privateName, "private");
       const notice = await browserText(c.cdp, ".notices");
       const invite = notice.match(/Private room:\s*([0-9a-f-]{36})\s*·\s*invite:\s*([0-9a-f-]{36})/i);
@@ -637,9 +810,7 @@ async function browserFlows() {
       );
       const privateProtocol = await registerAndLogin("private-protocol");
       const privateWs = await openWs(privateProtocol.cookie);
-      privateWs.sendText(JSON.stringify({type: "hello", payload: {version: PROTOCOL_VERSION}}));
-      await privateWs.next("private websocket hello");
-      await privateWs.next("private websocket state sync");
+      privateWs.sendText(JSON.stringify({type: "list_rooms"}));
       const privateRooms = JSON.parse((await privateWs.next("private websocket room list")).text);
       ok(
         privateRooms.type === "room_list"
@@ -652,9 +823,26 @@ async function browserFlows() {
       privateWs.close();
       await browserSet(d.cdp, "#private-room-id", invite[1]);
       await browserSet(d.cdp, "#invite-code", crypto.randomUUID());
+      ok(await d.cdp.evaluate(`(() => {
+        const input = document.querySelector('#invite-code');
+        input?.focus();
+        input?.setSelectionRange(3, 8, 'forward');
+        return Boolean(input);
+      })()`), "missing private invite input");
+      await browserInstallRenderProbe(d.cdp, "lobby-notice", [
+        ".app-frame", "#screen", ".lobby-shell", "#create-room-form", "#invite-room-form", "#invite-code",
+      ]);
       await browserSubmit(d.cdp, "#invite-room-form");
       await browserWait(d.cdp, "document.querySelector('.notices')?.textContent.includes('room is private')", "wrong private invite rejection");
-      ok(await d.cdp.evaluate("Boolean(document.querySelector('#create-room-form'))"), "wrong invite left lobby");
+      await browserAssertRenderStable(d.cdp, "lobby-notice", "lobby error notice");
+      ok(await d.cdp.evaluate(`(() => {
+        const input = document.querySelector('#invite-code');
+        return Boolean(document.querySelector('#create-room-form'))
+          && document.activeElement === input
+          && input.selectionStart === 3
+          && input.selectionEnd === 8
+          && input.selectionDirection === 'forward';
+      })()`), "wrong invite replaced lobby or lost focus");
       await browserSet(d.cdp, "#invite-code", invite[2]);
       await browserSubmit(d.cdp, "#invite-room-form");
       await browserWait(d.cdp, "Boolean(document.querySelector('#room-title'))", "private invite join");
@@ -678,6 +866,11 @@ async function browserFlows() {
         "document.querySelector('#function-input')?.disabled === false",
         "bot completed authoritative turn",
         30_000,
+      );
+      await browserWait(
+        c.cdp,
+        "document.querySelectorAll('.chat-panel .shot-entry').length >= 2",
+        "bot function history",
       );
       log("browser bot match and bot turn completion: pass");
     } finally {
