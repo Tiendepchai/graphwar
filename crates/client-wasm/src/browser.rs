@@ -53,6 +53,7 @@ struct App {
     auth_pending: bool,
     auth_request: Option<AbortController>,
     event_handlers: Vec<Closure<dyn FnMut(Event)>>,
+    dynamic_event_handlers: Vec<Closure<dyn FnMut(Event)>>,
     reconnect_attempt: u32,
     reconnect_timer: Option<Timeout>,
     clock: Option<Interval>,
@@ -74,7 +75,31 @@ struct ShotAnimation {
     started_at: f64,
 }
 
+#[derive(Clone, Copy)]
+enum RenderScope {
+    None,
+    Header,
+    Notices,
+    Rooms,
+    Chat,
+    Screen,
+}
+
 type SharedApp = Rc<RefCell<App>>;
+
+enum FeedEntry<'a> {
+    Chat(&'a crate::state::ChatView),
+    Shot(&'a crate::state::ShotHistoryView),
+}
+
+impl FeedEntry<'_> {
+    fn sequence(&self) -> u64 {
+        match self {
+            Self::Chat(entry) => entry.sequence,
+            Self::Shot(entry) => entry.sequence,
+        }
+    }
+}
 
 #[wasm_bindgen(start)]
 pub fn start() -> Result<(), JsValue> {
@@ -93,6 +118,7 @@ pub fn start() -> Result<(), JsValue> {
         auth_pending: false,
         auth_request: None,
         event_handlers: Vec::new(),
+        dynamic_event_handlers: Vec::new(),
         reconnect_attempt: 0,
         reconnect_timer: None,
         clock: None,
@@ -131,7 +157,7 @@ fn restore_session(app: &SharedApp) {
 }
 
 fn restored_authenticated(app: &SharedApp, auth_epoch: u64, account: AccountResponse) {
-    {
+    let previous_screen = {
         let mut app_ref = app.borrow_mut();
         if app_ref.auth_epoch != auth_epoch
             || app_ref.auth_pending
@@ -139,6 +165,7 @@ fn restored_authenticated(app: &SharedApp, auth_epoch: u64, account: AccountResp
         {
             return;
         }
+        let previous_screen = app_ref.model.screen.clone();
         reduce(
             &mut app_ref.model,
             Action::Authenticated {
@@ -146,8 +173,9 @@ fn restored_authenticated(app: &SharedApp, auth_epoch: u64, account: AccountResp
                 display_name: account.display_name,
             },
         );
-    }
-    rerender(app);
+        previous_screen
+    };
+    redraw_after(app, previous_screen);
     if let Err(error) = connect(app) {
         notice(app, format!("connection failed: {error:?}"));
     }
@@ -214,7 +242,7 @@ fn dispose_socket(socket: WebSocket, handlers: Option<SocketHandlers>) {
 }
 
 fn connect(app: &SharedApp) -> Result<(), JsValue> {
-    let (ws_url, connection_epoch, auth_epoch, previous_socket, previous_handlers) = {
+    let (ws_url, connection_epoch, auth_epoch, previous_socket, previous_handlers, previous_screen) = {
         let mut app = app.borrow_mut();
         if app.model.player_id.is_none() || app.auth_pending {
             return Ok(());
@@ -223,6 +251,7 @@ fn connect(app: &SharedApp) -> Result<(), JsValue> {
         app.reconnect_timer = None;
         let previous_socket = app.socket.take();
         let previous_handlers = app.socket_handlers.take();
+        let previous_screen = app.model.screen.clone();
         reduce(&mut app.model, Action::Connecting);
         (
             app.ws_url.clone(),
@@ -230,24 +259,22 @@ fn connect(app: &SharedApp) -> Result<(), JsValue> {
             app.auth_epoch,
             previous_socket,
             previous_handlers,
+            previous_screen,
         )
     };
     if let Some(socket) = previous_socket {
         dispose_socket(socket, previous_handlers);
     }
-    rerender(app);
+    redraw_scope(app, previous_screen, RenderScope::Header);
     let socket = match WebSocket::new(&ws_url) {
         Ok(socket) => socket,
         Err(error) => {
-            let mut app_ref = app.borrow_mut();
-            let current =
-                app_ref.connection_epoch == connection_epoch && app_ref.auth_epoch == auth_epoch;
+            let current = {
+                let app_ref = app.borrow();
+                app_ref.connection_epoch == connection_epoch && app_ref.auth_epoch == auth_epoch
+            };
             if current {
-                reduce(&mut app_ref.model, Action::GiveUp);
-            }
-            drop(app_ref);
-            if current {
-                rerender(app);
+                schedule_reconnect(app, connection_epoch, auth_epoch);
             }
             return Err(error);
         }
@@ -260,9 +287,7 @@ fn connect(app: &SharedApp) -> Result<(), JsValue> {
         }
         {
             let mut app = open_app.borrow_mut();
-            app.reconnect_attempt = 0;
             app.reconnect_timer = None;
-            reduce(&mut app.model, Action::Connected);
         }
         send_current(
             &open_app,
@@ -272,13 +297,6 @@ fn connect(app: &SharedApp) -> Result<(), JsValue> {
                 version: PROTOCOL_VERSION,
             },
         );
-        send_current(
-            &open_app,
-            connection_epoch,
-            auth_epoch,
-            ClientMessage::ListRooms,
-        );
-        rerender(&open_app);
     });
     socket.set_onopen(Some(onopen.as_ref().unchecked_ref()));
 
@@ -292,28 +310,42 @@ fn connect(app: &SharedApp) -> Result<(), JsValue> {
         };
         match serde_json::from_str::<ServerMessage>(&text) {
             Ok(ServerMessage::SessionExpired) => session_expired(&message_app),
+            Ok(ServerMessage::Hello { version }) if version == PROTOCOL_VERSION => {
+                let previous_screen = {
+                    let mut app = message_app.borrow_mut();
+                    if !connection_is_current(&app, connection_epoch, auth_epoch) {
+                        return;
+                    }
+                    app.reconnect_attempt = 0;
+                    let previous_screen = app.model.screen.clone();
+                    reduce(&mut app.model, Action::Connected);
+                    previous_screen
+                };
+                redraw_scope(&message_app, previous_screen, RenderScope::Header);
+            }
+            Ok(ServerMessage::Hello { .. }) => {
+                notice(
+                    &message_app,
+                    "Client update required; reload the page".into(),
+                );
+                dispose_current_socket(&message_app, connection_epoch, auth_epoch);
+            }
             Ok(message) => {
                 announce_server_message(&message_app, &message);
-                let app_ref = message_app.borrow();
-                let was_game = app_ref.model.screen == Screen::Game;
-                let prior_sequence = app_ref.model.shot_sequence;
-                drop(app_ref);
-                reduce(
-                    &mut message_app.borrow_mut().model,
-                    Action::Message(Box::new(message)),
-                );
-                let app_ref = message_app.borrow();
-                let is_game = app_ref.model.screen == Screen::Game;
-                let sequence = app_ref.model.shot_sequence;
-                drop(app_ref);
+                let scope = render_scope(&message);
+                let (previous_screen, prior_sequence) = {
+                    let app_ref = message_app.borrow();
+                    (app_ref.model.screen.clone(), app_ref.model.shot_sequence)
+                };
+                {
+                    let mut app = message_app.borrow_mut();
+                    reduce(&mut app.model, Action::Message(Box::new(message)));
+                }
+                let sequence = message_app.borrow().model.shot_sequence;
                 if sequence != prior_sequence {
                     start_shot_animation(&message_app, sequence);
                 }
-                if was_game && is_game {
-                    refresh_game(&message_app);
-                } else {
-                    rerender(&message_app);
-                }
+                redraw_scope(&message_app, previous_screen, scope);
             }
             Err(error) => log_error(&format!("protocol error: {error}")),
         }
@@ -350,8 +382,22 @@ fn connect(app: &SharedApp) -> Result<(), JsValue> {
     Ok(())
 }
 
+fn dispose_current_socket(app: &SharedApp, connection_epoch: u64, auth_epoch: u64) {
+    let (socket, handlers) = {
+        let mut app = app.borrow_mut();
+        if !connection_is_current(&app, connection_epoch, auth_epoch) {
+            return;
+        }
+        app.connection_epoch = app.connection_epoch.saturating_add(1);
+        (app.socket.take(), app.socket_handlers.take())
+    };
+    if let Some(socket) = socket {
+        dispose_socket(socket, handlers);
+    }
+}
+
 fn schedule_reconnect(app: &SharedApp, connection_epoch: u64, auth_epoch: u64) {
-    let (attempt, timer_epoch) = {
+    let (attempt, timer_epoch, previous_screen) = {
         let mut app = app.borrow_mut();
         if !connection_is_current(&app, connection_epoch, auth_epoch) {
             return;
@@ -362,19 +408,14 @@ fn schedule_reconnect(app: &SharedApp, connection_epoch: u64, auth_epoch: u64) {
         let timer_epoch = app.connection_epoch;
         let attempt = app.reconnect_attempt.saturating_add(1);
         app.reconnect_attempt = attempt;
-        if attempt > 10 {
-            reduce(&mut app.model, Action::GiveUp);
-        } else {
-            reduce(&mut app.model, Action::Disconnected { attempt });
-        }
-        (attempt, timer_epoch)
+        let previous_screen = app.model.screen.clone();
+        reduce(&mut app.model, Action::Disconnected { attempt });
+        (attempt, timer_epoch, previous_screen)
     };
-    rerender(app);
-    if attempt > 10 {
-        return;
-    }
+    redraw_scope(app, previous_screen, RenderScope::Header);
 
-    let delay_ms = 500_u32.saturating_mul(2_u32.saturating_pow(attempt.min(5)));
+    let cap_ms = 500_u32.saturating_mul(2_u32.saturating_pow(attempt.min(6)));
+    let delay_ms = 500 + (js_sys::Math::random() * f64::from(cap_ms.saturating_sub(500))) as u32;
     let reconnect_app = Rc::clone(app);
     let timer = Timeout::new(delay_ms, move || {
         if !connection_is_current(&reconnect_app.borrow(), timer_epoch, auth_epoch) {
@@ -430,6 +471,7 @@ fn send_current(app: &SharedApp, connection_epoch: u64, auth_epoch: u64, message
         });
     if let Err(error) = result {
         log_error(&format!("send failed: {error:?}"));
+        notice(app, "Connection failed; action not sent".into());
     }
 }
 
@@ -437,7 +479,6 @@ fn login(app: &SharedApp, request: LoginRequest) {
     let Some((auth_epoch, controller)) = begin_authentication(app) else {
         return;
     };
-    rerender(app);
     let app = Rc::clone(app);
     spawn_local(async move {
         match post_json("/auth/login", &request, &controller).await {
@@ -454,7 +495,6 @@ fn register(app: &SharedApp, request: RegisterRequest) {
     let Some((auth_epoch, controller)) = begin_authentication(app) else {
         return;
     };
-    rerender(app);
     let app = Rc::clone(app);
     spawn_local(async move {
         match post_json("/auth/register", &request, &controller).await {
@@ -480,13 +520,14 @@ fn register(app: &SharedApp, request: RegisterRequest) {
 }
 
 fn authenticated(app: &SharedApp, auth_epoch: u64, account: AccountResponse) {
-    {
+    let previous_screen = {
         let mut app_ref = app.borrow_mut();
         if app_ref.auth_epoch != auth_epoch || !app_ref.auth_pending {
             return;
         }
         app_ref.auth_pending = false;
         app_ref.auth_request = None;
+        let previous_screen = app_ref.model.screen.clone();
         reduce(
             &mut app_ref.model,
             Action::Authenticated {
@@ -494,15 +535,16 @@ fn authenticated(app: &SharedApp, auth_epoch: u64, account: AccountResponse) {
                 display_name: account.display_name,
             },
         );
-    }
-    rerender(app);
+        previous_screen
+    };
+    redraw_after(app, previous_screen);
     if let Err(error) = connect(app) {
         notice(app, format!("connection failed: {error:?}"));
     }
 }
 
 fn session_expired(app: &SharedApp) {
-    let (socket, handlers) = {
+    let (socket, handlers, previous_screen) = {
         let mut app_ref = app.borrow_mut();
         app_ref.auth_epoch = app_ref.auth_epoch.saturating_add(1);
         app_ref.auth_pending = false;
@@ -511,17 +553,19 @@ fn session_expired(app: &SharedApp) {
         app_ref.auth_request = None;
         let socket = app_ref.socket.take();
         let handlers = app_ref.socket_handlers.take();
+        let previous_screen = app_ref.model.screen.clone();
         reduce(&mut app_ref.model, Action::SessionExpired);
-        (socket, handlers)
+        (socket, handlers, previous_screen)
     };
     if let Some(socket) = socket {
         dispose_socket(socket, handlers);
     }
+    redraw_after(app, previous_screen);
     notice(app, "Session expired; sign in again".into());
 }
 
 fn logout(app: &SharedApp) {
-    let (auth_epoch, request, socket, handlers) = {
+    let (auth_epoch, request, socket, handlers, previous_screen) = {
         let mut app_ref = app.borrow_mut();
         app_ref.auth_epoch = app_ref.auth_epoch.saturating_add(1);
         app_ref.auth_pending = false;
@@ -530,8 +574,15 @@ fn logout(app: &SharedApp) {
         let request = app_ref.auth_request.take();
         let socket = app_ref.socket.take();
         let handlers = app_ref.socket_handlers.take();
+        let previous_screen = app_ref.model.screen.clone();
         reduce(&mut app_ref.model, Action::LoggedOut);
-        (app_ref.auth_epoch, request, socket, handlers)
+        (
+            app_ref.auth_epoch,
+            request,
+            socket,
+            handlers,
+            previous_screen,
+        )
     };
     if let Some(request) = request {
         request.abort();
@@ -539,7 +590,7 @@ fn logout(app: &SharedApp) {
     if let Some(socket) = socket {
         dispose_socket(socket, handlers);
     }
-    rerender(app);
+    redraw_after(app, previous_screen);
     let app = Rc::clone(app);
     spawn_local(async move {
         let result = Request::post("/auth/logout")
@@ -593,17 +644,7 @@ fn announce(app: &SharedApp, message: &str) {
 
 fn announce_server_message(app: &SharedApp, message: &ServerMessage) {
     let message = match message {
-        ServerMessage::Chat { player_id, text } => {
-            let name = app
-                .borrow()
-                .model
-                .players
-                .iter()
-                .find(|player| player.id == player_id.to_string())
-                .map(|player| player.name.clone())
-                .unwrap_or_else(|| "Player".into());
-            Some(format!("{name}: {text}"))
-        }
+        ServerMessage::Chat { entry } => Some(format!("{}: {}", entry.display_name, entry.text)),
         ServerMessage::GameStarted { snapshot, .. } => {
             Some(format!("Match started in {}", snapshot.name))
         }
@@ -638,16 +679,61 @@ fn announce_server_message(app: &SharedApp, message: &ServerMessage) {
 
 fn notice(app: &SharedApp, message: String) {
     announce(app, &message);
-    {
+    let previous_screen = {
         let mut app = app.borrow_mut();
         app.model.notices.push(message);
         if app.model.notices.len() > 40 {
             app.model.notices.remove(0);
         }
+        app.model.screen.clone()
+    };
+    redraw_scope(app, previous_screen, RenderScope::Notices);
+}
+
+fn render_scope(message: &ServerMessage) -> RenderScope {
+    match message {
+        ServerMessage::Hello { .. } => RenderScope::None,
+        ServerMessage::RoomList { .. } => RenderScope::Rooms,
+        ServerMessage::Chat { .. } => RenderScope::Chat,
+        ServerMessage::Error { .. } => RenderScope::Notices,
+        ServerMessage::SessionExpired => RenderScope::None,
+        ServerMessage::RoomCreated { .. }
+        | ServerMessage::Room { .. }
+        | ServerMessage::GameStarted { .. }
+        | ServerMessage::TurnStarted { .. }
+        | ServerMessage::ShotResolved { .. }
+        | ServerMessage::GameFinished { .. }
+        | ServerMessage::StateSync { .. }
+        | ServerMessage::LeftRoom => RenderScope::Screen,
     }
-    if app.borrow().model.screen == Screen::Game {
-        refresh_game(app);
-    } else {
+}
+
+fn redraw_after(app: &SharedApp, previous_screen: Screen) {
+    redraw_scope(app, previous_screen, RenderScope::Screen);
+}
+
+fn redraw_scope(app: &SharedApp, previous_screen: Screen, scope: RenderScope) {
+    let screen_changed = { app.borrow().model.screen != previous_screen };
+    if screen_changed {
+        rerender(app);
+        return;
+    }
+    let result = match scope {
+        RenderScope::None => Ok(()),
+        RenderScope::Header => refresh_header_dom(app),
+        RenderScope::Notices => refresh_notices_dom(app),
+        RenderScope::Rooms => {
+            if previous_screen == Screen::Lobby {
+                refresh_lobby_rooms_dom(app)
+            } else {
+                Ok(())
+            }
+        }
+        RenderScope::Chat => refresh_chat_dom(app),
+        RenderScope::Screen => refresh_current_dom(app),
+    };
+    if let Err(error) = result {
+        log_error(&format!("partial refresh failed: {error:?}"));
         rerender(app);
     }
 }
@@ -659,10 +745,153 @@ fn rerender(app: &SharedApp) {
         return;
     }
     restore_form_state(app, form_state);
-    app.borrow_mut().event_handlers.clear();
+    {
+        let mut app = app.borrow_mut();
+        app.event_handlers.clear();
+        app.dynamic_event_handlers.clear();
+    }
     if let Err(error) = bind_events(app) {
         log_error(&format!("event binding failed: {error:?}"));
     }
+}
+
+fn refresh_current_dom(app: &SharedApp) -> Result<(), JsValue> {
+    refresh_header_dom(app)?;
+    let screen = { app.borrow().model.screen.clone() };
+    match screen {
+        Screen::Login => refresh_notices_dom(app),
+        Screen::Lobby => {
+            refresh_lobby_rooms_dom(app)?;
+            refresh_notices_dom(app)
+        }
+        Screen::Room => refresh_room_dom(app),
+        Screen::Game => refresh_game_dom(app),
+    }
+}
+
+fn refresh_header_dom(app: &SharedApp) -> Result<(), JsValue> {
+    let app_ref = app.borrow();
+    let connection = app_ref
+        .document
+        .query_selector(".connection")?
+        .ok_or(".connection missing")?;
+    let reconnect = app_ref
+        .document
+        .get_element_by_id("reconnect-now")
+        .ok_or("#reconnect-now missing")?;
+    let (class, label) = connection_view(&app_ref.model.connection);
+    connection.set_class_name(&format!("connection {class}"));
+    connection.set_inner_html(&format!("<i></i>{}", escape(&label)));
+    set_boolean_attribute(
+        &reconnect,
+        "hidden",
+        !matches!(app_ref.model.connection, Connection::Offline),
+    )
+}
+
+fn refresh_notices_dom(app: &SharedApp) -> Result<(), JsValue> {
+    let app_ref = app.borrow();
+    let selector = if app_ref.model.screen == Screen::Game {
+        ".game-notices"
+    } else {
+        ".app-notices"
+    };
+    let notices = app_ref
+        .document
+        .query_selector(selector)?
+        .ok_or_else(|| JsValue::from_str(&format!("{selector} missing")))?;
+    notices.set_inner_html(&notice_items_html(&app_ref.model));
+    Ok(())
+}
+
+fn refresh_lobby_rooms_dom(app: &SharedApp) -> Result<(), JsValue> {
+    let (rooms, items) = {
+        let app_ref = app.borrow();
+        if app_ref.model.screen != Screen::Lobby {
+            return Err(JsValue::from_str("lobby screen unavailable"));
+        }
+        (
+            app_ref.document.clone(),
+            lobby_room_items_html(&app_ref.model),
+        )
+    };
+    let list = rooms
+        .query_selector(".room-list")?
+        .ok_or(".room-list missing")?;
+    list.set_inner_html(&items);
+    app.borrow_mut().dynamic_event_handlers.clear();
+    bind_lobby_room_events(app, &rooms)
+}
+
+fn refresh_room_dom(app: &SharedApp) -> Result<(), JsValue> {
+    let form_state = capture_form_state(app);
+    let document = {
+        let app_ref = app.borrow();
+        let document = &app_ref.document;
+        let model = &app_ref.model;
+        if model.screen != Screen::Room {
+            return Err(JsValue::from_str("room screen unavailable"));
+        }
+        room_element(document, "#room-title")?.set_text_content(Some(&model.room_name));
+        room_element(document, "#players-title span")?
+            .set_text_content(Some(&model.players.len().to_string()));
+        room_element(document, ".roster ul")?.set_inner_html(&room_player_items_html(model));
+        room_element(document, ".chat-panel ul")?.set_inner_html(&chat_messages_html(model));
+
+        let owner = model.local_owner();
+        set_boolean_attribute(&room_element(document, ".mode-picker")?, "disabled", !owner)?;
+        let mode = model.game_mode.unwrap_or(GameMode::Function);
+        let mode_inputs = document.query_selector_all("input[name=game-mode]")?;
+        for index in 0..mode_inputs.length() {
+            let Some(input) = mode_inputs.item(index) else {
+                continue;
+            };
+            let input = input.dyn_into::<HtmlInputElement>()?;
+            input.set_checked(
+                matches!(input.value().as_str(), "function") && mode == GameMode::Function
+                    || matches!(input.value().as_str(), "first_order")
+                        && mode == GameMode::FirstOrder
+                    || matches!(input.value().as_str(), "second_order")
+                        && mode == GameMode::SecondOrder,
+            );
+        }
+        room_element(document, "#ready-button")?.set_text_content(Some(if model.local_ready() {
+            "Not ready"
+        } else {
+            "I’m ready"
+        }));
+        set_boolean_attribute(&room_element(document, "#add-bot")?, "disabled", !owner)?;
+        set_boolean_attribute(
+            &room_element(document, "#start-game")?,
+            "disabled",
+            !model.can_start(),
+        )?;
+        document.clone()
+    };
+    refresh_notices_dom(app)?;
+    app.borrow_mut().dynamic_event_handlers.clear();
+    bind_room_roster_events(app, &document)?;
+    restore_form_state(app, form_state);
+    Ok(())
+}
+
+fn refresh_chat_dom(app: &SharedApp) -> Result<(), JsValue> {
+    let app_ref = app.borrow();
+    if !matches!(app_ref.model.screen, Screen::Room | Screen::Game) {
+        return Ok(());
+    }
+    let list = app_ref
+        .document
+        .query_selector(".chat-panel ul")?
+        .ok_or(".chat-panel ul missing")?;
+    list.set_inner_html(&chat_messages_html(&app_ref.model));
+    Ok(())
+}
+
+fn room_element(document: &Document, selector: &str) -> Result<web_sys::Element, JsValue> {
+    document
+        .query_selector(selector)?
+        .ok_or_else(|| JsValue::from_str(&format!("{selector} missing")))
 }
 
 fn refresh_game(app: &SharedApp) {
@@ -687,7 +916,7 @@ fn refresh_game_dom(app: &SharedApp) -> Result<(), JsValue> {
         game_element(document, "#battlefield-summary")?
             .set_text_content(Some(&battlefield_summary(model)));
         game_element(document, ".chat-panel ul")?.set_inner_html(&chat_messages_html(model));
-        game_element(document, ".notices")?.set_inner_html(&notice_items_html(model));
+        game_element(document, ".game-notices")?.set_inner_html(&notice_items_html(model));
 
         let local_turn = local_turn(model);
         let function_input =
@@ -782,8 +1011,13 @@ fn focus_selector(element: &web_sys::Element) -> Option<String> {
         return Some(format!("#{id}"));
     }
     if let Some(player_id) = element.get_attribute("data-player-id") {
+        let class = element
+            .get_attribute("class")
+            .and_then(|classes| classes.split_ascii_whitespace().next().map(str::to_owned))
+            .map(|class| format!(".{class}"))
+            .unwrap_or_default();
         return Some(format!(
-            "{}[data-player-id=\"{player_id}\"]",
+            "{}{class}[data-player-id=\"{player_id}\"]",
             element.tag_name().to_ascii_lowercase()
         ));
     }
@@ -840,11 +1074,14 @@ fn render(app: &SharedApp) -> Result<(), JsValue> {
         Screen::Room => room_html(&app_ref.model),
         Screen::Game => game_html(&app_ref.model),
     };
+    let notices = (app_ref.model.screen != Screen::Game)
+        .then(|| notices_html(&app_ref.model))
+        .unwrap_or_default();
     root.set_inner_html(&format!(
         "<div class=\"app-frame\">{}<main id=\"screen\">{}</main>{}</div>",
         header_html(&app_ref.model),
         screen,
-        notices_html(&app_ref.model)
+        notices
     ));
     drop(app_ref);
     if app.borrow().model.screen == Screen::Game
@@ -861,21 +1098,25 @@ fn header_html(model: &Model) -> String {
         .as_ref()
         .map(|_| "<button id=\"logout\" class=\"text-button\" type=\"button\">Log out</button>")
         .unwrap_or("");
-    let (class, label) = match model.connection {
+    let (class, label) = connection_view(&model.connection);
+    let reconnect_hidden = (!matches!(model.connection, Connection::Offline))
+        .then_some(" hidden")
+        .unwrap_or("");
+    format!(
+        "<header class=\"masthead\"><a class=\"wordmark\" href=\"/\" aria-label=\"Graphwar home\"><span>GRAPH</span><strong>WAR</strong></a><div><p class=\"connection {class}\" role=\"status\"><i></i>{}</p><button id=\"reconnect-now\" class=\"text-button\" type=\"button\"{reconnect_hidden}>Reconnect</button>{account_action}</div></header>",
+        escape(&label)
+    )
+}
+
+fn connection_view(connection: &Connection) -> (&'static str, String) {
+    match connection {
         Connection::Connecting => ("is-waiting", "Connecting".into()),
         Connection::Online => ("is-online", "Online".into()),
         Connection::Reconnecting { attempt } => {
             ("is-waiting", format!("Reconnecting · attempt {attempt}"))
         }
         Connection::Offline => ("is-offline", "Offline".into()),
-    };
-    let retry = matches!(model.connection, Connection::Offline)
-        .then_some("<button id=\"reconnect-now\" class=\"text-button\">Reconnect</button>")
-        .unwrap_or("");
-    format!(
-        "<header class=\"masthead\"><a class=\"wordmark\" href=\"/\" aria-label=\"Graphwar home\"><span>GRAPH</span><strong>WAR</strong></a><div><p class=\"connection {class}\" role=\"status\"><i></i>{}</p>{retry}{account_action}</div></header>",
-        escape(&label)
-    )
+    }
 }
 
 fn login_html() -> String {
@@ -883,22 +1124,25 @@ fn login_html() -> String {
 }
 
 fn lobby_html(model: &Model) -> String {
-    let rooms = if model.rooms.is_empty() {
-        "<li class=\"empty\"><strong>No open rooms.</strong><span>Start the first skirmish.</span></li>".into()
-    } else {
-        model
-            .rooms
-            .iter()
-            .map(|room| format!(
-                "<li><div><strong>{}</strong><span>{} / {} players</span></div><button class=\"join-room secondary\" data-room-id=\"{}\">Join <span aria-hidden=\"true\">→</span></button></li>",
-                escape(&room.name), room.players, room.capacity, attr(&room.id)
-            ))
-            .collect::<String>()
-    };
     format!(
-        "<section class=\"lobby-shell reveal\" aria-labelledby=\"lobby-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Welcome, {}</p><h1 id=\"lobby-title\">Open rooms</h1></div><div class=\"lobby-actions\"><form id=\"create-room-form\" class=\"inline-form\"><label class=\"sr-only\" for=\"room-name\">New room name</label><input id=\"room-name\" maxlength=\"32\" required placeholder=\"Room name\"><select id=\"room-visibility\" aria-label=\"Room visibility\"><option value=\"public\">Public</option><option value=\"private\">Private</option></select><button class=\"primary\" type=\"submit\">Create room</button></form><form id=\"invite-room-form\" class=\"inline-form\"><label class=\"sr-only\" for=\"private-room-id\">Private room ID</label><input id=\"private-room-id\" required placeholder=\"Room ID\"><label class=\"sr-only\" for=\"invite-code\">Private invite code</label><input id=\"invite-code\" required placeholder=\"Invite code\"><button class=\"secondary\" type=\"submit\">Join private</button></form></div></div><ul class=\"room-list\">{rooms}</ul></section>",
-        escape(&model.player_name)
+        "<section class=\"lobby-shell reveal\" aria-labelledby=\"lobby-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Welcome, {}</p><h1 id=\"lobby-title\">Open rooms</h1></div><div class=\"lobby-actions\"><form id=\"create-room-form\" class=\"inline-form\"><label class=\"sr-only\" for=\"room-name\">New room name</label><input id=\"room-name\" maxlength=\"32\" required placeholder=\"Room name\"><select id=\"room-visibility\" aria-label=\"Room visibility\"><option value=\"public\">Public</option><option value=\"private\">Private</option></select><button class=\"primary\" type=\"submit\">Create room</button></form><form id=\"invite-room-form\" class=\"inline-form\"><label class=\"sr-only\" for=\"private-room-id\">Private room ID</label><input id=\"private-room-id\" required placeholder=\"Room ID\"><label class=\"sr-only\" for=\"invite-code\">Private invite code</label><input id=\"invite-code\" required placeholder=\"Invite code\"><button class=\"secondary\" type=\"submit\">Join private</button></form></div></div><ul class=\"room-list\">{}</ul></section>",
+        escape(&model.player_name),
+        lobby_room_items_html(model)
     )
+}
+
+fn lobby_room_items_html(model: &Model) -> String {
+    if model.rooms.is_empty() {
+        return "<li class=\"empty\"><strong>No open rooms.</strong><span>Start the first skirmish.</span></li>".into();
+    }
+    model
+        .rooms
+        .iter()
+        .map(|room| format!(
+            "<li><div><strong>{}</strong><span>{} / {} players</span></div><button class=\"join-room secondary\" data-room-id=\"{}\">Join <span aria-hidden=\"true\">→</span></button></li>",
+            escape(&room.name), room.players, room.capacity, attr(&room.id)
+        ))
+        .collect()
 }
 
 fn room_html(model: &Model) -> String {
@@ -911,7 +1155,24 @@ fn room_html(model: &Model) -> String {
     let owner_controls = model.local_owner();
     let mode = model.game_mode.unwrap_or(GameMode::Function);
     let mode_checked = |candidate| (mode == candidate).then_some(" checked").unwrap_or("");
-    let players = model
+    format!(
+        "<section class=\"room-shell reveal\" aria-labelledby=\"room-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Staging area</p><h1 id=\"room-title\">{}</h1></div><button id=\"leave-room\" class=\"text-button\">Leave room</button></div><div class=\"room-grid\"><section class=\"paper-card roster\" aria-labelledby=\"players-title\"><h2 id=\"players-title\">Players <span>{}</span></h2><ul>{}</ul></section><aside class=\"briefing\"><p>Configure your slot, then ready up. The owner starts after everyone commits.</p><fieldset class=\"mode-picker\"{}><legend>Rule set</legend><label><input type=\"radio\" name=\"game-mode\" value=\"function\"{}> Function</label><label><input type=\"radio\" name=\"game-mode\" value=\"first_order\"{}> First-order</label><label><input type=\"radio\" name=\"game-mode\" value=\"second_order\"{}> Second-order</label></fieldset><button id=\"ready-button\" class=\"primary wide\">{ready_label}</button><button id=\"add-bot\" class=\"text-button wide\"{}>Add computer</button><button id=\"start-game\" class=\"secondary wide\"{}>Start match</button></aside></div>{}</section>",
+        escape(&model.room_name),
+        model.players.len(),
+        room_player_items_html(model),
+        if owner_controls { "" } else { " disabled" },
+        mode_checked(GameMode::Function),
+        mode_checked(GameMode::FirstOrder),
+        mode_checked(GameMode::SecondOrder),
+        if owner_controls { "" } else { " disabled" },
+        start_disabled,
+        chat_html(model)
+    )
+}
+
+fn room_player_items_html(model: &Model) -> String {
+    let owner_controls = model.local_owner();
+    model
         .players
         .iter()
         .map(|player| {
@@ -954,19 +1215,7 @@ fn room_html(model: &Model) -> String {
                 controls
             )
         })
-        .collect::<String>();
-    format!(
-        "<section class=\"room-shell reveal\" aria-labelledby=\"room-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Staging area</p><h1 id=\"room-title\">{}</h1></div><button id=\"leave-room\" class=\"text-button\">Leave room</button></div><div class=\"room-grid\"><section class=\"paper-card roster\" aria-labelledby=\"players-title\"><h2 id=\"players-title\">Players <span>{}</span></h2><ul>{players}</ul></section><aside class=\"briefing\"><p>Configure your slot, then ready up. The owner starts after everyone commits.</p><fieldset class=\"mode-picker\"{}><legend>Rule set</legend><label><input type=\"radio\" name=\"game-mode\" value=\"function\"{}> Function</label><label><input type=\"radio\" name=\"game-mode\" value=\"first_order\"{}> First-order</label><label><input type=\"radio\" name=\"game-mode\" value=\"second_order\"{}> Second-order</label></fieldset><button id=\"ready-button\" class=\"primary wide\">{ready_label}</button><button id=\"add-bot\" class=\"text-button wide\"{}>Add computer</button><button id=\"start-game\" class=\"secondary wide\"{}>Start match</button></aside></div>{}</section>",
-        escape(&model.room_name),
-        model.players.len(),
-        if owner_controls { "" } else { " disabled" },
-        mode_checked(GameMode::Function),
-        mode_checked(GameMode::FirstOrder),
-        mode_checked(GameMode::SecondOrder),
-        if owner_controls { "" } else { " disabled" },
-        start_disabled,
-        chat_html(model)
-    )
+        .collect()
 }
 
 fn game_html(model: &Model) -> String {
@@ -976,7 +1225,7 @@ fn game_html(model: &Model) -> String {
     let angle_hidden = (!second_order).then_some(" hidden").unwrap_or("");
     let angle_disabled = (!second_order).then_some(" disabled").unwrap_or(disabled);
     format!(
-        "<section class=\"game-shell reveal\" aria-labelledby=\"game-title\"><div class=\"game-heading\"><div><p class=\"eyebrow\">Live match · <span id=\"turn-timer\" role=\"timer\">{}</span></p><h1 id=\"game-title\">{}</h1></div><button id=\"leave-room\" class=\"text-button\">Retreat</button></div><div class=\"battlefield\"><canvas id=\"game-canvas\" width=\"770\" height=\"450\" aria-label=\"Graphwar battlefield\" aria-describedby=\"battlefield-summary\"></canvas><div class=\"preview-key\"><i></i> Provisional</div><div class=\"axis-label x-label\">x</div><div class=\"axis-label y-label\">y</div></div><p id=\"battlefield-summary\" class=\"sr-only\">{}</p>{}<form id=\"fire-form\" class=\"fire-console\"><div class=\"equation-field\"><label for=\"function-input\">Function</label><div><span aria-hidden=\"true\">y =</span><input id=\"function-input\" spellcheck=\"false\" autocomplete=\"off\" maxlength=\"256\" required value=\"{}\" aria-describedby=\"function-hint function-error\"{disabled}></div><small id=\"function-hint\">Use x, sin, cos, tan, sqrt and standard operators.</small><p id=\"function-error\" class=\"function-error\" aria-live=\"polite\"></p></div><div class=\"angle-field\"{angle_hidden}><div class=\"angle-label\"><label for=\"angle-input\">Launch angle</label><output id=\"angle-output\" for=\"angle-input\">{:.1}°</output></div><input id=\"angle-input\" type=\"range\" min=\"-90\" max=\"90\" value=\"{:.1}\" step=\"0.1\" aria-describedby=\"angle-hint angle-output\"{angle_disabled}><small id=\"angle-hint\">Focus the slider, then use Arrow Up/Down.</small></div><button class=\"fire-button\" type=\"submit\"{disabled}><span>{}</span><small>Enter ↵</small></button></form>{}</section>",
+        "<section class=\"game-shell reveal\" aria-labelledby=\"game-title\"><div class=\"game-heading\"><div><p class=\"eyebrow\">Live match · <span id=\"turn-timer\" role=\"timer\">{}</span></p><h1 id=\"game-title\">{}</h1></div><button id=\"leave-room\" class=\"text-button\">Retreat</button></div><div class=\"war-room\"><section class=\"map-panel\" aria-labelledby=\"battlefield-label\"><div class=\"map-heading\"><p class=\"eyebrow\">Coordinate field / 01</p><h2 id=\"battlefield-label\">Battlefield</h2></div><div class=\"battlefield\"><canvas id=\"game-canvas\" width=\"770\" height=\"450\" aria-label=\"Graphwar battlefield\" aria-describedby=\"battlefield-summary\"></canvas><div class=\"preview-key\"><i></i> Provisional</div><div class=\"axis-label x-label\">x</div><div class=\"axis-label y-label\">y</div></div><p id=\"battlefield-summary\" class=\"sr-only\">{}</p></section><aside class=\"command-stack\" aria-label=\"Command stack\">{}<section class=\"paper-card function-panel\" aria-labelledby=\"function-panel-title\"><h2 id=\"function-panel-title\">Function</h2><form id=\"fire-form\" class=\"fire-console\"><div class=\"equation-field\"><label for=\"function-input\">Function</label><div><span aria-hidden=\"true\">y =</span><input id=\"function-input\" spellcheck=\"false\" autocomplete=\"off\" maxlength=\"256\" required value=\"{}\" aria-describedby=\"function-hint function-error\"{disabled}></div><small id=\"function-hint\">Use x, sin, cos, tan, sqrt and standard operators.</small><p id=\"function-error\" class=\"function-error\" aria-live=\"polite\"></p></div><div class=\"angle-field\"{angle_hidden}><div class=\"angle-label\"><label for=\"angle-input\">Launch angle</label><output id=\"angle-output\" for=\"angle-input\">{:.1}°</output></div><input id=\"angle-input\" type=\"range\" min=\"-90\" max=\"90\" value=\"{:.1}\" step=\"0.1\" aria-describedby=\"angle-hint angle-output\"{angle_disabled}><small id=\"angle-hint\">Focus the slider, then use Arrow Up/Down.</small></div><button class=\"fire-button\" type=\"submit\"{disabled}><span>{}</span><small>Enter ↵</small></button></form></section><ul class=\"game-notices notices\">{}</ul>{}</aside></div></section>",
         timer_text(model),
         escape(&model.room_name),
         escape(&battlefield_summary(model)),
@@ -989,6 +1238,7 @@ fn game_html(model: &Model) -> String {
         model.aim_angle_deg,
         model.aim_angle_deg,
         if local_turn { "Fire" } else { "Waiting" },
+        notice_items_html(model),
         chat_html(model)
     )
 }
@@ -1037,15 +1287,17 @@ fn unix_time() -> i64 {
 }
 
 fn timer_text(model: &Model) -> String {
-    let Some(deadline) = model.turn_deadline_at else {
-        return match model.room_phase {
-            Some(graphwar_protocol::Phase::Resolving) => "Resolving shot".into(),
-            Some(graphwar_protocol::Phase::Finished) => "Match finished".into(),
-            _ => "Waiting".into(),
-        };
-    };
-    let remaining = deadline.saturating_sub(unix_time());
-    format!("{}:{:02}", remaining / 60, remaining % 60)
+    match model.room_phase {
+        Some(graphwar_protocol::Phase::Resolving) => "Resolving shot".into(),
+        Some(graphwar_protocol::Phase::Finished) => "Match finished".into(),
+        _ => model.turn_deadline_at.map_or_else(
+            || "Waiting".into(),
+            |deadline| {
+                let remaining = deadline.saturating_sub(unix_time());
+                format!("{}:{:02}", remaining / 60, remaining % 60)
+            },
+        ),
+    }
 }
 
 fn update_timer(app: &SharedApp) {
@@ -1069,12 +1321,15 @@ fn update_timer(app: &SharedApp) {
         refresh_game(app);
         return;
     }
-    let app_ref = app.borrow();
-    if app_ref.model.screen != Screen::Game {
-        return;
-    }
-    if let Some(timer) = app_ref.document.get_element_by_id("turn-timer") {
-        timer.set_text_content(Some(&timer_text(&app_ref.model)));
+    let (document, timer) = {
+        let app_ref = app.borrow();
+        if app_ref.model.screen != Screen::Game {
+            return;
+        }
+        (app_ref.document.clone(), timer_text(&app_ref.model))
+    };
+    if let Some(timer_element) = document.get_element_by_id("turn-timer") {
+        timer_element.set_text_content(Some(&timer));
     }
 }
 
@@ -1152,30 +1407,46 @@ fn chat_html(model: &Model) -> String {
 }
 
 fn chat_messages_html(model: &Model) -> String {
-    model
+    let mut entries = model
         .chat
         .iter()
-        .rev()
-        .take(40)
-        .rev()
-        .map(|message| {
-            let name = model
-                .players
-                .iter()
-                .find(|player| player.id == message.player_id)
-                .map(|player| player.name.as_str())
-                .unwrap_or("Player");
-            format!(
-                "<li><strong>{}</strong><span>{}</span></li>",
-                escape(name),
+        .map(FeedEntry::Chat)
+        .chain(model.shot_history.iter().map(FeedEntry::Shot))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(FeedEntry::sequence);
+    entries.dedup_by_key(|entry| entry.sequence());
+    let start = entries.len().saturating_sub(40);
+    entries[start..]
+        .iter()
+        .map(|entry| match entry {
+            FeedEntry::Chat(message) => format!(
+                "<li class=\"chat-message\" data-sequence=\"{}\"><strong>{}</strong><span>{}</span></li>",
+                message.sequence,
+                escape(&message.display_name),
                 escape(&message.text)
-            )
+            ),
+            FeedEntry::Shot(entry) => {
+                let angle = (model.game_mode == Some(GameMode::SecondOrder))
+                    .then(|| format!("<span>{:.1}°</span>", entry.angle_deg))
+                    .unwrap_or_default();
+                format!(
+                    "<li class=\"shot-entry\" data-sequence=\"{}\"><strong><span class=\"team team-{}\" aria-hidden=\"true\"></span>{}</strong><small>Accepted function</small><code>{}</code>{}</li>",
+                    entry.sequence,
+                    entry.team,
+                    escape(&entry.display_name),
+                    escape(&entry.function),
+                    angle,
+                )
+            }
         })
         .collect()
 }
 
 fn notices_html(model: &Model) -> String {
-    format!("<ul class=\"notices\">{}</ul>", notice_items_html(model))
+    format!(
+        "<ul class=\"app-notices notices\">{}</ul>",
+        notice_items_html(model)
+    )
 }
 
 fn notice_items_html(model: &Model) -> String {
@@ -1274,27 +1545,7 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
             );
         });
     }
-    let room_buttons = document.query_selector_all(".join-room")?;
-    for index in 0..room_buttons.length() {
-        let Some(element) = room_buttons.item(index) else {
-            continue;
-        };
-        let element = element.unchecked_into::<web_sys::Element>();
-        let room_id = element.get_attribute("data-room-id").unwrap_or_default();
-        let app = Rc::clone(app);
-        bind_click(&app.clone(), &element, move || {
-            match Uuid::parse_str(&room_id) {
-                Ok(room_id) => send(
-                    &app,
-                    ClientMessage::JoinRoom {
-                        room_id,
-                        invite: None,
-                    },
-                ),
-                Err(_) => log_error("invalid room ID"),
-            }
-        });
-    }
+    bind_lobby_room_events(app, &document)?;
     if let Some(button) = document.get_element_by_id("leave-room") {
         let app = Rc::clone(app);
         bind_click(&app.clone(), &button, move || {
@@ -1352,54 +1603,7 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
             send(&app, ClientMessage::StartGame)
         });
     }
-    let bot_buttons = document.query_selector_all(".remove-bot")?;
-    for index in 0..bot_buttons.length() {
-        let Some(element) = bot_buttons.item(index) else {
-            continue;
-        };
-        let element = element.unchecked_into::<web_sys::Element>();
-        let player_id = element.get_attribute("data-player-id").unwrap_or_default();
-        let app = Rc::clone(app);
-        bind_click(&app.clone(), &element, move || {
-            if let Ok(player_id) = Uuid::parse_str(&player_id) {
-                send(&app, ClientMessage::RemoveBot { player_id });
-            }
-        });
-    }
-    for selector in [".player-team", ".player-soldiers"] {
-        let inputs = document.query_selector_all(selector)?;
-        for index in 0..inputs.length() {
-            let Some(element) = inputs.item(index) else {
-                continue;
-            };
-            let element = element.unchecked_into::<HtmlSelectElement>();
-            let player_id = element.get_attribute("data-player-id").unwrap_or_default();
-            let app = Rc::clone(app);
-            bind_select_change(&app.clone(), &element, move |input| {
-                let Ok(player_id) = Uuid::parse_str(&player_id) else {
-                    return;
-                };
-                let value = input.value().parse::<u8>().unwrap_or_default();
-                if selector == ".player-team" {
-                    send(
-                        &app,
-                        ClientMessage::SetTeam {
-                            player_id,
-                            team: value,
-                        },
-                    );
-                } else {
-                    send(
-                        &app,
-                        ClientMessage::SetSoldiers {
-                            player_id,
-                            soldiers: value,
-                        },
-                    );
-                }
-            })?;
-        }
-    }
+    bind_room_roster_events(app, &document)?;
     if let Some(input) = document.get_element_by_id("angle-input") {
         let input = input.unchecked_into::<HtmlInputElement>();
         let listener_input = input.clone();
@@ -1475,6 +1679,81 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
                 input.set_value("");
             }
         });
+    }
+    Ok(())
+}
+
+fn bind_lobby_room_events(app: &SharedApp, document: &Document) -> Result<(), JsValue> {
+    let room_buttons = document.query_selector_all(".join-room")?;
+    for index in 0..room_buttons.length() {
+        let Some(element) = room_buttons.item(index) else {
+            continue;
+        };
+        let element = element.unchecked_into::<web_sys::Element>();
+        let room_id = element.get_attribute("data-room-id").unwrap_or_default();
+        let event_app = Rc::clone(app);
+        bind_dynamic_click(app, &element, move || match Uuid::parse_str(&room_id) {
+            Ok(room_id) => send(
+                &event_app,
+                ClientMessage::JoinRoom {
+                    room_id,
+                    invite: None,
+                },
+            ),
+            Err(_) => log_error("invalid room ID"),
+        });
+    }
+    Ok(())
+}
+
+fn bind_room_roster_events(app: &SharedApp, document: &Document) -> Result<(), JsValue> {
+    let bot_buttons = document.query_selector_all(".remove-bot")?;
+    for index in 0..bot_buttons.length() {
+        let Some(element) = bot_buttons.item(index) else {
+            continue;
+        };
+        let element = element.unchecked_into::<web_sys::Element>();
+        let player_id = element.get_attribute("data-player-id").unwrap_or_default();
+        let event_app = Rc::clone(app);
+        bind_dynamic_click(app, &element, move || {
+            if let Ok(player_id) = Uuid::parse_str(&player_id) {
+                send(&event_app, ClientMessage::RemoveBot { player_id });
+            }
+        });
+    }
+    for selector in [".player-team", ".player-soldiers"] {
+        let inputs = document.query_selector_all(selector)?;
+        for index in 0..inputs.length() {
+            let Some(element) = inputs.item(index) else {
+                continue;
+            };
+            let element = element.unchecked_into::<HtmlSelectElement>();
+            let player_id = element.get_attribute("data-player-id").unwrap_or_default();
+            let event_app = Rc::clone(app);
+            bind_dynamic_select_change(app, &element, move |input| {
+                let Ok(player_id) = Uuid::parse_str(&player_id) else {
+                    return;
+                };
+                let value = input.value().parse::<u8>().unwrap_or_default();
+                if selector == ".player-team" {
+                    send(
+                        &event_app,
+                        ClientMessage::SetTeam {
+                            player_id,
+                            team: value,
+                        },
+                    );
+                } else {
+                    send(
+                        &event_app,
+                        ClientMessage::SetSoldiers {
+                            player_id,
+                            soldiers: value,
+                        },
+                    );
+                }
+            })?;
+        }
     }
     Ok(())
 }
@@ -1570,6 +1849,32 @@ fn retain_event_handler(app: &SharedApp, closure: Closure<dyn FnMut(Event)>) {
     app.borrow_mut().event_handlers.push(closure);
 }
 
+fn retain_dynamic_event_handler(app: &SharedApp, closure: Closure<dyn FnMut(Event)>) {
+    app.borrow_mut().dynamic_event_handlers.push(closure);
+}
+
+fn bind_dynamic_click(
+    app: &SharedApp,
+    element: &web_sys::Element,
+    mut handler: impl FnMut() + 'static,
+) {
+    let closure = Closure::<dyn FnMut(Event)>::new(move |_| handler());
+    let _ = element.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref());
+    retain_dynamic_event_handler(app, closure);
+}
+
+fn bind_dynamic_select_change(
+    app: &SharedApp,
+    input: &HtmlSelectElement,
+    mut handler: impl FnMut(HtmlSelectElement) + 'static,
+) -> Result<(), JsValue> {
+    let bound_input = input.clone();
+    let closure = Closure::<dyn FnMut(Event)>::new(move |_| handler(bound_input.clone()));
+    input.add_event_listener_with_callback("change", closure.as_ref().unchecked_ref())?;
+    retain_dynamic_event_handler(app, closure);
+    Ok(())
+}
+
 fn bind_submit(
     app: &SharedApp,
     form: HtmlFormElement,
@@ -1594,18 +1899,6 @@ fn bind_change(
     app: &SharedApp,
     input: &HtmlInputElement,
     mut handler: impl FnMut(HtmlInputElement) + 'static,
-) -> Result<(), JsValue> {
-    let bound_input = input.clone();
-    let closure = Closure::<dyn FnMut(Event)>::new(move |_| handler(bound_input.clone()));
-    input.add_event_listener_with_callback("change", closure.as_ref().unchecked_ref())?;
-    retain_event_handler(app, closure);
-    Ok(())
-}
-
-fn bind_select_change(
-    app: &SharedApp,
-    input: &HtmlSelectElement,
-    mut handler: impl FnMut(HtmlSelectElement) + 'static,
 ) -> Result<(), JsValue> {
     let bound_input = input.clone();
     let closure = Closure::<dyn FnMut(Event)>::new(move |_| handler(bound_input.clone()));
@@ -1651,7 +1944,7 @@ fn render_canvas(app: &SharedApp) -> Result<(), JsValue> {
         0.0,
         0.0,
     )?;
-    context.set_fill_style_str("#f3eddc");
+    context.set_fill_style_str("#f4ecd8");
     context.fill_rect(0.0, 0.0, LOGICAL_WIDTH, LOGICAL_HEIGHT);
     draw_grid(&context);
     draw_terrain(&context, &app.model);
@@ -1690,7 +1983,7 @@ fn render_canvas(app: &SharedApp) -> Result<(), JsValue> {
 
 fn draw_shot_effects(context: &CanvasRenderingContext2d, model: &Model) {
     context.save();
-    context.set_stroke_style_str("#ff5b3d");
+    context.set_stroke_style_str("#a33a2b");
     context.set_line_width(3.0);
     for hit in &model.shot_hits {
         if let Some(soldier) = model
@@ -1718,7 +2011,7 @@ fn draw_shot_effects(context: &CanvasRenderingContext2d, model: &Model) {
 }
 
 fn draw_grid(context: &CanvasRenderingContext2d) {
-    context.set_stroke_style_str("rgba(28, 31, 27, .10)");
+    context.set_stroke_style_str("rgba(16, 37, 31, .12)");
     context.set_line_width(0.65);
     for x in (0..=770).step_by(35) {
         context.begin_path();
@@ -1732,7 +2025,7 @@ fn draw_grid(context: &CanvasRenderingContext2d) {
         context.line_to(LOGICAL_WIDTH, y as f64);
         context.stroke();
     }
-    context.set_stroke_style_str("#1c1f1b");
+    context.set_stroke_style_str("#10251f");
     context.set_line_width(1.5);
     context.begin_path();
     context.move_to(0.0, 225.0);
@@ -1767,7 +2060,7 @@ fn draw_terrain(context: &CanvasRenderingContext2d, model: &Model) {
             0.0,
             std::f64::consts::TAU,
         );
-        context.set_fill_style_str("#f3eddc");
+        context.set_fill_style_str("#f4ecd8");
         context.fill();
         context.save();
         context.clip();
@@ -1789,7 +2082,7 @@ fn draw_path(
     for point in rest {
         context.line_to(point.0, point.1);
     }
-    context.set_stroke_style_str(if provisional { "#6d7168" } else { "#ff5b3d" });
+    context.set_stroke_style_str(if provisional { "#666756" } else { "#a33a2b" });
     context.set_line_width(if provisional { 1.5 } else { 2.5 });
     if provisional {
         context.set_line_dash(&js_sys::Array::of2(
@@ -1813,9 +2106,9 @@ fn draw_soldier(
     active: bool,
 ) {
     let color = if alive {
-        if team % 2 == 0 { "#ff5b3d" } else { "#e4b83b" }
+        if team % 2 == 0 { "#a33a2b" } else { "#d8a52b" }
     } else {
-        "#6d7368"
+        "#6d7168"
     };
     let radius = if active && alive { 7.0 } else { 5.0 };
     context.begin_path();
@@ -1826,7 +2119,7 @@ fn draw_soldier(
     }
     context.set_fill_style_str(color);
     context.fill();
-    context.set_stroke_style_str("#1c1f1b");
+    context.set_stroke_style_str("#10251f");
     context.set_line_width(if active && alive { 2.5 } else { 1.5 });
     context.stroke();
     if !alive {

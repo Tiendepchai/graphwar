@@ -97,9 +97,45 @@ The available commands are:
 
 Just type them on the game chat to use them.
 
+## Connection and restart recovery
+
+The server remains a single authoritative writer. Room and active-match state is stored as a validated PostgreSQL snapshot before successful state-changing broadcasts. App restart restores rooms and matches; planning turns keep their player and receive a fresh 60-second deadline, while resolving turns settle once before resuming planning. Bot search memory is intentionally rebuilt.
+
+WebSocket reconnect uses indefinite exponential full-jitter retry, with no offline gameplay-command queue. A live socket rechecks session validity at most once per 60 seconds; cross-device logout can therefore take up to 60 seconds to terminate an idle socket. A short network interruption preserves active-match membership.
+
+For recovery testing, use a disposable stack: create a match, restart only `app` while retaining the PostgreSQL volume, then reconnect existing sessions and compare `StateSync` room, roster, terrain, shot history, and turn state. Never restart production for this test.
+
 ## Rust/WASM deployment
 
-`deploy/compose.yaml` treats `POSTGRES_PASSWORD` as PostgreSQL bootstrap input. Changing it after the `postgres-data` volume exists does not change the database role password. Rotate an existing deployment with the old credential: run a controlled `ALTER ROLE graphwar PASSWORD ...`, update the deployment secret, then recreate the app and PostgreSQL services. Never rotate by changing only the Compose environment.
+
+The production stack runs Graphwar, PostgreSQL, and the Cloudflare Tunnel with one Compose command.
+
+1. Copy `.env.example` to `.env`. Set a URL-safe `POSTGRES_PASSWORD`, keep `DOMAIN=graphwar.tiendepchai.id.vn`, and keep `CLOUDFLARE_TUNNEL_TOKEN_FILE=./cloudflare-tunnel-token`.
+2. Save the named-tunnel token in `cloudflare-tunnel-token`, outside Git, with restrictive permissions:
+
+   ```sh
+   printf '%s' "$CLOUDFLARE_TUNNEL_TOKEN" > cloudflare-tunnel-token
+   chmod 600 cloudflare-tunnel-token
+   ```
+
+3. In Cloudflare Tunnel → Public Hostnames, route `graphwar.tiendepchai.id.vn` to `http://127.0.0.1:18081`.
+4. Start the full stack:
+
+   ```sh
+   docker compose --env-file .env -f deploy/compose.yaml up -d --build --wait
+   ```
+
+`deploy/compose.yaml` keeps PostgreSQL private, exposes no host ports, and lets `cloudflared` reach the app over the Compose network. Check status with `docker compose --env-file .env -f deploy/compose.yaml ps`.
+
+`POSTGRES_PASSWORD` is PostgreSQL bootstrap input. Changing it after the `postgres-data` volume exists does not change the database role password. Rotate an existing deployment with the old credential: run a controlled `ALTER ROLE graphwar PASSWORD ...`, update the deployment secret, then recreate the app and PostgreSQL services. Never rotate by changing only the Compose environment.
+
+> The tunnel token is a credential. Rotate it if it was pasted into chat, shell history, or logs.
+
+```sh
+unset CLOUDFLARE_TUNNEL_TOKEN
+```
+
+The command above writes the token only from an environment variable; do not commit the token file.
 
 ## Running The Game
 

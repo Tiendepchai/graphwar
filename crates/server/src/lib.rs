@@ -1,12 +1,13 @@
 pub mod auth;
 pub mod bot;
 pub mod config;
+pub mod room_store;
 pub mod rooms;
 
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, RwLock as StdRwLock},
     time::{Duration, Instant},
 };
 
@@ -37,37 +38,92 @@ const MAX_WS_TRANSPORT_BYTES: usize = 16 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 16 * 1024;
 const MAX_MESSAGES_PER_WINDOW: usize = 120;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(120);
+const SESSION_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
 const WS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const BOT_SEARCH_BUDGET: Duration = Duration::from_secs(2);
-const DISCONNECT_GRACE: Duration = Duration::from_secs(3);
+const DISCONNECT_GRACE: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
     pub config: Arc<Config>,
     pub rooms: RoomRegistry,
-    events: broadcast::Sender<ScopedEvent>,
+    account_events: Arc<StdRwLock<HashMap<uuid::Uuid, broadcast::Sender<ServerMessage>>>>,
     presence: Arc<RwLock<HashMap<uuid::Uuid, usize>>>,
+    #[cfg(test)]
+    persistence_enabled: bool,
 }
 
 impl AppState {
     pub fn new(pool: PgPool, config: Config) -> Self {
-        let (events, _) = broadcast::channel(256);
+        Self::from_registry(pool, config, Default::default())
+    }
+
+    pub fn from_registry(pool: PgPool, config: Config, rooms: rooms::Registry) -> Self {
         Self {
             pool,
             config: Arc::new(config),
-            rooms: Arc::new(RwLock::new(Default::default())),
-            events,
+            rooms: Arc::new(RwLock::new(rooms)),
+            account_events: Arc::new(StdRwLock::new(HashMap::new())),
             presence: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(test)]
+            persistence_enabled: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn test_without_persistence(pool: PgPool, config: Config) -> Self {
+        let mut state = Self::new(pool, config);
+        state.persistence_enabled = false;
+        state
+    }
+
+    async fn persist_rooms(&self, rooms: &rooms::Registry) -> Result<(), RoomError> {
+        #[cfg(test)]
+        if !self.persistence_enabled {
+            return Ok(());
+        }
+        room_store::save(&self.pool, rooms)
+            .await
+            .map_err(|_| RoomError::Storage)
+    }
+
+    fn subscribe(&self, player: uuid::Uuid) -> broadcast::Receiver<ServerMessage> {
+        self.account_events
+            .write()
+            .expect("account event lock")
+            .entry(player)
+            .or_insert_with(|| broadcast::channel(256).0)
+            .subscribe()
+    }
+
+    fn publish(&self, event: ScopedEvent) {
+        let events = self.account_events.read().expect("account event lock");
+        let recipients = match event.audience {
+            Audience::Lobby => events.keys().copied().collect(),
+            Audience::Accounts(players) | Audience::Room { players } => players,
+        };
+        for player in recipients {
+            if let Some(sender) = events.get(&player) {
+                let _ = sender.send(event.message.clone());
+            }
         }
     }
 
     pub async fn expire_turns(&self) {
-        let outcomes = self.rooms.write().await.expire_turns();
-        for outcome in outcomes {
-            self.broadcast_turn(outcome);
+        {
+            let mut rooms = self.rooms.write().await;
+            let previous = rooms.clone();
+            let outcomes = rooms.expire_turns();
+            if !outcomes.is_empty() && self.persist_rooms(&rooms).await.is_ok() {
+                for outcome in outcomes {
+                    self.broadcast_turn(outcome);
+                }
+            } else if !outcomes.is_empty() {
+                *rooms = previous;
+            }
         }
         self.drive_bots().await;
         self.cleanup_inactive_connections().await;
@@ -98,14 +154,21 @@ impl AppState {
             .await
             .ok();
             let mut rooms = self.rooms.write().await;
+            let previous = rooms.clone();
             if let Some(outcome) =
                 result.and_then(|result| rooms.apply_bot_turn(turn.clone(), result).ok().flatten())
             {
-                drop(rooms);
-                self.broadcast_fire(outcome);
+                if self.persist_rooms(&rooms).await.is_ok() {
+                    self.broadcast_fire(outcome);
+                } else {
+                    *rooms = previous;
+                }
             } else if let Some(outcome) = rooms.skip_bot_turn(turn).ok().flatten() {
-                drop(rooms);
-                self.broadcast_turn(outcome);
+                if self.persist_rooms(&rooms).await.is_ok() {
+                    self.broadcast_turn(outcome);
+                } else {
+                    *rooms = previous;
+                }
             }
         }
     }
@@ -118,11 +181,8 @@ impl AppState {
             .filter(|player| !player.is_bot)
             .map(|player| player.id)
             .collect();
-        let _ = self.events.send(ScopedEvent {
-            audience: Audience::Room {
-                room_id: outcome.snapshot.id,
-                players,
-            },
+        self.publish(ScopedEvent {
+            audience: Audience::Room { players },
             message: ServerMessage::TurnStarted {
                 snapshot: outcome.snapshot,
                 game: outcome.game,
@@ -149,13 +209,8 @@ impl AppState {
                 shot: outcome.shot,
             }
         };
-        let room_id = match &message {
-            ServerMessage::GameFinished { snapshot, .. }
-            | ServerMessage::ShotResolved { snapshot, .. } => snapshot.id,
-            _ => unreachable!(),
-        };
-        let _ = self.events.send(ScopedEvent {
-            audience: Audience::Room { room_id, players },
+        self.publish(ScopedEvent {
+            audience: Audience::Room { players },
             message,
         });
     }
@@ -167,6 +222,11 @@ impl AppState {
             .entry(player)
             .and_modify(|count| *count += 1)
             .or_insert(1);
+        self.account_events
+            .write()
+            .expect("account event lock")
+            .entry(player)
+            .or_insert_with(|| broadcast::channel(256).0);
     }
 
     fn socket_disconnected(&self, player: uuid::Uuid) {
@@ -190,7 +250,7 @@ impl AppState {
 
     async fn cleanup_disconnected(&self, player: uuid::Uuid) {
         let cleanup = {
-            let presence = self.presence.write().await;
+            let mut presence = self.presence.write().await;
             if presence.get(&player).is_some_and(|count| *count > 0) {
                 return;
             }
@@ -200,46 +260,40 @@ impl AppState {
                 .map(|snapshot| snapshot.id)
                 .ok();
             let cleanup = match old_room {
-                Some(old_room) => match rooms.disconnect(player) {
-                    Ok(snapshot) => Some((
-                        old_room,
-                        snapshot,
-                        rooms.member_ids(old_room),
-                        rooms.public_snapshots(),
-                    )),
-                    Err(RoomError::WrongPhase) => None,
-                    Err(_) => None,
-                },
-                None => Some((
-                    uuid::Uuid::nil(),
-                    None,
-                    Vec::new(),
-                    rooms.public_snapshots(),
-                )),
+                Some(old_room) => {
+                    let previous = rooms.clone();
+                    match rooms.disconnect(player) {
+                        Ok(snapshot) if self.persist_rooms(&rooms).await.is_ok() => Some((
+                            snapshot,
+                            rooms.member_ids(old_room),
+                            rooms.public_snapshots(),
+                        )),
+                        Ok(_) => {
+                            *rooms = previous;
+                            return;
+                        }
+                        Err(_) => None,
+                    }
+                }
+                None => Some((None, Vec::new(), rooms.public_snapshots())),
             };
-            drop(rooms);
-            drop(presence);
+            presence.remove(&player);
+            self.account_events
+                .write()
+                .expect("account event lock")
+                .remove(&player);
             cleanup
         };
-        {
-            let mut presence = self.presence.write().await;
-            if presence.get(&player) == Some(&0) {
-                presence.remove(&player);
-            }
-        }
-        let Some((old_room, snapshot, players, public_rooms)) = cleanup else {
+        let Some((snapshot, players, public_rooms)) = cleanup else {
             return;
         };
         if let Some(snapshot) = snapshot {
-            let _ = self.events.send(ScopedEvent {
-                audience: Audience::Room {
-                    room_id: old_room,
-                    players,
-                },
+            self.publish(ScopedEvent {
+                audience: Audience::Room { players },
                 message: ServerMessage::Room { snapshot },
             });
         }
-        let _ = self.events.send(ScopedEvent {
+        self.publish(ScopedEvent {
             audience: Audience::Lobby,
             message: ServerMessage::RoomList {
                 rooms: public_rooms,
@@ -357,27 +411,15 @@ async fn handle_socket(
 ) {
     state.socket_connected(user.id).await;
     let (mut sender, mut receiver) = socket.split();
-    let mut events = state.events.subscribe();
-    if send_message(
-        &mut sender,
-        &ServerMessage::Hello {
-            version: PROTOCOL_VERSION,
-        },
-    )
-    .await
-    .is_err()
-    {
-        state.socket_disconnected(user.id);
-        return;
-    }
-
-    let broadcast_sender = state.events.clone();
+    let mut events = state.subscribe(user.id);
     let mut hello_complete = false;
     let mut window_started = Instant::now();
     let mut message_count = 0;
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_seen = Instant::now();
+    let mut session_checked_at = Instant::now();
+    let mut session_valid = true;
     loop {
         tokio::select! {
             incoming = receiver.next() => {
@@ -416,13 +458,13 @@ async fn handle_socket(
                     .await;
                     break;
                 }
-                match auth::session_is_valid(&state.pool, user.id, &session_token).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        let _ = send_message(&mut sender, &ServerMessage::SessionExpired).await;
-                        break;
-                    }
-                    Err(_) => break,
+                if session_checked_at.elapsed() >= SESSION_RECHECK_INTERVAL {
+                    session_valid = auth::session_is_valid(&state.pool, user.id, &session_token).await.unwrap_or(false);
+                    session_checked_at = Instant::now();
+                }
+                if !session_valid {
+                    let _ = send_message(&mut sender, &ServerMessage::SessionExpired).await;
+                    break;
                 }
                 last_seen = Instant::now();
                 if window_started.elapsed() >= RATE_WINDOW {
@@ -450,7 +492,20 @@ async fn handle_socket(
                         Ok(DispatchOutcome::private(ServerMessage::Hello { version }))
                     }
                     Ok(ClientMessage::Hello { .. }) => {
-                        Err(RoomError::Invalid("unsupported protocol version"))
+                        let error = ServerMessage::Error {
+                            code: "unsupported_protocol".into(),
+                            message: "unsupported protocol version".into(),
+                        };
+                        let _ = send_message(&mut sender, &error).await;
+                        let _ = send_frame(
+                            &mut sender,
+                            Message::Close(Some(axum::extract::ws::CloseFrame {
+                                code: 1002,
+                                reason: "unsupported protocol version".into(),
+                            })),
+                        )
+                        .await;
+                        break;
                     }
                     Ok(_) if !hello_complete => Err(RoomError::Invalid("hello is required first")),
                     Ok(message) => dispatch(&state, &user, message).await,
@@ -468,11 +523,6 @@ async fn handle_socket(
                                 break;
                             }
                         }
-                        for event in outcome.broadcasts {
-                            if broadcast_sender.send(event).is_err() {
-                                break;
-                            }
-                        }
                     }
                     Err(error) => {
                         let message = ServerMessage::Error {
@@ -486,24 +536,23 @@ async fn handle_socket(
                 }
             }
             event = events.recv() => {
-                match auth::session_is_valid(&state.pool, user.id, &session_token).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        let _ = send_message(&mut sender, &ServerMessage::SessionExpired).await;
-                        break;
-                    }
-                    Err(_) => break,
+                if session_checked_at.elapsed() >= SESSION_RECHECK_INTERVAL {
+                    session_valid = auth::session_is_valid(&state.pool, user.id, &session_token).await.unwrap_or(false);
+                    session_checked_at = Instant::now();
+                }
+                if !session_valid {
+                    let _ = send_message(&mut sender, &ServerMessage::SessionExpired).await;
+                    break;
                 }
                 if !hello_complete {
                     continue;
                 }
                 match event {
-                    Ok(event) if event_visible_to(&state, user.id, &event).await => {
-                        if send_message(&mut sender, &event.message).await.is_err() {
+                    Ok(message) => {
+                        if send_message(&mut sender, &message).await.is_err() {
                             break;
                         }
                     }
-                    Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         if send_sync(&state, user.id, &mut sender).await.is_err() {
                             break;
@@ -513,13 +562,13 @@ async fn handle_socket(
                 }
             }
             _ = heartbeat.tick() => {
-                match auth::session_is_valid(&state.pool, user.id, &session_token).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        let _ = send_message(&mut sender, &ServerMessage::SessionExpired).await;
-                        break;
-                    }
-                    Err(_) => break,
+                if session_checked_at.elapsed() >= SESSION_RECHECK_INTERVAL {
+                    session_valid = auth::session_is_valid(&state.pool, user.id, &session_token).await.unwrap_or(false);
+                    session_checked_at = Instant::now();
+                }
+                if !session_valid {
+                    let _ = send_message(&mut sender, &ServerMessage::SessionExpired).await;
+                    break;
                 }
                 if last_seen.elapsed() >= HEARTBEAT_TIMEOUT
                     || send_frame(&mut sender, Message::Ping(Vec::new().into())).await.is_err()
@@ -568,10 +617,7 @@ struct ScopedEvent {
 enum Audience {
     Lobby,
     Accounts(Vec<uuid::Uuid>),
-    Room {
-        room_id: uuid::Uuid,
-        players: Vec<uuid::Uuid>,
-    },
+    Room { players: Vec<uuid::Uuid> },
 }
 
 impl DispatchOutcome {
@@ -592,11 +638,11 @@ impl DispatchOutcome {
         }
     }
 
-    fn room(room_id: uuid::Uuid, players: Vec<uuid::Uuid>, message: ServerMessage) -> Self {
+    fn room(players: Vec<uuid::Uuid>, message: ServerMessage) -> Self {
         Self {
             private: None,
             broadcasts: vec![ScopedEvent {
-                audience: Audience::Room { room_id, players },
+                audience: Audience::Room { players },
                 message,
             }],
         }
@@ -617,7 +663,12 @@ async fn dispatch(
     message: ClientMessage,
 ) -> Result<DispatchOutcome, RoomError> {
     let mut rooms = state.rooms.write().await;
-    match message {
+    let mutates = !matches!(
+        message,
+        ClientMessage::Hello { .. } | ClientMessage::ListRooms
+    );
+    let previous = mutates.then(|| rooms.clone());
+    let outcome = match message {
         ClientMessage::Hello { .. } => Err(RoomError::Invalid("hello already completed")),
         ClientMessage::ListRooms => Ok(DispatchOutcome::private(ServerMessage::RoomList {
             rooms: rooms.public_snapshots(),
@@ -639,7 +690,6 @@ async fn dispatch(
                 invite.as_deref(),
             )?;
             Ok(DispatchOutcome::room(
-                snapshot.id,
                 rooms.member_ids(snapshot.id),
                 ServerMessage::Room { snapshot },
             )
@@ -651,9 +701,14 @@ async fn dispatch(
             if let Some(broadcast) = leave.broadcast {
                 let message = match broadcast {
                     LeaveBroadcast::Room(snapshot) => ServerMessage::Room { snapshot },
-                    LeaveBroadcast::StateSync { snapshot, game } => ServerMessage::StateSync {
+                    LeaveBroadcast::StateSync {
+                        snapshot,
+                        game,
+                        chat_history,
+                    } => ServerMessage::StateSync {
                         snapshot,
                         game: Some(game),
+                        chat_history,
                     },
                     LeaveBroadcast::TurnStarted { snapshot, game } => {
                         ServerMessage::TurnStarted { snapshot, game }
@@ -664,7 +719,6 @@ async fn dispatch(
                 };
                 outcome.broadcasts.push(ScopedEvent {
                     audience: Audience::Room {
-                        room_id: leave.room_id,
                         players: rooms.member_ids(leave.room_id),
                     },
                     message,
@@ -675,7 +729,6 @@ async fn dispatch(
         ClientMessage::SetReady { ready } => {
             let snapshot = rooms.set_ready(user.id, ready)?;
             Ok(DispatchOutcome::room(
-                snapshot.id,
                 rooms.member_ids(snapshot.id),
                 ServerMessage::Room { snapshot },
             ))
@@ -683,7 +736,6 @@ async fn dispatch(
         ClientMessage::SetMode { mode } => {
             let snapshot = rooms.set_mode(user.id, mode)?;
             Ok(DispatchOutcome::room(
-                snapshot.id,
                 rooms.member_ids(snapshot.id),
                 ServerMessage::Room { snapshot },
             ))
@@ -691,7 +743,6 @@ async fn dispatch(
         ClientMessage::SetTeam { player_id, team } => {
             let snapshot = rooms.set_team(user.id, player_id, team)?;
             Ok(DispatchOutcome::room(
-                snapshot.id,
                 rooms.member_ids(snapshot.id),
                 ServerMessage::Room { snapshot },
             ))
@@ -702,7 +753,6 @@ async fn dispatch(
         } => {
             let snapshot = rooms.set_soldiers(user.id, player_id, soldiers)?;
             Ok(DispatchOutcome::room(
-                snapshot.id,
                 rooms.member_ids(snapshot.id),
                 ServerMessage::Room { snapshot },
             ))
@@ -710,7 +760,6 @@ async fn dispatch(
         ClientMessage::AddBot { level } => {
             let snapshot = rooms.add_bot(user.id, level)?;
             Ok(DispatchOutcome::room(
-                snapshot.id,
                 rooms.member_ids(snapshot.id),
                 ServerMessage::Room { snapshot },
             )
@@ -719,7 +768,6 @@ async fn dispatch(
         ClientMessage::RemoveBot { player_id } => {
             let snapshot = rooms.remove_bot(user.id, player_id)?;
             Ok(DispatchOutcome::room(
-                snapshot.id,
                 rooms.member_ids(snapshot.id),
                 ServerMessage::Room { snapshot },
             )
@@ -728,7 +776,6 @@ async fn dispatch(
         ClientMessage::StartGame => {
             let start = rooms.start_game(user.id)?;
             Ok(DispatchOutcome::room(
-                start.snapshot.id,
                 rooms.member_ids(start.snapshot.id),
                 ServerMessage::GameStarted {
                     snapshot: start.snapshot,
@@ -743,7 +790,6 @@ async fn dispatch(
         } => {
             let outcome = rooms.fire(user.id, function, angle_deg)?;
             Ok(DispatchOutcome::room(
-                outcome.shot.game.room_id,
                 rooms.member_ids(outcome.shot.game.room_id),
                 if outcome.shot.winner_team.is_some() {
                     ServerMessage::GameFinished {
@@ -758,21 +804,22 @@ async fn dispatch(
                 },
             ))
         }
-        ClientMessage::Chat { text } if text.trim().is_empty() || text.len() > 500 => {
-            Err(RoomError::Invalid("chat must be 1-500 characters"))
-        }
         ClientMessage::Chat { text } => {
-            let room_id = rooms.member_snapshot(user.id)?.id;
+            let (room_id, entry) = rooms.chat(user.id, text)?;
             Ok(DispatchOutcome::room(
-                room_id,
                 rooms.member_ids(room_id),
-                ServerMessage::Chat {
-                    player_id: user.id,
-                    text,
-                },
+                ServerMessage::Chat { entry },
             ))
         }
+    }?;
+    if mutates && state.persist_rooms(&rooms).await.is_err() {
+        *rooms = previous.expect("mutations keep prior registry");
+        return Err(RoomError::Storage);
     }
+    for event in &outcome.broadcasts {
+        state.publish(event.clone());
+    }
+    Ok(outcome)
 }
 
 async fn send_sync<S, E>(state: &AppState, player: uuid::Uuid, sender: &mut S) -> Result<(), ()>
@@ -782,7 +829,11 @@ where
     let messages = {
         let rooms = state.rooms.read().await;
         let room = match rooms.member_state(player) {
-            Ok((snapshot, game)) => ServerMessage::StateSync { snapshot, game },
+            Ok((snapshot, game, chat_history)) => ServerMessage::StateSync {
+                snapshot,
+                game,
+                chat_history,
+            },
             Err(RoomError::NotMember) => ServerMessage::LeftRoom,
             Err(_) => return Err(()),
         };
@@ -795,16 +846,6 @@ where
     };
     send_message(sender, &messages.0).await?;
     send_message(sender, &messages.1).await
-}
-
-async fn event_visible_to(state: &AppState, player: uuid::Uuid, event: &ScopedEvent) -> bool {
-    match &event.audience {
-        Audience::Lobby => true,
-        Audience::Accounts(accounts) => accounts.contains(&player),
-        Audience::Room { room_id, players } => {
-            players.contains(&player) && state.rooms.read().await.is_member_of(player, *room_id)
-        }
-    }
 }
 
 fn verify_origin(headers: &HeaderMap, config: &Config) -> Result<(), ApiError> {
@@ -913,7 +954,14 @@ mod tests {
 
     fn test_state() -> AppState {
         let pool = PgPoolOptions::new()
-            .connect_lazy("postgres://unused")
+            .connect_lazy("postgres://127.0.0.1:1/unused")
+            .expect("test pool");
+        AppState::test_without_persistence(pool, Config::test())
+    }
+
+    fn failing_persistence_state() -> AppState {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://127.0.0.1:1/unused")
             .expect("test pool");
         AppState::new(pool, Config::test())
     }
@@ -1041,7 +1089,7 @@ mod tests {
         assert!(outcome.broadcasts.iter().any(|event| {
             matches!(
                 &event.audience,
-                Audience::Room { players, .. } if players == &[guest]
+                Audience::Room { players } if players == &[guest]
             ) && matches!(
                 &event.message,
                 ServerMessage::GameFinished { snapshot, shot }
@@ -1049,6 +1097,31 @@ mod tests {
                         && shot.game.soldiers.iter().any(|soldier| soldier.player_id == owner && !soldier.alive)
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_rolls_back_mutation() {
+        let state = failing_persistence_state();
+        let user = test_user(uuid::Uuid::new_v4(), "Player");
+        let mut events = state.subscribe(user.id);
+
+        assert!(matches!(
+            dispatch(
+                &state,
+                &user,
+                ClientMessage::CreateRoom {
+                    name: "room".into(),
+                    visibility: graphwar_protocol::RoomVisibility::Public,
+                },
+            )
+            .await,
+            Err(RoomError::Storage)
+        ));
+        assert!(state.rooms.read().await.public_snapshots().is_empty());
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

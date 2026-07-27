@@ -10,27 +10,72 @@ use graphwar_game_core::{
 };
 
 use graphwar_protocol::{
-    GameMode, GameSnapshot, Phase, PlayerSnapshot, RoomSnapshot, RoomVisibility, ShotResolved,
-    SoldierPosition, SoldierSnapshot, TerrainCircle,
+    ChatEntry, GameMode, GameSnapshot, Phase, PlayerSnapshot, RoomSnapshot, RoomVisibility,
+    ShotHistoryEntry, ShotResolved, SoldierPosition, SoldierSnapshot, TerrainCircle,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+const REGISTRY_FORMAT_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct PersistedRegistry {
+    version: u32,
+    rooms: Vec<PersistedRoom>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedRoom {
+    snapshot: RoomSnapshot,
+    invite: Option<String>,
+    members: HashMap<Uuid, bool>,
+    bots: HashMap<Uuid, PersistedBot>,
+    game: Option<PersistedMatch>,
+    #[serde(default)]
+    event_sequence: u64,
+    #[serde(default)]
+    chat_history: Vec<ChatEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedBot {
+    level: u8,
+    seed: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedMatch {
+    mode: GameMode,
+    terrain: Terrain,
+    state: GameState,
+    player_ids: Vec<Uuid>,
+    turn_deadline_at: i64,
+    #[serde(default)]
+    shot_history: Vec<ShotHistoryEntry>,
+}
+
 use uuid::Uuid;
 
 pub type RoomRegistry = std::sync::Arc<tokio::sync::RwLock<Registry>>;
 
 const TURN_DURATION: Duration = Duration::from_secs(60);
+const MAX_SHOT_HISTORY: usize = 40;
+const MAX_CHAT_HISTORY: usize = 100;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Registry {
     rooms: HashMap<Uuid, Room>,
 }
 
+#[derive(Clone)]
 struct Room {
     snapshot: RoomSnapshot,
     invite: Option<String>,
     members: HashMap<Uuid, bool>,
     bots: HashMap<Uuid, BotSpec>,
     game: Option<Match>,
+    event_sequence: u64,
+    chat_history: Vec<ChatEntry>,
 }
 
 #[derive(Clone)]
@@ -40,12 +85,14 @@ struct BotSpec {
     memory: crate::bot::SearchMemory,
 }
 
+#[derive(Clone)]
 struct Match {
     mode: GameMode,
     terrain: Terrain,
     state: GameState,
     player_ids: Vec<Uuid>,
     turn_deadline_at: i64,
+    shot_history: Vec<ShotHistoryEntry>,
 }
 
 pub struct StartOutcome {
@@ -68,6 +115,7 @@ pub enum LeaveBroadcast {
     StateSync {
         snapshot: RoomSnapshot,
         game: GameSnapshot,
+        chat_history: Vec<ChatEntry>,
     },
     TurnStarted {
         snapshot: RoomSnapshot,
@@ -111,6 +159,8 @@ pub enum RoomError {
     WrongPhase,
     #[error("it is not your turn")]
     NotTurn,
+    #[error("state storage unavailable")]
+    Storage,
 }
 
 impl RoomError {
@@ -124,11 +174,130 @@ impl RoomError {
             Self::NotSlotOwner => "not_slot_owner",
             Self::WrongPhase => "wrong_phase",
             Self::NotTurn => "not_turn",
+            Self::Storage => "storage_unavailable",
         }
     }
 }
 
 impl Registry {
+    pub(crate) fn from_persisted_json(input: &str) -> Result<Self, String> {
+        let persisted: PersistedRegistry =
+            serde_json::from_str(input).map_err(|error| error.to_string())?;
+        if persisted.version != REGISTRY_FORMAT_VERSION {
+            return Err(format!(
+                "unsupported registry snapshot version {}",
+                persisted.version
+            ));
+        }
+        let mut rooms = HashMap::with_capacity(persisted.rooms.len());
+        for mut persisted in persisted.rooms {
+            let id = persisted.snapshot.id;
+            if rooms.contains_key(&id) {
+                return Err("duplicate room ID".into());
+            }
+            normalize_feed_history(&mut persisted)?;
+            validate_persisted_room(&persisted)?;
+            let bots = persisted
+                .bots
+                .into_iter()
+                .map(|(id, bot)| {
+                    (
+                        id,
+                        BotSpec {
+                            level: bot.level,
+                            seed: bot.seed,
+                            memory: crate::bot::SearchMemory::default(),
+                        },
+                    )
+                })
+                .collect();
+            let game = persisted.game.map(|game| Match {
+                mode: game.mode,
+                terrain: game.terrain,
+                state: game.state,
+                player_ids: game.player_ids,
+                turn_deadline_at: game.turn_deadline_at,
+                shot_history: game.shot_history,
+            });
+            rooms.insert(
+                id,
+                Room {
+                    snapshot: persisted.snapshot,
+                    invite: persisted.invite,
+                    members: persisted.members,
+                    bots,
+                    game,
+                    event_sequence: persisted.event_sequence,
+                    chat_history: persisted.chat_history,
+                },
+            );
+        }
+        Ok(Self { rooms })
+    }
+
+    pub(crate) fn persisted_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&PersistedRegistry {
+            version: REGISTRY_FORMAT_VERSION,
+            rooms: self
+                .rooms
+                .values()
+                .map(|room| PersistedRoom {
+                    snapshot: room.snapshot.clone(),
+                    invite: room.invite.clone(),
+                    members: room.members.clone(),
+                    bots: room
+                        .bots
+                        .iter()
+                        .map(|(id, bot)| {
+                            (
+                                *id,
+                                PersistedBot {
+                                    level: bot.level,
+                                    seed: bot.seed,
+                                },
+                            )
+                        })
+                        .collect(),
+                    game: room.game.as_ref().map(|game| PersistedMatch {
+                        mode: game.mode,
+                        terrain: game.terrain.clone(),
+                        state: game.state.clone(),
+                        player_ids: game.player_ids.clone(),
+                        turn_deadline_at: game.turn_deadline_at,
+                        shot_history: game.shot_history.clone(),
+                    }),
+                    event_sequence: room.event_sequence,
+                    chat_history: room.chat_history.clone(),
+                })
+                .collect(),
+        })
+    }
+
+    pub fn resume_after_restart(&mut self) -> bool {
+        let mut changed = false;
+        for room in self.rooms.values_mut() {
+            let Some(game) = room.game.as_mut() else {
+                continue;
+            };
+            match room.snapshot.phase {
+                Phase::Planning => {
+                    game.turn_deadline_at = turn_deadline();
+                    room.snapshot.revision += 1;
+                    changed = true;
+                }
+                Phase::Resolving => {
+                    advance_turn(&mut game.state);
+                    game.turn_deadline_at = turn_deadline();
+                    room.snapshot.phase = Phase::Planning;
+                    room.snapshot.revision += 1;
+                    changed = true;
+                }
+                Phase::Lobby | Phase::Finished => {}
+            }
+        }
+        changed
+    }
+
     pub fn create(
         &mut self,
         owner: Uuid,
@@ -170,6 +339,8 @@ impl Registry {
                 members: HashMap::from([(owner, false)]),
                 bots: HashMap::new(),
                 game: None,
+                event_sequence: 0,
+                chat_history: Vec::new(),
             },
         );
         Ok((snapshot, invite))
@@ -290,6 +461,7 @@ impl Registry {
                     broadcast: Some(LeaveBroadcast::StateSync {
                         snapshot: room.snapshot.clone(),
                         game: game_snapshot,
+                        chat_history: room.chat_history.clone(),
                     }),
                 })
             }
@@ -542,17 +714,39 @@ impl Registry {
         if active_id != player {
             return Err(RoomError::NotTurn);
         }
-        let expr = parse(function.trim()).map_err(|_| RoomError::Invalid("invalid function"))?;
+        let normalized_function = function.trim().to_owned();
+        let expr =
+            parse(&normalized_function).map_err(|_| RoomError::Invalid("invalid function"))?;
+        let (display_name, team) = room
+            .snapshot
+            .players
+            .iter()
+            .find(|member| member.id == player)
+            .map(|member| (member.display_name.clone(), member.team))
+            .ok_or(RoomError::NotMember)?;
+        let trajectory = {
+            let game = room.game.as_ref().expect("checked above");
+            if !mode_allows(&expr, game.mode) {
+                return Err(RoomError::Invalid(
+                    "function uses variables unavailable in this mode",
+                ));
+            }
+            let mode = trajectory_mode(game.mode, angle_deg);
+            let inverted = matches!(game.state.players[game.state.turn].team, Team::Two);
+            trace(&expr, mode, &game.terrain, &game.state, inverted)
+                .map_err(|_| RoomError::Invalid("function produced no finite trajectory"))?
+        };
+        let sequence = next_event_sequence(room)?;
+        let history_entry = ShotHistoryEntry {
+            sequence,
+            player_id: player,
+            display_name,
+            team,
+            function: normalized_function,
+            angle_deg,
+        };
         let game = room.game.as_mut().expect("checked above");
-        if !mode_allows(&expr, game.mode) {
-            return Err(RoomError::Invalid(
-                "function uses variables unavailable in this mode",
-            ));
-        }
-        let mode = trajectory_mode(game.mode, angle_deg);
-        let inverted = matches!(game.state.players[game.state.turn].team, Team::Two);
-        let trajectory = trace(&expr, mode, &game.terrain, &game.state, inverted)
-            .map_err(|_| RoomError::Invalid("function produced no finite trajectory"))?;
+        append_shot_history(game, history_entry);
         let explosion = trajectory.points.last().copied().map(|(x, y)| Circle {
             x,
             y,
@@ -587,6 +781,31 @@ impl Registry {
             snapshot: room.snapshot.clone(),
             shot,
         })
+    }
+
+    pub fn chat(&mut self, player: Uuid, text: String) -> Result<(Uuid, ChatEntry), RoomError> {
+        if text.trim().is_empty() || text.len() > 500 {
+            return Err(RoomError::Invalid("chat must be 1-500 characters"));
+        }
+        let room = self.member_room_mut(player)?;
+        let display_name = room
+            .snapshot
+            .players
+            .iter()
+            .find(|member| member.id == player)
+            .map(|member| member.display_name.clone())
+            .ok_or(RoomError::NotMember)?;
+        let entry = ChatEntry {
+            room_id: room.snapshot.id,
+            sequence: next_event_sequence(room)?,
+            player_id: player,
+            display_name,
+            text,
+        };
+        room.chat_history.push(entry.clone());
+        let excess = room.chat_history.len().saturating_sub(MAX_CHAT_HISTORY);
+        room.chat_history.drain(..excess);
+        Ok((room.snapshot.id, entry))
     }
 
     pub fn pending_bot_turns(&self) -> Vec<BotTurn> {
@@ -716,12 +935,13 @@ impl Registry {
     pub fn member_state(
         &self,
         player: Uuid,
-    ) -> Result<(RoomSnapshot, Option<GameSnapshot>), RoomError> {
+    ) -> Result<(RoomSnapshot, Option<GameSnapshot>, Vec<ChatEntry>), RoomError> {
         let id = self.room_id_for(player).ok_or(RoomError::NotMember)?;
         let room = &self.rooms[&id];
         Ok((
             room.snapshot.clone(),
             room.game.as_ref().map(|_| snapshot_for_game(room)),
+            room.chat_history.clone(),
         ))
     }
 
@@ -747,7 +967,11 @@ impl Registry {
     pub fn public_snapshots(&self) -> Vec<RoomSnapshot> {
         self.rooms
             .values()
-            .filter(|room| room.snapshot.visibility == RoomVisibility::Public)
+            .filter(|room| {
+                room.snapshot.visibility == RoomVisibility::Public
+                    && room.snapshot.phase == Phase::Lobby
+                    && room.snapshot.players.len() < MAX_PLAYERS
+            })
             .map(|room| room.snapshot.clone())
             .collect()
     }
@@ -764,6 +988,151 @@ impl Registry {
             .find(|room| room.members.contains_key(&player))
             .ok_or(RoomError::NotMember)
     }
+}
+
+fn normalize_feed_history(room: &mut PersistedRoom) -> Result<(), String> {
+    let mut used = std::collections::HashSet::new();
+    let mut maximum = room.event_sequence;
+    for sequence in room
+        .chat_history
+        .iter()
+        .map(|entry| entry.sequence)
+        .chain(
+            room.game
+                .iter()
+                .flat_map(|game| game.shot_history.iter().map(|entry| entry.sequence)),
+        )
+        .filter(|sequence| *sequence != 0)
+    {
+        if !used.insert(sequence) {
+            return Err("duplicate feed sequence".into());
+        }
+        maximum = maximum.max(sequence);
+    }
+    if let Some(game) = &mut room.game {
+        for shot in &mut game.shot_history {
+            if shot.sequence == 0 {
+                maximum = maximum
+                    .checked_add(1)
+                    .ok_or_else(|| "feed sequence exhausted".to_string())?;
+                shot.sequence = maximum;
+            }
+        }
+    }
+    room.event_sequence = maximum;
+    Ok(())
+}
+
+fn validate_persisted_room(room: &PersistedRoom) -> Result<(), String> {
+    let snapshot = &room.snapshot;
+    if snapshot.name.is_empty() || snapshot.name.len() > 64 || snapshot.players.is_empty() {
+        return Err("invalid room snapshot".into());
+    }
+    if snapshot.players.len() > MAX_PLAYERS
+        || snapshot
+            .players
+            .iter()
+            .filter(|player| player.owner)
+            .count()
+            != 1
+        || snapshot.players.iter().any(|player| {
+            player.display_name.is_empty()
+                || player.display_name.len() > 32
+                || !(1..=2).contains(&player.team)
+                || player.soldiers == 0
+                || usize::from(player.soldiers) > MAX_SOLDIERS_PER_PLAYER
+        })
+    {
+        return Err("invalid room players".into());
+    }
+    let player_ids = snapshot
+        .players
+        .iter()
+        .map(|player| player.id)
+        .collect::<std::collections::HashSet<_>>();
+    if player_ids.len() != snapshot.players.len()
+        || room.members.len() != player_ids.len()
+        || room.members.keys().any(|id| !player_ids.contains(id))
+        || room.bots.keys().any(|id| !player_ids.contains(id))
+        || snapshot
+            .players
+            .iter()
+            .any(|player| player.is_bot != room.bots.contains_key(&player.id))
+        || room.bots.values().any(|bot| !(1..=8).contains(&bot.level))
+    {
+        return Err("inconsistent room membership".into());
+    }
+    if snapshot.visibility == RoomVisibility::Private
+        && room.invite.as_deref().is_none_or(str::is_empty)
+    {
+        return Err("private room missing invite".into());
+    }
+    if room.chat_history.len() > MAX_CHAT_HISTORY
+        || room.chat_history.iter().any(|entry| {
+            entry.room_id != snapshot.id
+                || entry.sequence == 0
+                || entry.sequence > room.event_sequence
+                || entry.display_name.is_empty()
+                || entry.display_name.len() > 32
+                || entry.text.trim().is_empty()
+                || entry.text.len() > 500
+        })
+    {
+        return Err("invalid chat history".into());
+    }
+    match (&snapshot.phase, &room.game) {
+        (Phase::Lobby, None) | (Phase::Finished, None) => return Ok(()),
+        (Phase::Planning | Phase::Resolving | Phase::Finished, Some(game)) => {
+            if game.mode != snapshot.mode
+                || game.state.players.len() != game.player_ids.len()
+                || game.state.turn >= game.state.players.len()
+                || game
+                    .player_ids
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    != game.player_ids.len()
+                || game.shot_history.len() > MAX_SHOT_HISTORY
+                || game.shot_history.iter().any(|shot| {
+                    shot.sequence == 0
+                        || shot.sequence > room.event_sequence
+                        || !(1..=2).contains(&shot.team)
+                        || shot.display_name.is_empty()
+                        || shot.display_name.len() > 32
+                        || shot.function.is_empty()
+                        || shot.function.len() > 256
+                        || !shot.angle_deg.is_finite()
+                })
+            {
+                return Err("invalid match state".into());
+            }
+            if game
+                .terrain
+                .circles
+                .iter()
+                .chain(&game.terrain.explosions)
+                .any(|circle| {
+                    !circle.x.is_finite()
+                        || !circle.y.is_finite()
+                        || !circle.radius.is_finite()
+                        || circle.radius <= 0.0
+                })
+                || game.state.players.iter().any(|player| {
+                    player.current_soldier >= player.soldiers.len()
+                        || player.soldiers.is_empty()
+                        || player.soldiers.len() > MAX_SOLDIERS_PER_PLAYER
+                        || player
+                            .soldiers
+                            .iter()
+                            .any(|soldier| !soldier.x.is_finite() || !soldier.y.is_finite())
+                })
+            {
+                return Err("invalid terrain or soldiers".into());
+            }
+        }
+        _ => return Err("inconsistent room phase".into()),
+    }
+    Ok(())
 }
 
 fn new_match(seed: u64, players: &[PlayerSnapshot], mode: GameMode) -> Result<Match, RoomError> {
@@ -785,6 +1154,7 @@ fn new_match(seed: u64, players: &[PlayerSnapshot], mode: GameMode) -> Result<Ma
         state: GameState::new(game_players),
         player_ids,
         turn_deadline_at: turn_deadline(),
+        shot_history: Vec::new(),
     })
 }
 
@@ -912,6 +1282,14 @@ fn reset_readiness(room: &mut Room) {
     }
 }
 
+fn next_event_sequence(room: &mut Room) -> Result<u64, RoomError> {
+    room.event_sequence = room
+        .event_sequence
+        .checked_add(1)
+        .ok_or(RoomError::Invalid("feed sequence exhausted"))?;
+    Ok(room.event_sequence)
+}
+
 fn unix_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -941,6 +1319,12 @@ fn trajectory_mode(mode: GameMode, angle_deg: f64) -> TrajectoryMode {
             angle: angle_deg.to_radians(),
         },
     }
+}
+
+fn append_shot_history(game: &mut Match, entry: ShotHistoryEntry) {
+    game.shot_history.push(entry);
+    let excess = game.shot_history.len().saturating_sub(MAX_SHOT_HISTORY);
+    game.shot_history.drain(..excess);
 }
 
 fn apply_hits(game: &mut Match, hits: &[graphwar_game_core::Hit]) {
@@ -1060,6 +1444,7 @@ fn snapshot_for_game(room: &Room) -> GameSnapshot {
             .copied()
             .map(circle_snapshot)
             .collect(),
+        shot_history: game.shot_history.clone(),
     }
 }
 
@@ -1112,6 +1497,125 @@ mod tests {
         let start = registry.start_game(owner).unwrap();
         assert_eq!(start.snapshot.phase, Phase::Planning);
         assert_eq!(start.game.soldiers.len(), 4);
+    }
+
+    #[test]
+    fn persisted_active_match_round_trips_and_resets_bot_memory() {
+        let owner = Uuid::new_v4();
+        let mut registry = Registry::default();
+        let room = registry
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Private,
+            )
+            .unwrap()
+            .0;
+        let bot = registry
+            .add_bot(owner, 2)
+            .unwrap()
+            .players
+            .into_iter()
+            .find(|player| player.is_bot)
+            .unwrap()
+            .id;
+        registry.set_ready(owner, true).unwrap();
+        registry.start_game(owner).unwrap();
+        let memory = {
+            let game = registry.rooms[&room.id].game.as_ref().unwrap();
+            crate::bot::search(crate::bot::SearchInput {
+                mode: game.mode,
+                terrain: &game.terrain,
+                state: &game.state,
+                team: Team::Two,
+                level: 2,
+                seed: 0,
+                memory: crate::bot::SearchMemory::default(),
+                budget: Duration::ZERO,
+            })
+            .memory
+        };
+        assert_ne!(memory, crate::bot::SearchMemory::default());
+        registry
+            .rooms
+            .get_mut(&room.id)
+            .unwrap()
+            .bots
+            .get_mut(&bot)
+            .unwrap()
+            .memory = memory;
+
+        let restored = Registry::from_persisted_json(&registry.persisted_json().unwrap()).unwrap();
+        let (restored_snapshot, restored_game, restored_chat) =
+            restored.member_state(owner).unwrap();
+        let (snapshot, game, chat) = registry.member_state(owner).unwrap();
+        assert_eq!(restored_chat, chat);
+        assert_eq!(restored_snapshot, snapshot);
+        let (Some(restored_game), Some(game)) = (restored_game, game) else {
+            panic!("active match missing after restore");
+        };
+        assert_eq!(restored_game.room_id, game.room_id);
+        assert_eq!(restored_game.revision, game.revision);
+        assert_eq!(restored_game.mode, game.mode);
+        assert_eq!(restored_game.turn_player_id, game.turn_player_id);
+        assert_eq!(restored_game.shot_history, game.shot_history);
+        assert_eq!(restored_game.soldiers.len(), game.soldiers.len());
+        assert!(restored_game.soldiers.iter().zip(game.soldiers.iter()).all(
+            |(restored, original)| {
+                restored.player_id == original.player_id
+                    && restored.index == original.index
+                    && restored.team == original.team
+                    && restored.alive == original.alive
+                    && restored.active == original.active
+                    && (restored.x - original.x).abs() < 1e-9
+                    && (restored.y - original.y).abs() < 1e-9
+            }
+        ));
+        assert_eq!(restored_game.terrain.len(), game.terrain.len());
+        assert!(restored_game.terrain.iter().zip(game.terrain.iter()).all(
+            |(restored, original)| {
+                (restored.x - original.x).abs() < 1e-9
+                    && (restored.y - original.y).abs() < 1e-9
+                    && (restored.radius - original.radius).abs() < 1e-9
+            }
+        ));
+        assert_eq!(restored_game.terrain_cuts, game.terrain_cuts);
+        assert_eq!(restored.rooms[&room.id].bots[&bot].level, 2);
+        assert_eq!(
+            restored.rooms[&room.id].bots[&bot].memory,
+            crate::bot::SearchMemory::default()
+        );
+        assert_eq!(
+            restored.rooms[&room.id].bots[&bot].memory,
+            crate::bot::SearchMemory::default()
+        );
+    }
+
+    #[test]
+    fn restart_keeps_planning_turn_and_settles_resolving_once() {
+        let (mut registry, room_id, owner, guest) = started_registry();
+        let before = registry
+            .member_state(owner)
+            .unwrap()
+            .1
+            .unwrap()
+            .turn_player_id;
+        assert!(registry.resume_after_restart());
+        let resumed = registry.member_state(owner).unwrap().1.unwrap();
+        assert_eq!(resumed.turn_player_id, before);
+        assert!(resumed.turn_deadline_at.unwrap() > unix_timestamp());
+
+        registry.fire(owner, "0".into(), 0.0).unwrap();
+        assert!(registry.resume_after_restart());
+        let resolved = registry.member_state(guest).unwrap().1.unwrap();
+        assert_eq!(resolved.turn_player_id, Some(guest));
+        assert_eq!(registry.rooms[&room_id].snapshot.phase, Phase::Planning);
+    }
+
+    #[test]
+    fn corrupt_persisted_registry_is_rejected() {
+        assert!(Registry::from_persisted_json(r#"{"version":1,"rooms":[{"snapshot":{"id":"00000000-0000-0000-0000-000000000000","name":"","visibility":"public","phase":"lobby","revision":0,"mode":"function","players":[]},"invite":null,"members":{},"bots":{},"game":null}]}"#).is_err());
     }
 
     #[test]
@@ -1369,7 +1873,7 @@ mod tests {
             .find(|player| *player != next_turn.unwrap())
             .unwrap();
         let outcome = registry.leave(non_current).unwrap();
-        let LeaveBroadcast::StateSync { snapshot, game } = outcome.broadcast.unwrap() else {
+        let LeaveBroadcast::StateSync { snapshot, game, .. } = outcome.broadcast.unwrap() else {
             panic!("non-current planning leave should sync without advancing");
         };
         assert_eq!(snapshot.phase, Phase::Planning);
@@ -1397,7 +1901,7 @@ mod tests {
             .unwrap();
 
         let outcome = registry.leave(leaver).unwrap();
-        let LeaveBroadcast::StateSync { snapshot, game } = outcome.broadcast.unwrap() else {
+        let LeaveBroadcast::StateSync { snapshot, game, .. } = outcome.broadcast.unwrap() else {
             panic!("nonterminal resolving leave should sync");
         };
         assert_eq!(snapshot.phase, Phase::Resolving);
@@ -1481,6 +1985,175 @@ mod tests {
             Err(RoomError::NotTurn)
         ));
         assert!(registry.fire(owner, "0".into(), 0.0).is_ok());
+    }
+
+    #[test]
+    fn accepted_shots_are_authoritative_and_bounded() {
+        let (mut registry, room_id, owner, _) = started_registry();
+        let outcome = registry.fire(owner, " sin(x) ".into(), 0.0).unwrap();
+        assert_eq!(outcome.shot.game.shot_history.len(), 1);
+        assert_eq!(outcome.shot.game.shot_history[0].display_name, "Owner");
+        assert_eq!(outcome.shot.game.shot_history[0].function, "sin(x)");
+
+        let game = registry
+            .rooms
+            .get_mut(&room_id)
+            .unwrap()
+            .game
+            .as_mut()
+            .unwrap();
+        for index in 0..MAX_SHOT_HISTORY {
+            append_shot_history(
+                game,
+                ShotHistoryEntry {
+                    sequence: index as u64 + 2,
+                    player_id: owner,
+                    display_name: "Owner".into(),
+                    team: 1,
+                    function: format!("x+{index}"),
+                    angle_deg: 0.0,
+                },
+            );
+        }
+        assert_eq!(game.shot_history.len(), MAX_SHOT_HISTORY);
+        assert_eq!(game.shot_history[0].function, "x+0");
+    }
+
+    #[test]
+    fn invalid_shots_do_not_enter_history() {
+        let (mut registry, room_id, owner, _) = started_registry();
+        assert!(registry.fire(owner, "x+".into(), 0.0).is_err());
+        assert_eq!(registry.rooms[&room_id].event_sequence, 0);
+        assert!(
+            registry.rooms[&room_id]
+                .game
+                .as_ref()
+                .unwrap()
+                .shot_history
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn chat_and_shot_share_monotonic_sequence() {
+        let (mut registry, room_id, owner, guest) = started_registry();
+        let (_, before) = registry.chat(owner, "before".into()).unwrap();
+        let shot = registry.fire(owner, "sin(x)".into(), 0.0).unwrap();
+        let (_, after) = registry.chat(guest, "after".into()).unwrap();
+        assert_eq!(
+            (
+                before.sequence,
+                shot.shot.game.shot_history[0].sequence,
+                after.sequence
+            ),
+            (1, 2, 3)
+        );
+        assert_eq!(registry.rooms[&room_id].event_sequence, 3);
+        assert_eq!(registry.member_state(owner).unwrap().2, vec![before, after]);
+    }
+
+    #[test]
+    fn invalid_chat_does_not_consume_sequence() {
+        let (mut registry, room_id, owner, _) = started_registry();
+        assert!(matches!(
+            registry.chat(owner, "   ".into()),
+            Err(RoomError::Invalid(_))
+        ));
+        assert_eq!(registry.rooms[&room_id].event_sequence, 0);
+        let (_, entry) = registry.chat(owner, "accepted".into()).unwrap();
+        assert_eq!(entry.sequence, 1);
+    }
+
+    #[test]
+    fn departed_player_name_remains_in_history() {
+        let (mut registry, _room_id, owner, guest) = started_registry();
+        let (_, entry) = registry.chat(owner, "hello".into()).unwrap();
+        registry.leave(owner).unwrap();
+        let history = registry.member_state(guest).unwrap().2;
+        assert_eq!(history, vec![entry]);
+        assert_eq!(history[0].display_name, "Owner");
+    }
+
+    #[test]
+    fn persisted_active_match_without_legacy_shot_history_is_accepted() {
+        let (registry, _room_id, owner, _) = started_registry();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&registry.persisted_json().unwrap()).unwrap();
+        json["rooms"][0]["game"]
+            .as_object_mut()
+            .unwrap()
+            .remove("shot_history");
+        let restored = Registry::from_persisted_json(&json.to_string()).unwrap();
+        assert!(
+            restored
+                .member_state(owner)
+                .unwrap()
+                .1
+                .unwrap()
+                .shot_history
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn persisted_chat_with_wrong_room_id_is_rejected() {
+        let (mut registry, _room_id, owner, _) = started_registry();
+        registry.chat(owner, "chat".into()).unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&registry.persisted_json().unwrap()).unwrap();
+        json["rooms"][0]["chat_history"][0]["room_id"] =
+            serde_json::Value::String(Uuid::new_v4().to_string());
+        assert!(Registry::from_persisted_json(&json.to_string()).is_err());
+    }
+
+    #[test]
+    fn persisted_legacy_zero_shot_sequence_is_normalized() {
+        let (mut registry, room_id, owner, _) = started_registry();
+        registry.fire(owner, "sin(x)".into(), 0.0).unwrap();
+        registry.rooms.get_mut(&room_id).unwrap().event_sequence = 0;
+        registry
+            .rooms
+            .get_mut(&room_id)
+            .unwrap()
+            .game
+            .as_mut()
+            .unwrap()
+            .shot_history[0]
+            .sequence = 0;
+        let restored = Registry::from_persisted_json(&registry.persisted_json().unwrap()).unwrap();
+        let room = &restored.rooms[&room_id];
+        assert_eq!(room.event_sequence, 1);
+        assert_eq!(room.game.as_ref().unwrap().shot_history[0].sequence, 1);
+    }
+
+    #[test]
+    fn persisted_duplicate_feed_sequence_is_rejected() {
+        let (mut registry, room_id, owner, _) = started_registry();
+        registry.chat(owner, "chat".into()).unwrap();
+        registry.fire(owner, "sin(x)".into(), 0.0).unwrap();
+        registry
+            .rooms
+            .get_mut(&room_id)
+            .unwrap()
+            .game
+            .as_mut()
+            .unwrap()
+            .shot_history[0]
+            .sequence = 1;
+        assert!(Registry::from_persisted_json(&registry.persisted_json().unwrap()).is_err());
+    }
+
+    #[test]
+    fn chat_history_is_bounded_and_persisted() {
+        let (mut registry, _room_id, owner, _) = started_registry();
+        for index in 0..(MAX_CHAT_HISTORY + 1) {
+            registry.chat(owner, format!("chat-{index}")).unwrap();
+        }
+        let history = registry.member_state(owner).unwrap().2;
+        assert_eq!(history.len(), MAX_CHAT_HISTORY);
+        assert_eq!(history[0].text, "chat-1");
+        let restored = Registry::from_persisted_json(&registry.persisted_json().unwrap()).unwrap();
+        assert_eq!(restored.member_state(owner).unwrap().2, history);
     }
 
     #[test]
