@@ -1392,7 +1392,16 @@ fn advance_turn(game: &mut GameState) {
     }
     for offset in 1..=game.players.len() {
         let candidate = (current + offset) % game.players.len();
-        if game.players[candidate].living().next().is_some() {
+        let player = &mut game.players[candidate];
+        if player.living().next().is_some() {
+            if player.current().is_none_or(|soldier| !soldier.alive) {
+                let index = player
+                    .living()
+                    .next()
+                    .map(|(index, _)| index)
+                    .expect("candidate has a living soldier");
+                player.current_soldier = index;
+            }
             game.turn = candidate;
             return;
         }
@@ -1481,6 +1490,22 @@ fn circle_snapshot(circle: Circle) -> TerrainCircle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advance_turn_selects_a_living_soldier() {
+        let mut dead = Soldier::new(3.0, 4.0);
+        dead.alive = false;
+        let mut game = GameState::new(vec![
+            Player::new(1, Team::One, vec![Soldier::new(1.0, 2.0)]),
+            Player::new(2, Team::Two, vec![dead, Soldier::new(5.0, 6.0)]),
+        ]);
+
+        advance_turn(&mut game);
+
+        assert_eq!(game.turn, 1);
+        assert_eq!(game.players[1].current_soldier, 1);
+        assert!(game.players[1].current().unwrap().alive);
+    }
 
     #[test]
     fn owner_only_starts_ready_two_player_game() {
