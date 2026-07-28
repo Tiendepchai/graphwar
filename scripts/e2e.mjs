@@ -622,7 +622,9 @@ async function browserFlows() {
           && summary?.textContent.includes('Team Two')
           && teams.includes('Team One')
           && teams.includes('Team Two')
-          && document.querySelectorAll('.notices').length === 1
+          && document.querySelector('.map-panel')?.classList.contains('field-map')
+          && document.querySelector('.chat-panel')?.classList.contains('field-log')
+          && document.querySelectorAll('.notices').length === 0
           && Boolean(document.querySelector('.chat-panel ul'))
           && !document.querySelector('.combat-log');
       })()`), "battlefield accessibility semantics missing");
@@ -703,7 +705,8 @@ async function browserFlows() {
       input?.setSelectionRange(1, 4, 'backward');
       window.dispatchEvent(new Event('resize'));
       return document.querySelector('label[for="function-input"]')?.textContent === 'Function'
-        && document.querySelector('#game-canvas')?.getAttribute('aria-label') === 'Graphwar battlefield';
+        && document.querySelector('#game-canvas')?.getAttribute('aria-label') === 'Graphwar battlefield'
+        && !document.querySelector('.game-notices');
     })()`), "game semantics missing");
     await sleep(150);
     ok(await active.evaluate(`(() => {
@@ -799,11 +802,30 @@ async function browserFlows() {
       d = await launchBrowser(BASE);
       await browserRegister(c, browserUser("private-owner"));
       await browserRegister(d, browserUser("private-guest"));
+      await d.cdp.command("Emulation.setDeviceMetricsOverride", {width: 320, height: 800, deviceScaleFactor: 1, mobile: false});
+      ok(await d.cdp.evaluate(`(() => {
+        const forms = [...document.querySelectorAll('#create-room-form, #invite-room-form')];
+        return getComputedStyle(document.documentElement).colorScheme === 'light'
+          && forms.every(form => form.classList.contains('command-slip'))
+          && document.querySelectorAll('.room-card').length >= 0
+          && document.documentElement.scrollWidth <= 320
+          && forms.every(form => form.getBoundingClientRect().right <= 320)
+          && [...document.querySelectorAll('#create-room-form button, #invite-room-form button, #create-room-form input, #invite-room-form input, #create-room-form select')]
+            .every(control => control.getBoundingClientRect().height >= 44);
+      })()`), "mobile lobby forms overflow or miss touch targets");
+      await d.cdp.command("Emulation.setDeviceMetricsOverride", {width: 1280, height: 800, deviceScaleFactor: 1, mobile: false});
       const privateName = `Private E2E ${crypto.randomUUID().slice(0, 8)}`;
       await browserCreate(c.cdp, privateName, "private");
       const notice = await browserText(c.cdp, ".notices");
       const invite = notice.match(/Private room:\s*([0-9a-f-]{36})\s*·\s*invite:\s*([0-9a-f-]{36})/i);
       ok(invite, "private room invite not displayed");
+      ok(await c.cdp.evaluate(`(() => {
+        const list = document.querySelector('.notices');
+        const live = document.querySelector('#announcements');
+        return list?.getAttribute('aria-label') === 'Recent notices'
+          && live?.textContent.includes('Private room:')
+          && document.querySelectorAll('.invite-notice').length === 1;
+      })()`), "private invite was not announced exactly once");
       ok(
         !await d.cdp.evaluate(`[...document.querySelectorAll('.room-list strong')].some(node => node.textContent === ${JSON.stringify(privateName)})`),
         "private room leaked into lobby listing",
@@ -834,6 +856,8 @@ async function browserFlows() {
       ]);
       await browserSubmit(d.cdp, "#invite-room-form");
       await browserWait(d.cdp, "document.querySelector('.notices')?.textContent.includes('room is private')", "wrong private invite rejection");
+      await browserWait(d.cdp, "document.querySelector('#announcements')?.textContent.includes('room is private')", "private invite live error");
+      ok((await d.cdp.evaluate("document.querySelector('#announcements')?.textContent.match(/room is private/g)?.length ?? 0")) === 1, "private invite error announced more than once");
       await browserAssertRenderStable(d.cdp, "lobby-notice", "lobby error notice");
       ok(await d.cdp.evaluate(`(() => {
         const input = document.querySelector('#invite-code');
@@ -855,8 +879,22 @@ async function browserFlows() {
       await browserWait(c.cdp, "document.body.textContent.includes('Computer')", "bot slot");
       await browserClick(c.cdp, "#ready-button");
       await browserWait(c.cdp, "document.querySelector('#start-game')?.disabled === false", "bot start enabled");
+      await c.cdp.command("Emulation.setEmulatedMedia", {media: "", features: [{name: "prefers-color-scheme", value: "dark"}]});
+      await browserWait(c.cdp, "matchMedia('(prefers-color-scheme: dark)').matches", "dark system scheme");
       await browserClick(c.cdp, "#start-game");
       await browserWait(c.cdp, "Boolean(document.querySelector('#game-canvas'))", "bot game", 20_000);
+      ok(await c.cdp.evaluate(`(() => {
+        const canvas = document.querySelector('#game-canvas');
+        const root = document.documentElement;
+        const paper = getComputedStyle(root).getPropertyValue('--paper').trim();
+        if (getComputedStyle(root).colorScheme !== 'light' || paper !== '#f4ecd8') return false;
+        const pixels = canvas?.getContext('2d')?.getImageData(0, 0, canvas.width, canvas.height).data;
+        if (!canvas?.width || !canvas?.height || !pixels) return false;
+        for (let index = 0; index < pixels.length; index += 4) {
+          if (pixels[index] === 244 && pixels[index + 1] === 236 && pixels[index + 2] === 216) return true;
+        }
+        return false;
+      })()`), "battlefield should remain light under dark system scheme");
       await browserWait(c.cdp, "document.querySelector('#function-input')?.disabled === false", "human bot-game turn", 20_000);
       await browserSet(c.cdp, "#function-input", "0");
       await browserSubmit(c.cdp, "#fire-form");
@@ -872,6 +910,7 @@ async function browserFlows() {
         "document.querySelectorAll('.chat-panel .shot-entry').length >= 2",
         "bot function history",
       );
+      await c.cdp.command("Emulation.setEmulatedMedia", {media: "", features: []});
       log("browser bot match and bot turn completion: pass");
     } finally {
       for (const browser of [c, d]) await closeBrowser(browser);

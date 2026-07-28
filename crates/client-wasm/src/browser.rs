@@ -76,6 +76,22 @@ struct ShotAnimation {
 }
 
 #[derive(Clone, Copy)]
+struct CanvasPalette {
+    background: &'static str,
+    grid: &'static str,
+    axis: &'static str,
+    terrain: &'static str,
+    terrain_stroke: &'static str,
+    path: &'static str,
+    preview: &'static str,
+    team_one: &'static str,
+    team_two: &'static str,
+    dead: &'static str,
+    soldier_stroke: &'static str,
+    hit: &'static str,
+}
+
+#[derive(Clone, Copy)]
 enum RenderScope {
     None,
     Header,
@@ -333,13 +349,23 @@ fn connect(app: &SharedApp) -> Result<(), JsValue> {
             Ok(message) => {
                 announce_server_message(&message_app, &message);
                 let scope = render_scope(&message);
-                let (previous_screen, prior_sequence) = {
+                let (previous_screen, prior_sequence, prior_notice) = {
                     let app_ref = message_app.borrow();
-                    (app_ref.model.screen.clone(), app_ref.model.shot_sequence)
+                    (
+                        app_ref.model.screen.clone(),
+                        app_ref.model.shot_sequence,
+                        app_ref.model.notices.last().cloned(),
+                    )
                 };
                 {
                     let mut app = message_app.borrow_mut();
                     reduce(&mut app.model, Action::Message(Box::new(message)));
+                }
+                let latest_notice = message_app.borrow().model.notices.last().cloned();
+                if latest_notice != prior_notice
+                    && let Some(message) = latest_notice.as_deref()
+                {
+                    announce(&message_app, message);
                 }
                 let sequence = message_app.borrow().model.shot_sequence;
                 if sequence != prior_sequence {
@@ -669,7 +695,6 @@ fn announce_server_message(app: &SharedApp, message: &ServerMessage) {
             Some(2) => "Match finished; Team Two wins".into(),
             _ => "Match finished; draw".into(),
         }),
-        ServerMessage::Error { message, .. } => Some(message.clone()),
         _ => None,
     };
     if let Some(message) = message {
@@ -791,15 +816,13 @@ fn refresh_header_dom(app: &SharedApp) -> Result<(), JsValue> {
 
 fn refresh_notices_dom(app: &SharedApp) -> Result<(), JsValue> {
     let app_ref = app.borrow();
-    let selector = if app_ref.model.screen == Screen::Game {
-        ".game-notices"
-    } else {
-        ".app-notices"
-    };
+    if app_ref.model.screen == Screen::Game {
+        return Ok(());
+    }
     let notices = app_ref
         .document
-        .query_selector(selector)?
-        .ok_or_else(|| JsValue::from_str(&format!("{selector} missing")))?;
+        .query_selector(".app-notices")?
+        .ok_or(".app-notices missing")?;
     notices.set_inner_html(&notice_items_html(&app_ref.model));
     Ok(())
 }
@@ -916,7 +939,6 @@ fn refresh_game_dom(app: &SharedApp) -> Result<(), JsValue> {
         game_element(document, "#battlefield-summary")?
             .set_text_content(Some(&battlefield_summary(model)));
         game_element(document, ".chat-panel ul")?.set_inner_html(&chat_messages_html(model));
-        game_element(document, ".game-notices")?.set_inner_html(&notice_items_html(model));
 
         let local_turn = local_turn(model);
         let function_input =
@@ -1103,7 +1125,7 @@ fn header_html(model: &Model) -> String {
         .then_some(" hidden")
         .unwrap_or("");
     format!(
-        "<header class=\"masthead\"><a class=\"wordmark\" href=\"/\" aria-label=\"Graphwar home\"><span>GRAPH</span><strong>WAR</strong></a><div><p class=\"connection {class}\" role=\"status\"><i></i>{}</p><button id=\"reconnect-now\" class=\"text-button\" type=\"button\"{reconnect_hidden}>Reconnect</button>{account_action}</div></header>",
+        "<header class=\"masthead\"><a class=\"wordmark\" href=\"/\" aria-label=\"Graphwar home\"><span>GRAPH</span><strong>WAR</strong></a><div class=\"masthead-status\"><p class=\"connection {class}\" role=\"status\"><i></i>{}</p><button id=\"reconnect-now\" class=\"text-button\" type=\"button\"{reconnect_hidden}>Reconnect</button>{account_action}</div></header>",
         escape(&label)
     )
 }
@@ -1120,12 +1142,12 @@ fn connection_view(connection: &Connection) -> (&'static str, String) {
 }
 
 fn login_html() -> String {
-    "<section class=\"login-shell reveal\" aria-labelledby=\"login-title\"><div class=\"hero-copy\"><p class=\"eyebrow\">Artillery for mathematicians</p><h1 id=\"login-title\">Draw the<br><em>winning line.</em></h1><p>Turn equations into trajectories. Outsmart the other side before the clock runs dry.</p></div><div class=\"auth-stack\"><form id=\"login-form\" class=\"paper-card\"><h2>Return to battle</h2><label for=\"login-email\">Email</label><input id=\"login-email\" type=\"email\" autocomplete=\"email\" maxlength=\"254\" required><label for=\"login-password\">Password</label><input id=\"login-password\" type=\"password\" autocomplete=\"current-password\" minlength=\"12\" required><button class=\"primary\" type=\"submit\">Enter the lobby <span aria-hidden=\"true\">↗</span></button></form><form id=\"register-form\" class=\"paper-card\"><h2>First deployment</h2><label for=\"register-name\">Display name</label><input id=\"register-name\" autocomplete=\"nickname\" minlength=\"2\" maxlength=\"32\" required placeholder=\"e.g. Gauss\"><label for=\"register-email\">Email</label><input id=\"register-email\" type=\"email\" autocomplete=\"email\" maxlength=\"254\" required><label for=\"register-password\">Password</label><input id=\"register-password\" type=\"password\" autocomplete=\"new-password\" minlength=\"12\" required><button class=\"secondary\" type=\"submit\">Create account</button><small>Passwords need at least 12 characters.</small></form></div></section>".into()
+    "<section class=\"login-shell reveal\" aria-labelledby=\"login-title\"><div class=\"hero-copy\"><p class=\"eyebrow\">Artillery for mathematicians</p><h1 id=\"login-title\">Draw the<br><em>winning line.</em></h1><p>Turn equations into trajectories. Outsmart the other side before the clock runs dry.</p></div><div class=\"auth-stack\"><form id=\"login-form\" class=\"paper-card auth-card auth-card-login\"><h2>Return to battle</h2><label for=\"login-email\">Email</label><input id=\"login-email\" type=\"email\" autocomplete=\"email\" maxlength=\"254\" required><label for=\"login-password\">Password</label><input id=\"login-password\" type=\"password\" autocomplete=\"current-password\" minlength=\"12\" required><button class=\"primary\" type=\"submit\">Enter the lobby <span aria-hidden=\"true\">↗</span></button></form><form id=\"register-form\" class=\"paper-card auth-card auth-card-register\"><h2>First deployment</h2><label for=\"register-name\">Display name</label><input id=\"register-name\" autocomplete=\"nickname\" minlength=\"2\" maxlength=\"32\" required placeholder=\"e.g. Gauss\"><label for=\"register-email\">Email</label><input id=\"register-email\" type=\"email\" autocomplete=\"email\" maxlength=\"254\" required><label for=\"register-password\">Password</label><input id=\"register-password\" type=\"password\" autocomplete=\"new-password\" minlength=\"12\" required><button class=\"secondary\" type=\"submit\">Create account</button><small>Passwords need at least 12 characters.</small></form></div></section>".into()
 }
 
 fn lobby_html(model: &Model) -> String {
     format!(
-        "<section class=\"lobby-shell reveal\" aria-labelledby=\"lobby-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Welcome, {}</p><h1 id=\"lobby-title\">Open rooms</h1></div><div class=\"lobby-actions\"><form id=\"create-room-form\" class=\"inline-form\"><label class=\"sr-only\" for=\"room-name\">New room name</label><input id=\"room-name\" maxlength=\"32\" required placeholder=\"Room name\"><select id=\"room-visibility\" aria-label=\"Room visibility\"><option value=\"public\">Public</option><option value=\"private\">Private</option></select><button class=\"primary\" type=\"submit\">Create room</button></form><form id=\"invite-room-form\" class=\"inline-form\"><label class=\"sr-only\" for=\"private-room-id\">Private room ID</label><input id=\"private-room-id\" required placeholder=\"Room ID\"><label class=\"sr-only\" for=\"invite-code\">Private invite code</label><input id=\"invite-code\" required placeholder=\"Invite code\"><button class=\"secondary\" type=\"submit\">Join private</button></form></div></div><ul class=\"room-list\">{}</ul></section>",
+        "<section class=\"lobby-shell reveal\" aria-labelledby=\"lobby-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Welcome, {}</p><h1 id=\"lobby-title\">Open rooms</h1></div><div class=\"lobby-actions\"><form id=\"create-room-form\" class=\"inline-form command-slip\" aria-labelledby=\"create-room-title\"><strong id=\"create-room-title\" class=\"form-title\">Create room</strong><label class=\"sr-only\" for=\"room-name\">New room name</label><input id=\"room-name\" maxlength=\"32\" required placeholder=\"Room name\"><select id=\"room-visibility\" aria-label=\"Room visibility\"><option value=\"public\">Public</option><option value=\"private\">Private</option></select><button class=\"primary\" type=\"submit\">Create room</button></form><form id=\"invite-room-form\" class=\"inline-form command-slip\" aria-labelledby=\"join-private-title\"><strong id=\"join-private-title\" class=\"form-title\">Join private room</strong><label class=\"sr-only\" for=\"private-room-id\">Private room ID</label><input id=\"private-room-id\" required placeholder=\"Room ID\"><label class=\"sr-only\" for=\"invite-code\">Private invite code</label><input id=\"invite-code\" required placeholder=\"Invite code\"><button class=\"secondary\" type=\"submit\">Join private</button></form></div></div><ul class=\"room-list\">{}</ul></section>",
         escape(&model.player_name),
         lobby_room_items_html(model)
     )
@@ -1139,7 +1161,7 @@ fn lobby_room_items_html(model: &Model) -> String {
         .rooms
         .iter()
         .map(|room| format!(
-            "<li><div><strong>{}</strong><span>{} / {} players</span></div><button class=\"join-room secondary\" data-room-id=\"{}\">Join <span aria-hidden=\"true\">→</span></button></li>",
+            "<li class=\"room-card\"><div><strong>{}</strong><span>{} / {} players</span></div><button class=\"join-room secondary\" data-room-id=\"{}\">Join <span aria-hidden=\"true\">→</span></button></li>",
             escape(&room.name), room.players, room.capacity, attr(&room.id)
         ))
         .collect()
@@ -1156,7 +1178,7 @@ fn room_html(model: &Model) -> String {
     let mode = model.game_mode.unwrap_or(GameMode::Function);
     let mode_checked = |candidate| (mode == candidate).then_some(" checked").unwrap_or("");
     format!(
-        "<section class=\"room-shell reveal\" aria-labelledby=\"room-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Staging area</p><h1 id=\"room-title\">{}</h1></div><button id=\"leave-room\" class=\"text-button\">Leave room</button></div><div class=\"room-grid\"><section class=\"paper-card roster\" aria-labelledby=\"players-title\"><h2 id=\"players-title\">Players <span>{}</span></h2><ul>{}</ul></section><aside class=\"briefing\"><p>Configure your slot, then ready up. The owner starts after everyone commits.</p><fieldset class=\"mode-picker\"{}><legend>Rule set</legend><label><input type=\"radio\" name=\"game-mode\" value=\"function\"{}> Function</label><label><input type=\"radio\" name=\"game-mode\" value=\"first_order\"{}> First-order</label><label><input type=\"radio\" name=\"game-mode\" value=\"second_order\"{}> Second-order</label></fieldset><button id=\"ready-button\" class=\"primary wide\">{ready_label}</button><button id=\"add-bot\" class=\"text-button wide\"{}>Add computer</button><button id=\"start-game\" class=\"secondary wide\"{}>Start match</button></aside></div>{}</section>",
+        "<section class=\"room-shell reveal\" aria-labelledby=\"room-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Staging area</p><h1 id=\"room-title\">{}</h1></div><button id=\"leave-room\" class=\"text-button\">Leave room</button></div><div class=\"room-grid\"><section class=\"paper-card roster\" aria-labelledby=\"players-title\"><h2 id=\"players-title\">Players <span>{}</span></h2><ul>{}</ul></section><aside class=\"briefing paper-card command-brief\"><p>Configure your slot, then ready up. The owner starts after everyone commits.</p><fieldset class=\"mode-picker\"{}><legend>Rule set</legend><label><input type=\"radio\" name=\"game-mode\" value=\"function\"{}> Function</label><label><input type=\"radio\" name=\"game-mode\" value=\"first_order\"{}> First-order</label><label><input type=\"radio\" name=\"game-mode\" value=\"second_order\"{}> Second-order</label></fieldset><button id=\"ready-button\" class=\"primary wide\">{ready_label}</button><button id=\"add-bot\" class=\"text-button wide\"{}>Add computer</button><button id=\"start-game\" class=\"secondary wide\"{}>Start match</button></aside></div>{}</section>",
         escape(&model.room_name),
         model.players.len(),
         room_player_items_html(model),
@@ -1206,7 +1228,7 @@ fn room_player_items_html(model: &Model) -> String {
                 })
                 .unwrap_or_default();
             format!(
-                "<li><span class=\"team team-{}\" aria-hidden=\"true\"></span><strong>{}</strong><span class=\"team-name\">{}</span>{}<span class=\"ready-state\">{}</span>{}</li>",
+                "<li class=\"player-slot\"><span class=\"team team-{}\" aria-hidden=\"true\"></span><strong>{}</strong><span class=\"team-name\">{}</span>{}<span class=\"ready-state\">{}</span>{}</li>",
                 player.team,
                 escape(&player.name),
                 team_name(player.team),
@@ -1225,7 +1247,7 @@ fn game_html(model: &Model) -> String {
     let angle_hidden = (!second_order).then_some(" hidden").unwrap_or("");
     let angle_disabled = (!second_order).then_some(" disabled").unwrap_or(disabled);
     format!(
-        "<section class=\"game-shell reveal\" aria-labelledby=\"game-title\"><div class=\"game-heading\"><div><p class=\"eyebrow\">Live match · <span id=\"turn-timer\" role=\"timer\">{}</span></p><h1 id=\"game-title\">{}</h1></div><button id=\"leave-room\" class=\"text-button\">Retreat</button></div><div class=\"war-room\"><section class=\"map-panel\" aria-labelledby=\"battlefield-label\"><div class=\"map-heading\"><p class=\"eyebrow\">Coordinate field / 01</p><h2 id=\"battlefield-label\">Battlefield</h2></div><div class=\"battlefield\"><canvas id=\"game-canvas\" width=\"770\" height=\"450\" aria-label=\"Graphwar battlefield\" aria-describedby=\"battlefield-summary\"></canvas><div class=\"preview-key\"><i></i> Provisional</div><div class=\"axis-label x-label\">x</div><div class=\"axis-label y-label\">y</div></div><p id=\"battlefield-summary\" class=\"sr-only\">{}</p></section><aside class=\"command-stack\" aria-label=\"Command stack\">{}<section class=\"paper-card function-panel\" aria-labelledby=\"function-panel-title\"><h2 id=\"function-panel-title\">Function</h2><form id=\"fire-form\" class=\"fire-console\"><div class=\"equation-field\"><label for=\"function-input\">Function</label><div><span aria-hidden=\"true\">y =</span><input id=\"function-input\" spellcheck=\"false\" autocomplete=\"off\" maxlength=\"256\" required value=\"{}\" aria-describedby=\"function-hint function-error\"{disabled}></div><small id=\"function-hint\">Use x, sin, cos, tan, sqrt and standard operators.</small><p id=\"function-error\" class=\"function-error\" aria-live=\"polite\"></p></div><div class=\"angle-field\"{angle_hidden}><div class=\"angle-label\"><label for=\"angle-input\">Launch angle</label><output id=\"angle-output\" for=\"angle-input\">{:.1}°</output></div><input id=\"angle-input\" type=\"range\" min=\"-90\" max=\"90\" value=\"{:.1}\" step=\"0.1\" aria-describedby=\"angle-hint angle-output\"{angle_disabled}><small id=\"angle-hint\">Focus the slider, then use Arrow Up/Down.</small></div><button class=\"fire-button\" type=\"submit\"{disabled}><span>{}</span><small>Enter ↵</small></button></form></section><ul class=\"game-notices notices\">{}</ul>{}</aside></div></section>",
+        "<section class=\"game-shell reveal\" aria-labelledby=\"game-title\"><div class=\"game-heading\"><div><p class=\"eyebrow\">Live match · <span id=\"turn-timer\" role=\"timer\">{}</span></p><h1 id=\"game-title\">{}</h1></div><button id=\"leave-room\" class=\"text-button\">Retreat</button></div><div class=\"war-room\"><section class=\"map-panel field-map\" aria-labelledby=\"battlefield-label\"><div class=\"map-heading\"><p class=\"eyebrow\">Coordinate field / 01</p><h2 id=\"battlefield-label\">Battlefield</h2></div><div class=\"battlefield\"><canvas id=\"game-canvas\" width=\"770\" height=\"450\" aria-label=\"Graphwar battlefield\" aria-describedby=\"battlefield-summary\"></canvas><div class=\"preview-key\"><i></i> Provisional</div><div class=\"axis-label x-label\">x</div><div class=\"axis-label y-label\">y</div></div><p id=\"battlefield-summary\" class=\"sr-only\">{}</p></section><aside class=\"command-stack\" aria-label=\"Command stack\">{}<section class=\"paper-card function-panel\" aria-labelledby=\"function-panel-title\"><h2 id=\"function-panel-title\">Function</h2><form id=\"fire-form\" class=\"fire-console\"><div class=\"equation-field\"><label for=\"function-input\">Function</label><div><span aria-hidden=\"true\">y =</span><input id=\"function-input\" spellcheck=\"false\" autocomplete=\"off\" maxlength=\"256\" required value=\"{}\" aria-describedby=\"function-hint function-error\"{disabled}></div><small id=\"function-hint\">Use x, sin, cos, tan, sqrt and standard operators.</small><p id=\"function-error\" class=\"function-error\" aria-live=\"polite\"></p></div><div class=\"angle-field\"{angle_hidden}><div class=\"angle-label\"><label for=\"angle-input\">Launch angle</label><output id=\"angle-output\" for=\"angle-input\">{:.1}°</output></div><input id=\"angle-input\" type=\"range\" min=\"-90\" max=\"90\" value=\"{:.1}\" step=\"0.1\" aria-describedby=\"angle-hint angle-output\"{angle_disabled}><small id=\"angle-hint\">Focus the slider, then use Arrow Up/Down.</small></div><button class=\"fire-button\" type=\"submit\"{disabled}><span>{}</span><small>Enter ↵</small></button></form></section>{}</aside></div></section>",
         timer_text(model),
         escape(&model.room_name),
         escape(&battlefield_summary(model)),
@@ -1238,7 +1260,6 @@ fn game_html(model: &Model) -> String {
         model.aim_angle_deg,
         model.aim_angle_deg,
         if local_turn { "Fire" } else { "Waiting" },
-        notice_items_html(model),
         chat_html(model)
     )
 }
@@ -1401,7 +1422,7 @@ fn battlefield_summary(model: &Model) -> String {
 
 fn chat_html(model: &Model) -> String {
     format!(
-        "<section class=\"paper-card chat-panel\" aria-labelledby=\"chat-title\"><h2 id=\"chat-title\">Room chat</h2><ul>{}</ul><form id=\"chat-form\" class=\"inline-form\"><label class=\"sr-only\" for=\"chat-input\">Message</label><input id=\"chat-input\" maxlength=\"500\" autocomplete=\"off\" required placeholder=\"Message the room\"><button class=\"secondary\" type=\"submit\">Send</button></form></section>",
+        "<section class=\"paper-card chat-panel field-log\" aria-labelledby=\"chat-title\"><h2 id=\"chat-title\">Room chat</h2><ul>{}</ul><form id=\"chat-form\" class=\"inline-form\"><label class=\"sr-only\" for=\"chat-input\">Message</label><input id=\"chat-input\" maxlength=\"500\" autocomplete=\"off\" required placeholder=\"Message the room\"><button class=\"secondary\" type=\"submit\">Send</button></form></section>",
         chat_messages_html(model)
     )
 }
@@ -1444,18 +1465,30 @@ fn chat_messages_html(model: &Model) -> String {
 
 fn notices_html(model: &Model) -> String {
     format!(
-        "<ul class=\"app-notices notices\">{}</ul>",
+        "<ul class=\"app-notices notices\" aria-label=\"Recent notices\">{}</ul>",
         notice_items_html(model)
     )
 }
 
 fn notice_items_html(model: &Model) -> String {
-    model
+    // ponytail: text identifies private invites until notices gain typed variants.
+    let invite = model
         .notices
         .iter()
         .rev()
-        .take(3)
-        .map(|notice| format!("<li>{}</li>", escape(notice)))
+        .find(|notice| notice.starts_with("Private room:"));
+    invite
+        .into_iter()
+        .map(|notice| format!("<li class=\"invite-notice\">{}</li>", escape(notice)))
+        .chain(
+            model
+                .notices
+                .iter()
+                .rev()
+                .filter(|notice| !notice.starts_with("Private room:"))
+                .take(3usize.saturating_sub(invite.is_some() as usize))
+                .map(|notice| format!("<li>{}</li>", escape(notice))),
+        )
         .collect()
 }
 
@@ -1920,6 +1953,23 @@ fn password_value(form: &HtmlFormElement, id: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
+fn canvas_palette() -> CanvasPalette {
+    CanvasPalette {
+        background: "#f4ecd8",
+        grid: "rgba(16, 37, 31, .12)",
+        axis: "#10251f",
+        terrain: "#244a3b",
+        terrain_stroke: "#1c1f1b",
+        path: "#a33a2b",
+        preview: "#666756",
+        team_one: "#d8a52b",
+        team_two: "#a33a2b",
+        dead: "#6d7168",
+        soldier_stroke: "#10251f",
+        hit: "#a33a2b",
+    }
+}
+
 fn render_canvas(app: &SharedApp) -> Result<(), JsValue> {
     let app = app.borrow();
     let canvas = app
@@ -1944,10 +1994,11 @@ fn render_canvas(app: &SharedApp) -> Result<(), JsValue> {
         0.0,
         0.0,
     )?;
-    context.set_fill_style_str("#f4ecd8");
+    let palette = canvas_palette();
+    context.set_fill_style_str(palette.background);
     context.fill_rect(0.0, 0.0, LOGICAL_WIDTH, LOGICAL_HEIGHT);
-    draw_grid(&context);
-    draw_terrain(&context, &app.model);
+    draw_grid(&context, palette);
+    draw_terrain(&context, &app.model, palette);
     let authoritative_len = app
         .shot_animation
         .as_ref()
@@ -1963,8 +2014,9 @@ fn render_canvas(app: &SharedApp) -> Result<(), JsValue> {
         &context,
         &app.model.authoritative_path[..authoritative_len],
         false,
+        palette,
     )?;
-    draw_path(&context, &app.model.preview_path, true)?;
+    draw_path(&context, &app.model.preview_path, true, palette)?;
     for soldier in &app.model.soldiers {
         draw_soldier(
             &context,
@@ -1973,17 +2025,18 @@ fn render_canvas(app: &SharedApp) -> Result<(), JsValue> {
             soldier.team,
             soldier.alive,
             soldier.active,
+            palette,
         );
     }
     if authoritative_len == app.model.authoritative_path.len() {
-        draw_shot_effects(&context, &app.model);
+        draw_shot_effects(&context, &app.model, palette);
     }
     Ok(())
 }
 
-fn draw_shot_effects(context: &CanvasRenderingContext2d, model: &Model) {
+fn draw_shot_effects(context: &CanvasRenderingContext2d, model: &Model, palette: CanvasPalette) {
     context.save();
-    context.set_stroke_style_str("#a33a2b");
+    context.set_stroke_style_str(palette.hit);
     context.set_line_width(3.0);
     for hit in &model.shot_hits {
         if let Some(soldier) = model
@@ -2010,8 +2063,8 @@ fn draw_shot_effects(context: &CanvasRenderingContext2d, model: &Model) {
     context.restore();
 }
 
-fn draw_grid(context: &CanvasRenderingContext2d) {
-    context.set_stroke_style_str("rgba(16, 37, 31, .12)");
+fn draw_grid(context: &CanvasRenderingContext2d, palette: CanvasPalette) {
+    context.set_stroke_style_str(palette.grid);
     context.set_line_width(0.65);
     for x in (0..=770).step_by(35) {
         context.begin_path();
@@ -2025,7 +2078,7 @@ fn draw_grid(context: &CanvasRenderingContext2d) {
         context.line_to(LOGICAL_WIDTH, y as f64);
         context.stroke();
     }
-    context.set_stroke_style_str("#10251f");
+    context.set_stroke_style_str(palette.axis);
     context.set_line_width(1.5);
     context.begin_path();
     context.move_to(0.0, 225.0);
@@ -2035,9 +2088,9 @@ fn draw_grid(context: &CanvasRenderingContext2d) {
     context.stroke();
 }
 
-fn draw_terrain(context: &CanvasRenderingContext2d, model: &Model) {
-    context.set_fill_style_str("#244a3b");
-    context.set_stroke_style_str("#1c1f1b");
+fn draw_terrain(context: &CanvasRenderingContext2d, model: &Model, palette: CanvasPalette) {
+    context.set_fill_style_str(palette.terrain);
+    context.set_stroke_style_str(palette.terrain_stroke);
     context.set_line_width(2.0);
     for terrain in model.terrain.iter().filter(|terrain| !terrain.cut) {
         context.begin_path();
@@ -2060,11 +2113,12 @@ fn draw_terrain(context: &CanvasRenderingContext2d, model: &Model) {
             0.0,
             std::f64::consts::TAU,
         );
-        context.set_fill_style_str("#f4ecd8");
+        context.set_fill_style_str(palette.background);
         context.fill();
+
         context.save();
         context.clip();
-        draw_grid(context);
+        draw_grid(context, palette);
         context.restore();
     }
 }
@@ -2073,6 +2127,7 @@ fn draw_path(
     context: &CanvasRenderingContext2d,
     path: &[(f64, f64)],
     provisional: bool,
+    palette: CanvasPalette,
 ) -> Result<(), JsValue> {
     let Some((start, rest)) = path.split_first() else {
         return Ok(());
@@ -2082,7 +2137,11 @@ fn draw_path(
     for point in rest {
         context.line_to(point.0, point.1);
     }
-    context.set_stroke_style_str(if provisional { "#666756" } else { "#a33a2b" });
+    context.set_stroke_style_str(if provisional {
+        palette.preview
+    } else {
+        palette.path
+    });
     context.set_line_width(if provisional { 1.5 } else { 2.5 });
     if provisional {
         context.set_line_dash(&js_sys::Array::of2(
@@ -2104,11 +2163,16 @@ fn draw_soldier(
     team: u8,
     alive: bool,
     active: bool,
+    palette: CanvasPalette,
 ) {
     let color = if alive {
-        if team % 2 == 0 { "#a33a2b" } else { "#d8a52b" }
+        if team % 2 == 0 {
+            palette.team_two
+        } else {
+            palette.team_one
+        }
     } else {
-        "#6d7168"
+        palette.dead
     };
     let radius = if active && alive { 7.0 } else { 5.0 };
     context.begin_path();
@@ -2119,7 +2183,7 @@ fn draw_soldier(
     }
     context.set_fill_style_str(color);
     context.fill();
-    context.set_stroke_style_str("#10251f");
+    context.set_stroke_style_str(palette.soldier_stroke);
     context.set_line_width(if active && alive { 2.5 } else { 1.5 });
     context.stroke();
     if !alive {
