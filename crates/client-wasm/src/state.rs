@@ -1,5 +1,5 @@
 use graphwar_protocol::{
-    GameMode, GameSnapshot, Phase, PlayerSnapshot, RoomSnapshot, ServerMessage,
+    GameMode, GameSnapshot, Phase, PlayerSnapshot, RoomSnapshot, RoomVisibility, ServerMessage,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -28,6 +28,7 @@ pub struct RoomSummary {
     pub name: String,
     pub players: u16,
     pub capacity: u16,
+    pub protected: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -185,16 +186,8 @@ pub fn reduce(model: &mut Model, action: Action) {
         Action::LeftRoom => leave_room(model),
         Action::Message(message) => match *message {
             ServerMessage::Hello { .. } => {}
-            ServerMessage::RoomCreated { snapshot, invite } => {
-                let room_id = snapshot.id;
-                if apply_room(model, snapshot)
-                    && let Some(invite) = invite
-                {
-                    model
-                        .notices
-                        .push(format!("Private room: {room_id} · invite: {invite}"));
-                    trim_notices(&mut model.notices);
-                }
+            ServerMessage::RoomCreated { snapshot, .. } => {
+                apply_room(model, snapshot);
             }
             ServerMessage::Room { snapshot } => {
                 apply_room(model, snapshot);
@@ -468,6 +461,7 @@ fn room_summary(room: &RoomSnapshot) -> RoomSummary {
         name: room.name.clone(),
         players: room.players.len().try_into().unwrap_or(u16::MAX),
         capacity: 10,
+        protected: room.visibility == RoomVisibility::Private,
     }
 }
 
@@ -588,6 +582,36 @@ mod tests {
         assert_eq!(model.screen, Screen::Room);
         assert_eq!(model.room_id.as_deref(), Some(room_id.to_string().as_str()));
         assert_eq!(model.players[0].name, "Ada");
+    }
+
+    #[test]
+    fn room_list_marks_private_rooms_as_protected() {
+        let room_id = Uuid::new_v4();
+        let mut model = Model::default();
+        reduce(
+            &mut model,
+            Action::Message(Box::new(ServerMessage::RoomList {
+                rooms: vec![RoomSnapshot {
+                    id: room_id,
+                    name: "Protected".into(),
+                    visibility: RoomVisibility::Private,
+                    phase: Phase::Lobby,
+                    revision: 0,
+                    mode: GameMode::Function,
+                    players: Vec::new(),
+                }],
+            })),
+        );
+        assert_eq!(
+            model.rooms,
+            [RoomSummary {
+                id: room_id.to_string(),
+                name: "Protected".into(),
+                players: 0,
+                capacity: 10,
+                protected: true,
+            }]
+        );
     }
 
     #[test]

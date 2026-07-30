@@ -10,9 +10,9 @@ use uuid::Uuid;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
-    AbortController, CanvasRenderingContext2d, CloseEvent, Document, ErrorEvent, Event,
-    HtmlCanvasElement, HtmlFormElement, HtmlInputElement, HtmlSelectElement, MessageEvent,
-    RequestCredentials, WebSocket, Window,
+    AbortController, CanvasRenderingContext2d, CloseEvent, Document, DragEvent, ErrorEvent, Event,
+    HtmlCanvasElement, HtmlDialogElement, HtmlFormElement, HtmlInputElement, HtmlSelectElement,
+    MessageEvent, RequestCredentials, WebSocket, Window,
 };
 
 const PRESERVED_INPUTS: &[&str] = &[
@@ -22,8 +22,7 @@ const PRESERVED_INPUTS: &[&str] = &[
     "register-email",
     "register-password",
     "room-name",
-    "private-room-id",
-    "invite-code",
+    "room-password",
     "function-input",
     "chat-input",
 ];
@@ -46,6 +45,7 @@ struct App {
     window: Window,
     document: Document,
     model: Model,
+    selected_team_player: Option<TeamMoveSelection>,
     socket: Option<WebSocket>,
     socket_handlers: Option<SocketHandlers>,
     connection_epoch: u64,
@@ -73,6 +73,12 @@ struct SocketHandlers {
 struct ShotAnimation {
     sequence: u64,
     started_at: f64,
+}
+
+#[derive(Clone, Copy)]
+struct TeamMoveSelection {
+    player_id: Uuid,
+    team: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -127,6 +133,7 @@ pub fn start() -> Result<(), JsValue> {
         window,
         document,
         model: Model::default(),
+        selected_team_player: None,
         socket: None,
         socket_handlers: None,
         connection_epoch: 0,
@@ -671,6 +678,20 @@ fn announce(app: &SharedApp, message: &str) {
 fn announce_server_message(app: &SharedApp, message: &ServerMessage) {
     let message = match message {
         ServerMessage::Chat { entry } => Some(format!("{}: {}", entry.display_name, entry.text)),
+        ServerMessage::Room { snapshot } => snapshot.players.iter().find_map(|player| {
+            app.borrow()
+                .model
+                .players
+                .iter()
+                .find(|current| current.id == player.id.to_string() && current.team != player.team)
+                .map(|_| {
+                    format!(
+                        "{} moved to {}",
+                        player.display_name,
+                        team_name(player.team)
+                    )
+                })
+        }),
         ServerMessage::GameStarted { snapshot, .. } => {
             Some(format!("Match started in {}", snapshot.name))
         }
@@ -765,6 +786,9 @@ fn redraw_scope(app: &SharedApp, previous_screen: Screen, scope: RenderScope) {
 
 fn rerender(app: &SharedApp) {
     let form_state = capture_form_state(app);
+    if app.borrow().model.screen != Screen::Room {
+        app.borrow_mut().selected_team_player = None;
+    }
     if let Err(error) = render(app) {
         log_error(&format!("render failed: {error:?}"));
         return;
@@ -858,8 +882,8 @@ fn refresh_room_dom(app: &SharedApp) -> Result<(), JsValue> {
         room_element(document, "#room-title")?.set_text_content(Some(&model.room_name));
         room_element(document, "#players-title span")?
             .set_text_content(Some(&model.players.len().to_string()));
-        room_element(document, ".roster ul")?.set_inner_html(&room_player_items_html(model));
-        room_element(document, ".chat-panel ul")?.set_inner_html(&chat_messages_html(model));
+        room_element(document, ".team-rosters")?.set_inner_html(&room_team_rosters_html(model));
+        room_element(document, ".room-chat ul")?.set_inner_html(&chat_messages_html(model));
 
         let owner = model.local_owner();
         set_boolean_attribute(&room_element(document, ".mode-picker")?, "disabled", !owner)?;
@@ -900,13 +924,15 @@ fn refresh_room_dom(app: &SharedApp) -> Result<(), JsValue> {
 
 fn refresh_chat_dom(app: &SharedApp) -> Result<(), JsValue> {
     let app_ref = app.borrow();
-    if !matches!(app_ref.model.screen, Screen::Room | Screen::Game) {
-        return Ok(());
-    }
+    let selector = match app_ref.model.screen {
+        Screen::Room => ".room-chat ul",
+        Screen::Game => ".game-chat ul",
+        Screen::Login | Screen::Lobby => return Ok(()),
+    };
     let list = app_ref
         .document
-        .query_selector(".chat-panel ul")?
-        .ok_or(".chat-panel ul missing")?;
+        .query_selector(selector)?
+        .ok_or_else(|| JsValue::from_str(&format!("{selector} missing")))?;
     list.set_inner_html(&chat_messages_html(&app_ref.model));
     Ok(())
 }
@@ -933,12 +959,12 @@ fn refresh_game_dom(app: &SharedApp) -> Result<(), JsValue> {
             return Err(JsValue::from_str("game screen unavailable"));
         }
 
-        game_element(document, "#turn-timer")?.set_text_content(Some(&timer_text(model)));
-        game_element(document, "#game-title")?.set_text_content(Some(&model.room_name));
-        game_element(document, ".scoreboard ul")?.set_inner_html(&scoreboard_rows_html(model));
+        let timer = timer_view(model);
+        game_element(document, "#turn-timer")?.set_text_content(Some(&timer.text));
+        refresh_soldier_name_labels(document, model)?;
         game_element(document, "#battlefield-summary")?
             .set_text_content(Some(&battlefield_summary(model)));
-        game_element(document, ".chat-panel ul")?.set_inner_html(&chat_messages_html(model));
+        game_element(document, ".game-chat ul")?.set_inner_html(&chat_messages_html(model));
 
         let local_turn = local_turn(model);
         let function_input =
@@ -958,11 +984,9 @@ fn refresh_game_dom(app: &SharedApp) -> Result<(), JsValue> {
             .set_disabled(!second_order || !local_turn);
         let fire_button = game_element(document, ".fire-button")?;
         set_boolean_attribute(&fire_button, "disabled", !local_turn)?;
-        game_element(document, ".fire-button span")?.set_text_content(Some(if local_turn {
-            "Fire"
-        } else {
-            "Waiting"
-        }));
+        set_turn_progress(&fire_button, timer.progress)?;
+        game_element(document, ".fire-button-label")?
+            .set_text_content(Some(&fire_label(model, local_turn)));
 
         start_preview.then_some(function_input)
     };
@@ -1066,6 +1090,11 @@ fn restore_form_state(app: &SharedApp, state: FormState) {
     {
         select.set_value(&value);
     }
+    let private = document
+        .get_element_by_id("room-visibility")
+        .and_then(|element| element.dyn_into::<HtmlSelectElement>().ok())
+        .is_some_and(|select| select.value() == "private");
+    set_create_room_password_visibility(&document, private);
     if let Some((selector, start, end, direction)) = state.focus
         && let Ok(Some(element)) = document.query_selector(&selector)
     {
@@ -1147,7 +1176,7 @@ fn login_html() -> String {
 
 fn lobby_html(model: &Model) -> String {
     format!(
-        "<section class=\"lobby-shell reveal\" aria-labelledby=\"lobby-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Welcome, {}</p><h1 id=\"lobby-title\">Open rooms</h1></div><div class=\"lobby-actions\"><form id=\"create-room-form\" class=\"inline-form command-slip\" aria-labelledby=\"create-room-title\"><strong id=\"create-room-title\" class=\"form-title\">Create room</strong><label class=\"sr-only\" for=\"room-name\">New room name</label><input id=\"room-name\" maxlength=\"32\" required placeholder=\"Room name\"><select id=\"room-visibility\" aria-label=\"Room visibility\"><option value=\"public\">Public</option><option value=\"private\">Private</option></select><button class=\"primary\" type=\"submit\">Create room</button></form><form id=\"invite-room-form\" class=\"inline-form command-slip\" aria-labelledby=\"join-private-title\"><strong id=\"join-private-title\" class=\"form-title\">Join private room</strong><label class=\"sr-only\" for=\"private-room-id\">Private room ID</label><input id=\"private-room-id\" required placeholder=\"Room ID\"><label class=\"sr-only\" for=\"invite-code\">Private invite code</label><input id=\"invite-code\" required placeholder=\"Invite code\"><button class=\"secondary\" type=\"submit\">Join private</button></form></div></div><ul class=\"room-list\">{}</ul></section>",
+        "<section class=\"lobby-shell reveal\" aria-labelledby=\"lobby-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Welcome, {}</p><h1 id=\"lobby-title\">Rooms</h1></div><div class=\"lobby-actions\"><button id=\"create-room-open\" class=\"primary\" type=\"button\" aria-haspopup=\"dialog\" aria-controls=\"create-room-dialog\">Create room</button></div></div><dialog id=\"create-room-dialog\" class=\"create-room-dialog\" aria-labelledby=\"create-room-title\"><form id=\"create-room-form\" class=\"command-slip\"><h2 id=\"create-room-title\">Create room</h2><label for=\"room-name\">Room name</label><input id=\"room-name\" maxlength=\"32\" required autocomplete=\"off\"><label for=\"room-visibility\">Room type</label><select id=\"room-visibility\"><option value=\"public\">Public</option><option value=\"private\">Private</option></select><div id=\"room-password-field\" hidden><label for=\"room-password\">Password</label><input id=\"room-password\" type=\"password\" autocomplete=\"new-password\" maxlength=\"1024\" disabled></div><div class=\"create-room-actions\"><button id=\"create-room-cancel\" class=\"secondary\" type=\"button\">Cancel</button><button class=\"primary\" type=\"submit\">Create room</button></div></form></dialog><ul class=\"room-list\">{}</ul></section>",
         escape(&model.player_name),
         lobby_room_items_html(model)
     )
@@ -1160,10 +1189,26 @@ fn lobby_room_items_html(model: &Model) -> String {
     model
         .rooms
         .iter()
-        .map(|room| format!(
-            "<li class=\"room-card\"><div><strong>{}</strong><span>{} / {} players</span></div><button class=\"join-room secondary\" data-room-id=\"{}\">Join <span aria-hidden=\"true\">→</span></button></li>",
-            escape(&room.name), room.players, room.capacity, attr(&room.id)
-        ))
+        .map(|room| {
+            let lock = room
+                .protected
+                .then_some("<span class=\"room-lock\"><svg aria-hidden=\"true\" viewBox=\"0 0 24 24\" width=\"18\" height=\"18\"><path d=\"M7 10V7a5 5 0 0 1 10 0v3m-11 0h12v10H6z\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg><span class=\"sr-only\">Protected room</span></span>")
+                .unwrap_or("");
+            let protected = if room.protected { "true" } else { "false" };
+            let join_label = if room.protected {
+                format!("Join protected room {}", room.name)
+            } else {
+                format!("Join room {}", room.name)
+            };
+            format!(
+                "<li class=\"room-card\"><div><span class=\"room-card-title\"><strong>{}</strong>{lock}</span><span>{} / {} players</span></div><button class=\"join-room secondary\" data-room-id=\"{}\" data-room-protected=\"{protected}\" aria-label=\"{}\">Join <span aria-hidden=\"true\">→</span></button></li>",
+                escape(&room.name),
+                room.players,
+                room.capacity,
+                attr(&room.id),
+                attr(&join_label),
+            )
+        })
         .collect()
 }
 
@@ -1178,66 +1223,92 @@ fn room_html(model: &Model) -> String {
     let mode = model.game_mode.unwrap_or(GameMode::Function);
     let mode_checked = |candidate| (mode == candidate).then_some(" checked").unwrap_or("");
     format!(
-        "<section class=\"room-shell reveal\" aria-labelledby=\"room-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Staging area</p><h1 id=\"room-title\">{}</h1></div><button id=\"leave-room\" class=\"text-button\">Leave room</button></div><div class=\"room-grid\"><section class=\"paper-card roster\" aria-labelledby=\"players-title\"><h2 id=\"players-title\">Players <span>{}</span></h2><ul>{}</ul></section><aside class=\"briefing paper-card command-brief\"><p>Configure your slot, then ready up. The owner starts after everyone commits.</p><fieldset class=\"mode-picker\"{}><legend>Rule set</legend><label><input type=\"radio\" name=\"game-mode\" value=\"function\"{}> Function</label><label><input type=\"radio\" name=\"game-mode\" value=\"first_order\"{}> First-order</label><label><input type=\"radio\" name=\"game-mode\" value=\"second_order\"{}> Second-order</label></fieldset><button id=\"ready-button\" class=\"primary wide\">{ready_label}</button><button id=\"add-bot\" class=\"text-button wide\"{}>Add computer</button><button id=\"start-game\" class=\"secondary wide\"{}>Start match</button></aside></div>{}</section>",
+        "<section class=\"room-shell reveal\" aria-labelledby=\"room-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Staging area</p><h1 id=\"room-title\">{}</h1></div><button id=\"leave-room\" class=\"text-button\">Leave room</button></div><div class=\"room-grid\"><section class=\"paper-card roster\" aria-labelledby=\"players-title\"><h2 id=\"players-title\">Players <span>{}</span></h2><div class=\"team-rosters\">{}</div><p id=\"roster-move-status\" class=\"sr-only\" aria-live=\"polite\"></p></section><aside class=\"briefing paper-card command-brief\"><p>Configure your slot, then ready up. The owner starts after everyone commits.</p><fieldset class=\"mode-picker\"{}><legend>Rule set</legend><label><input type=\"radio\" name=\"game-mode\" value=\"function\"{}> Function</label><label><input type=\"radio\" name=\"game-mode\" value=\"first_order\"{}> First-order</label><label><input type=\"radio\" name=\"game-mode\" value=\"second_order\"{}> Second-order</label></fieldset><button id=\"ready-button\" class=\"primary wide\">{ready_label}</button><button id=\"add-bot\" class=\"text-button wide\"{}>Add computer</button><button id=\"start-game\" class=\"secondary wide\"{}>Start match</button></aside></div></section>{}",
         escape(&model.room_name),
         model.players.len(),
-        room_player_items_html(model),
+        room_team_rosters_html(model),
         if owner_controls { "" } else { " disabled" },
         mode_checked(GameMode::Function),
         mode_checked(GameMode::FirstOrder),
         mode_checked(GameMode::SecondOrder),
         if owner_controls { "" } else { " disabled" },
         start_disabled,
-        chat_html(model)
+        chat_html(model, "room-chat")
     )
 }
 
-fn room_player_items_html(model: &Model) -> String {
-    let owner_controls = model.local_owner();
-    model
-        .players
-        .iter()
-        .map(|player| {
-            let local = model.player_id.as_deref() == Some(player.id.as_str());
-            let editable = local || (owner_controls && player.is_bot);
-            let controls = editable
-                .then(|| {
-                    format!(
-                        "<div class=\"slot-controls\"><label><span class=\"sr-only\">{} </span>Team <select class=\"player-team\" data-player-id=\"{}\"><option value=\"1\"{}>One</option><option value=\"2\"{}>Two</option></select></label><label><span class=\"sr-only\">{} </span>Soldiers <select class=\"player-soldiers\" data-player-id=\"{}\">{}</select></label>{}</div>",
-                        escape(&player.name),
-                        attr(&player.id),
-                        (player.team == 1).then_some(" selected").unwrap_or(""),
-                        (player.team == 2).then_some(" selected").unwrap_or(""),
-                        escape(&player.name),
-                        attr(&player.id),
-                        (1..=4)
-                            .map(|count| format!(
-                                "<option value=\"{count}\"{}>{count}</option>",
-                                (player.soldiers == count).then_some(" selected").unwrap_or("")
-                            ))
-                            .collect::<String>(),
-                        player
-                            .is_bot
-                            .then(|| format!(
-                                "<button class=\"remove-bot text-button\" data-player-id=\"{}\" aria-label=\"Remove {}\">Remove</button>",
-                                attr(&player.id),
-                                attr(&player.name)
-                            ))
-                            .unwrap_or_default()
-                    )
-                })
-                .unwrap_or_default();
+fn room_team_rosters_html(model: &Model) -> String {
+    [1, 2]
+        .into_iter()
+        .map(|team| {
+            let items = model
+                .players
+                .iter()
+                .filter(|player| player.team == team || (team == 2 && player.team != 1))
+                .map(|player| room_player_item_html(model, player))
+                .collect::<String>();
+            let empty = items
+                .is_empty()
+                .then_some("<p class=\"empty-team\">Waiting for players</p>")
+                .unwrap_or("");
             format!(
-                "<li class=\"player-slot\"><span class=\"team team-{}\" aria-hidden=\"true\"></span><strong>{}</strong><span class=\"team-name\">{}</span>{}<span class=\"ready-state\">{}</span>{}</li>",
-                player.team,
-                escape(&player.name),
-                team_name(player.team),
-                if player.owner { "<small>Owner</small>" } else if player.is_bot { "<small>Computer</small>" } else { "" },
-                if player.ready { "Ready" } else { "Plotting" },
-                controls
+                "<section class=\"team-roster team-roster-{team}\" data-team=\"{team}\" aria-labelledby=\"team-{team}-title\"><h3 id=\"team-{team}-title\">{}</h3><ul data-team=\"{team}\">{items}</ul>{empty}<button id=\"team-{team}-target\" type=\"button\" class=\"team-drop-target secondary\" data-team=\"{team}\" aria-disabled=\"true\">Move selected to {}</button></section>",
+                team_name(team),
+                team_name(team),
             )
         })
         .collect()
+}
+
+fn can_move_player(model: &Model, player: &crate::state::PlayerSummary) -> bool {
+    model.local_owner() || model.player_id.as_deref() == Some(player.id.as_str())
+}
+
+fn room_player_item_html(model: &Model, player: &crate::state::PlayerSummary) -> String {
+    let owner_controls = model.local_owner();
+    let local = model.player_id.as_deref() == Some(player.id.as_str());
+    let movable = can_move_player(model, player);
+    let draggable = movable.then_some(" draggable=\"true\"").unwrap_or("");
+    let move_control = movable
+        .then(|| {
+            format!(
+                "<button type=\"button\" class=\"select-player text-button\" data-player-id=\"{}\" data-player-team=\"{}\" aria-label=\"Select {} to move teams\" aria-pressed=\"false\">Move</button>",
+                attr(&player.id),
+                player.team,
+                attr(&player.name),
+            )
+        })
+        .unwrap_or_default();
+    let disabled = (!(local || (owner_controls && player.is_bot)))
+        .then_some(" disabled")
+        .unwrap_or("");
+    let remove = (owner_controls && !local)
+        .then(|| {
+            format!(
+                "<button type=\"button\" class=\"remove-player\" data-player-id=\"{}\" data-is-bot=\"{}\" aria-label=\"Remove {} from room\">x</button>",
+                attr(&player.id),
+                player.is_bot,
+                attr(&player.name),
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "<li class=\"player-slot\" data-player-id=\"{}\" data-player-team=\"{}\"{draggable}><strong>{}</strong><div class=\"player-controls\">{move_control}<label><span class=\"sr-only\">{} soldiers</span><select class=\"player-soldiers\" data-player-id=\"{}\"{}>{}</select></label>{remove}</div></li>",
+        attr(&player.id),
+        player.team,
+        escape(&player.name),
+        escape(&player.name),
+        attr(&player.id),
+        disabled,
+        (1..=4)
+            .map(|count| format!(
+                "<option value=\"{count}\"{}>{count}</option>",
+                (player.soldiers == count)
+                    .then_some(" selected")
+                    .unwrap_or("")
+            ))
+            .collect::<String>(),
+    )
 }
 
 fn game_html(model: &Model) -> String {
@@ -1246,12 +1317,12 @@ fn game_html(model: &Model) -> String {
     let second_order = model.game_mode == Some(GameMode::SecondOrder);
     let angle_hidden = (!second_order).then_some(" hidden").unwrap_or("");
     let angle_disabled = (!second_order).then_some(" disabled").unwrap_or(disabled);
+    let timer = timer_view(model);
+    let fire_label = fire_label(model, local_turn);
     format!(
-        "<section class=\"game-shell reveal\" aria-labelledby=\"game-title\"><div class=\"game-heading\"><div><p class=\"eyebrow\">Live match · <span id=\"turn-timer\" role=\"timer\">{}</span></p><h1 id=\"game-title\">{}</h1></div><button id=\"leave-room\" class=\"text-button\">Retreat</button></div><div class=\"war-room\"><section class=\"map-panel field-map\" aria-labelledby=\"battlefield-label\"><div class=\"map-heading\"><p class=\"eyebrow\">Coordinate field / 01</p><h2 id=\"battlefield-label\">Battlefield</h2></div><div class=\"battlefield\"><canvas id=\"game-canvas\" width=\"770\" height=\"450\" aria-label=\"Graphwar battlefield\" aria-describedby=\"battlefield-summary\"></canvas><div class=\"preview-key\"><i></i> Provisional</div><div class=\"axis-label x-label\">x</div><div class=\"axis-label y-label\">y</div></div><p id=\"battlefield-summary\" class=\"sr-only\">{}</p></section><aside class=\"command-stack\" aria-label=\"Command stack\">{}<section class=\"paper-card function-panel\" aria-labelledby=\"function-panel-title\"><h2 id=\"function-panel-title\">Function</h2><form id=\"fire-form\" class=\"fire-console\"><div class=\"equation-field\"><label for=\"function-input\">Function</label><div><span aria-hidden=\"true\">y =</span><input id=\"function-input\" spellcheck=\"false\" autocomplete=\"off\" maxlength=\"256\" required value=\"{}\" aria-describedby=\"function-hint function-error\"{disabled}></div><small id=\"function-hint\">Use x, sin, cos, tan, sqrt and standard operators.</small><p id=\"function-error\" class=\"function-error\" aria-live=\"polite\"></p></div><div class=\"angle-field\"{angle_hidden}><div class=\"angle-label\"><label for=\"angle-input\">Launch angle</label><output id=\"angle-output\" for=\"angle-input\">{:.1}°</output></div><input id=\"angle-input\" type=\"range\" min=\"-90\" max=\"90\" value=\"{:.1}\" step=\"0.1\" aria-describedby=\"angle-hint angle-output\"{angle_disabled}><small id=\"angle-hint\">Focus the slider, then use Arrow Up/Down.</small></div><button class=\"fire-button\" type=\"submit\"{disabled}><span>{}</span><small>Enter ↵</small></button></form></section>{}</aside></div></section>",
-        timer_text(model),
-        escape(&model.room_name),
+        "<section class=\"game-shell reveal\" aria-label=\"Active match\"><div class=\"war-room\"><section class=\"map-panel field-map\" aria-labelledby=\"battlefield-label\"><div class=\"map-heading\"><div><p class=\"eyebrow\">Coordinate field / 01</p><h2 id=\"battlefield-label\">Battlefield</h2></div><button id=\"leave-room\" class=\"text-button\">Retreat</button></div><div class=\"battlefield\"><canvas id=\"game-canvas\" width=\"770\" height=\"450\" aria-label=\"Graphwar battlefield\" aria-describedby=\"battlefield-summary\"></canvas>{}<div class=\"preview-key\"><i></i> Provisional</div><div class=\"axis-label x-label\">x</div><div class=\"axis-label y-label\">y</div></div><p id=\"battlefield-summary\" class=\"sr-only\">{}</p></section><aside class=\"command-stack\" aria-label=\"Command stack\"><section class=\"paper-card function-panel\" aria-labelledby=\"function-panel-title\"><h2 id=\"function-panel-title\">Function</h2><form id=\"fire-form\" class=\"fire-console\"><div class=\"equation-field\"><label for=\"function-input\">Function</label><div><span aria-hidden=\"true\">y =</span><input id=\"function-input\" spellcheck=\"false\" autocomplete=\"off\" maxlength=\"256\" required value=\"{}\" aria-describedby=\"function-hint function-error\"{disabled}></div><small id=\"function-hint\">Use x, sin, cos, tan, sqrt and standard operators.</small><p id=\"function-error\" class=\"function-error\" aria-live=\"polite\"></p></div><div class=\"angle-field\"{angle_hidden}><div class=\"angle-label\"><label for=\"angle-input\">Launch angle</label><output id=\"angle-output\" for=\"angle-input\">{:.1}°</output></div><input id=\"angle-input\" type=\"range\" min=\"-90\" max=\"90\" value=\"{:.1}\" step=\"0.1\" aria-describedby=\"angle-hint angle-output\"{angle_disabled}><small id=\"angle-hint\">Focus the slider, then use Arrow Up/Down.</small></div><button class=\"fire-button\" type=\"submit\" style=\"--turn-progress: {}%;\" aria-describedby=\"turn-timer\"{disabled}><span class=\"fire-button-label\">{}</span><span id=\"turn-timer\" class=\"fire-button-timer\" role=\"timer\">{}</span><small>Enter ↵</small></button></form></section>{}</aside></div></section>",
+        soldier_name_labels_html(model),
         escape(&battlefield_summary(model)),
-        scoreboard_html(model),
         escape(if model.draft_function.is_empty() {
             "sin(x)"
         } else {
@@ -1259,66 +1330,60 @@ fn game_html(model: &Model) -> String {
         }),
         model.aim_angle_deg,
         model.aim_angle_deg,
-        if local_turn { "Fire" } else { "Waiting" },
-        chat_html(model)
+        timer.progress,
+        escape(&fire_label),
+        escape(&timer.text),
+        chat_html(model, "game-chat")
     )
 }
 
-fn scoreboard_html(model: &Model) -> String {
-    format!(
-        "<section class=\"scoreboard paper-card\" aria-label=\"Match scoreboard\"><h2>Field report</h2><ul>{}</ul></section>",
-        scoreboard_rows_html(model)
-    )
+// ponytail: mirror the fixed server turn duration until protocol snapshots expose it.
+const TURN_DURATION_SECONDS: i64 = 60;
+
+struct TimerView {
+    text: String,
+    progress: u8,
 }
 
-fn scoreboard_rows_html(model: &Model) -> String {
-    model
-        .players
-        .iter()
-        .map(|player| {
-            let alive = model
-                .soldiers
-                .iter()
-                .filter(|soldier| soldier.player_id == player.id && soldier.alive)
-                .count();
-            let turn = (model.turn_player_id.as_deref() == Some(player.id.as_str()))
-                .then_some("<span class=\"turn-mark\">Turn</span>")
-                .unwrap_or("");
-            format!(
-                "<li><span class=\"team team-{}\" aria-hidden=\"true\"></span><strong>{}</strong><span class=\"team-name\">{}</span><span>{alive} / {}</span>{turn}</li>",
-                player.team,
-                escape(&player.name),
-                team_name(player.team),
-                player.soldiers
-            )
-        })
-        .collect()
-}
-
-fn local_turn(model: &Model) -> bool {
-    model.room_phase == Some(graphwar_protocol::Phase::Planning)
-        && model
-            .turn_deadline_at
-            .is_some_and(|deadline| deadline > unix_time())
-        && model.player_id == model.turn_player_id
-}
-
-fn unix_time() -> i64 {
-    (js_sys::Date::now() / 1_000.0) as i64
-}
-
-fn timer_text(model: &Model) -> String {
+fn timer_view(model: &Model) -> TimerView {
     match model.room_phase {
-        Some(graphwar_protocol::Phase::Resolving) => "Resolving shot".into(),
-        Some(graphwar_protocol::Phase::Finished) => "Match finished".into(),
+        Some(Phase::Resolving) => TimerView {
+            text: "Resolving shot".into(),
+            progress: 0,
+        },
+        Some(Phase::Finished) => TimerView {
+            text: "Match finished".into(),
+            progress: 0,
+        },
         _ => model.turn_deadline_at.map_or_else(
-            || "Waiting".into(),
+            || TimerView {
+                text: "Waiting".into(),
+                progress: 0,
+            },
             |deadline| {
-                let remaining = deadline.saturating_sub(unix_time());
-                format!("{}:{:02}", remaining / 60, remaining % 60)
+                let remaining = deadline
+                    .saturating_sub(unix_time())
+                    .clamp(0, TURN_DURATION_SECONDS);
+                TimerView {
+                    text: format!("{remaining}s"),
+                    progress: ((remaining * 100) / TURN_DURATION_SECONDS) as u8,
+                }
             },
         ),
     }
+}
+
+fn fire_label(model: &Model, local_turn: bool) -> String {
+    match model.room_phase {
+        Some(Phase::Resolving) => "Resolving".into(),
+        Some(Phase::Finished) => "Finished".into(),
+        _ if local_turn => "Fire".into(),
+        _ => "Waiting".into(),
+    }
+}
+
+fn set_turn_progress(element: &web_sys::Element, progress: u8) -> Result<(), JsValue> {
+    element.set_attribute("style", &format!("--turn-progress: {progress}%;"))
 }
 
 fn update_timer(app: &SharedApp) {
@@ -1326,7 +1391,7 @@ fn update_timer(app: &SharedApp) {
         let mut app_ref = app.borrow_mut();
         let deadline = app_ref.model.turn_deadline_at;
         let expired = app_ref.model.screen == Screen::Game
-            && app_ref.model.room_phase == Some(graphwar_protocol::Phase::Planning)
+            && app_ref.model.room_phase == Some(Phase::Planning)
             && deadline.is_some_and(|deadline| deadline <= unix_time());
         if expired && app_ref.expired_deadline != deadline {
             app_ref.expired_deadline = deadline;
@@ -1347,11 +1412,72 @@ fn update_timer(app: &SharedApp) {
         if app_ref.model.screen != Screen::Game {
             return;
         }
-        (app_ref.document.clone(), timer_text(&app_ref.model))
+        (app_ref.document.clone(), timer_view(&app_ref.model))
     };
     if let Some(timer_element) = document.get_element_by_id("turn-timer") {
-        timer_element.set_text_content(Some(&timer));
+        timer_element.set_text_content(Some(&timer.text));
     }
+    if let Some(fire_button) = document.query_selector(".fire-button").ok().flatten() {
+        if let Err(error) = set_turn_progress(&fire_button, timer.progress) {
+            log_error(&format!("timer progress update failed: {error:?}"));
+        }
+    }
+}
+
+fn refresh_soldier_name_labels(document: &Document, model: &Model) -> Result<(), JsValue> {
+    game_element(document, ".soldier-name-labels")?
+        .set_inner_html(&soldier_name_label_items_html(model));
+    Ok(())
+}
+
+fn soldier_name_labels_html(model: &Model) -> String {
+    format!(
+        "<div class=\"soldier-name-labels\" aria-hidden=\"true\">{}</div>",
+        soldier_name_label_items_html(model)
+    )
+}
+
+fn soldier_name_label_items_html(model: &Model) -> String {
+    let turn_player_id = matches!(model.room_phase, Some(Phase::Planning | Phase::Resolving))
+        .then(|| model.turn_player_id.as_deref())
+        .flatten();
+    model
+        .soldiers
+        .iter()
+        .filter(|soldier| soldier.alive)
+        .filter_map(|soldier| {
+            let name = model
+                .players
+                .iter()
+                .find(|player| player.id == soldier.player_id)?
+                .name
+                .as_str();
+            let active = soldier.active && Some(soldier.player_id.as_str()) == turn_player_id;
+            let class = active
+                .then_some("soldier-name-label is-active")
+                .unwrap_or("soldier-name-label");
+            let x = (soldier.x * 100.0 / LOGICAL_WIDTH).clamp(0.0, 100.0);
+            let y = (soldier.y * 100.0 / LOGICAL_HEIGHT).clamp(0.0, 100.0);
+            Some(format!(
+                "<span class=\"{class}\" data-player-id=\"{}\" data-soldier-index=\"{}\" style=\"--soldier-x: {x:.3}%; --soldier-y: {y:.3}%;\">{}</span>",
+                attr(&soldier.player_id),
+                soldier.index,
+                escape(name),
+            ))
+        })
+        .collect()
+}
+
+fn local_turn(model: &Model) -> bool {
+    model.room_phase == Some(graphwar_protocol::Phase::Planning)
+        && model
+            .turn_deadline_at
+            .is_some_and(|deadline| deadline > unix_time())
+        && model.player_id == model.turn_player_id
+}
+
+fn unix_time() -> i64 {
+    (js_sys::Date::now() / 1_000.0) as i64
 }
 
 fn bind_viewport_events(app: &SharedApp) -> Result<(), JsValue> {
@@ -1420,9 +1546,9 @@ fn battlefield_summary(model: &Model) -> String {
     )
 }
 
-fn chat_html(model: &Model) -> String {
+fn chat_html(model: &Model, class_name: &str) -> String {
     format!(
-        "<section class=\"paper-card chat-panel field-log\" aria-labelledby=\"chat-title\"><h2 id=\"chat-title\">Room chat</h2><ul>{}</ul><form id=\"chat-form\" class=\"inline-form\"><label class=\"sr-only\" for=\"chat-input\">Message</label><input id=\"chat-input\" maxlength=\"500\" autocomplete=\"off\" required placeholder=\"Message the room\"><button class=\"secondary\" type=\"submit\">Send</button></form></section>",
+        "<section class=\"paper-card chat-panel {class_name} field-log\" aria-labelledby=\"chat-title\"><h2 id=\"chat-title\">Room chat</h2><ul>{}</ul><form id=\"chat-form\" class=\"inline-form\"><label class=\"sr-only\" for=\"chat-input\">Message</label><input id=\"chat-input\" maxlength=\"500\" autocomplete=\"off\" required placeholder=\"Message the room\"><button class=\"secondary\" type=\"submit\">Send</button></form></section>",
         chat_messages_html(model)
     )
 }
@@ -1441,7 +1567,7 @@ fn chat_messages_html(model: &Model) -> String {
         .iter()
         .map(|entry| match entry {
             FeedEntry::Chat(message) => format!(
-                "<li class=\"chat-message\" data-sequence=\"{}\"><strong>{}</strong><span>{}</span></li>",
+                "<li class=\"chat-message\" data-sequence=\"{}\"><strong>{}:</strong> <span>{}</span></li>",
                 message.sequence,
                 escape(&message.display_name),
                 escape(&message.text)
@@ -1451,7 +1577,7 @@ fn chat_messages_html(model: &Model) -> String {
                     .then(|| format!("<span>{:.1}°</span>", entry.angle_deg))
                     .unwrap_or_default();
                 format!(
-                    "<li class=\"shot-entry\" data-sequence=\"{}\"><strong><span class=\"team team-{}\" aria-hidden=\"true\"></span>{}</strong><small>Accepted function</small><code>{}</code>{}</li>",
+                    "<li class=\"shot-entry\" data-sequence=\"{}\"><strong><span class=\"team team-{}\" aria-hidden=\"true\"></span>{}</strong><code>{}</code>{}</li>",
                     entry.sequence,
                     entry.team,
                     escape(&entry.display_name),
@@ -1471,24 +1597,12 @@ fn notices_html(model: &Model) -> String {
 }
 
 fn notice_items_html(model: &Model) -> String {
-    // ponytail: text identifies private invites until notices gain typed variants.
-    let invite = model
+    model
         .notices
         .iter()
         .rev()
-        .find(|notice| notice.starts_with("Private room:"));
-    invite
-        .into_iter()
-        .map(|notice| format!("<li class=\"invite-notice\">{}</li>", escape(notice)))
-        .chain(
-            model
-                .notices
-                .iter()
-                .rev()
-                .filter(|notice| !notice.starts_with("Private room:"))
-                .take(3usize.saturating_sub(invite.is_some() as usize))
-                .map(|notice| format!("<li>{}</li>", escape(notice))),
-        )
+        .take(3)
+        .map(|notice| format!("<li>{}</li>", escape(notice)))
         .collect()
 }
 
@@ -1541,6 +1655,56 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
             );
         });
     }
+    if let Some(button) = document.get_element_by_id("create-room-open")
+        && let Some(dialog) = document
+            .get_element_by_id("create-room-dialog")
+            .and_then(|element| element.dyn_into::<HtmlDialogElement>().ok())
+    {
+        let dialog_for_open = dialog.clone();
+        let document_for_open = document.clone();
+        bind_click(app, &button, move || {
+            if dialog_for_open.show_modal().is_ok()
+                && let Some(input) = document_for_open
+                    .get_element_by_id("room-name")
+                    .and_then(|element| element.dyn_into::<HtmlInputElement>().ok())
+            {
+                let _ = input.focus();
+            }
+        });
+        let document_for_close = document.clone();
+        let closure = Closure::<dyn FnMut(Event)>::new(move |_| {
+            if let Some(button) = document_for_close
+                .get_element_by_id("create-room-open")
+                .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
+            {
+                let _ = button.focus();
+            }
+        });
+        dialog.add_event_listener_with_callback("close", closure.as_ref().unchecked_ref())?;
+        retain_event_handler(app, closure);
+    }
+    if let Some(button) = document.get_element_by_id("create-room-cancel")
+        && let Some(dialog) = document
+            .get_element_by_id("create-room-dialog")
+            .and_then(|element| element.dyn_into::<HtmlDialogElement>().ok())
+    {
+        bind_click(app, &button, move || dialog.close());
+    }
+    if let Some(select) = document
+        .get_element_by_id("room-visibility")
+        .and_then(|element| element.dyn_into::<HtmlSelectElement>().ok())
+    {
+        let bound_select = select.clone();
+        let visibility_document = document.clone();
+        let closure = Closure::<dyn FnMut(Event)>::new(move |_| {
+            set_create_room_password_visibility(
+                &visibility_document,
+                bound_select.value() == "private",
+            );
+        });
+        select.add_event_listener_with_callback("change", closure.as_ref().unchecked_ref())?;
+        retain_event_handler(app, closure);
+    }
     if let Some(form) = document.get_element_by_id("create-room-form") {
         let app = Rc::clone(app);
         bind_submit(&app.clone(), form.unchecked_into(), move |form| {
@@ -1553,29 +1717,24 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
                     .is_some_and(|input| input.value() == "private")
                     .then_some(RoomVisibility::Private)
                     .unwrap_or(RoomVisibility::Public);
-                send(&app, ClientMessage::CreateRoom { name, visibility });
+                let password = if visibility == RoomVisibility::Private {
+                    let Some(password) = password_value(&form, "room-password") else {
+                        notice(&app, "Private room password is required".into());
+                        return;
+                    };
+                    Some(password)
+                } else {
+                    None
+                };
+                send(
+                    &app,
+                    ClientMessage::CreateRoom {
+                        name,
+                        visibility,
+                        password,
+                    },
+                );
             }
-        });
-    }
-    if let Some(form) = document.get_element_by_id("invite-room-form") {
-        let app = Rc::clone(app);
-        bind_submit(&app.clone(), form.unchecked_into(), move |form| {
-            let Some(room_id) =
-                input_value(&form, "private-room-id").and_then(|id| Uuid::parse_str(&id).ok())
-            else {
-                notice(&app, "Invalid private room ID".into());
-                return;
-            };
-            let Some(invite) = input_value(&form, "invite-code") else {
-                return;
-            };
-            send(
-                &app,
-                ClientMessage::JoinRoom {
-                    room_id,
-                    invite: Some(invite),
-                },
-            );
         });
     }
     bind_lobby_room_events(app, &document)?;
@@ -1724,71 +1883,339 @@ fn bind_lobby_room_events(app: &SharedApp, document: &Document) -> Result<(), Js
         };
         let element = element.unchecked_into::<web_sys::Element>();
         let room_id = element.get_attribute("data-room-id").unwrap_or_default();
+        let protected = element
+            .get_attribute("data-room-protected")
+            .is_some_and(|value| value == "true");
         let event_app = Rc::clone(app);
-        bind_dynamic_click(app, &element, move || match Uuid::parse_str(&room_id) {
-            Ok(room_id) => send(
-                &event_app,
-                ClientMessage::JoinRoom {
-                    room_id,
-                    invite: None,
-                },
-            ),
-            Err(_) => log_error("invalid room ID"),
+        bind_dynamic_click(app, &element, move || {
+            let Ok(room_id) = Uuid::parse_str(&room_id) else {
+                log_error("invalid room ID");
+                return;
+            };
+            let invite = if protected {
+                let window = event_app.borrow().window.clone();
+                match window.prompt_with_message("Room password") {
+                    Ok(Some(password)) if !password.is_empty() => Some(password),
+                    Ok(Some(_)) => {
+                        notice(&event_app, "Room password is required".into());
+                        return;
+                    }
+                    Ok(None) => return,
+                    Err(_) => return,
+                }
+            } else {
+                None
+            };
+            send(&event_app, ClientMessage::JoinRoom { room_id, invite });
         });
     }
     Ok(())
 }
 
 fn bind_room_roster_events(app: &SharedApp, document: &Document) -> Result<(), JsValue> {
-    let bot_buttons = document.query_selector_all(".remove-bot")?;
-    for index in 0..bot_buttons.length() {
-        let Some(element) = bot_buttons.item(index) else {
+    if app.borrow_mut().selected_team_player.take().is_some()
+        && let Some(status) = document.get_element_by_id("roster-move-status")
+    {
+        status.set_text_content(Some("Roster updated. Select a player to move teams."));
+    }
+    let inputs = document.query_selector_all(".player-soldiers")?;
+    for index in 0..inputs.length() {
+        let Some(element) = inputs.item(index) else {
+            continue;
+        };
+        let element = element.unchecked_into::<HtmlSelectElement>();
+        let player_id = element.get_attribute("data-player-id").unwrap_or_default();
+        let event_app = Rc::clone(app);
+        bind_dynamic_select_change(app, &element, move |input| {
+            let Ok(player_id) = Uuid::parse_str(&player_id) else {
+                return;
+            };
+            let soldiers = input.value().parse::<u8>().unwrap_or_default();
+            send(
+                &event_app,
+                ClientMessage::SetSoldiers {
+                    player_id,
+                    soldiers,
+                },
+            );
+        })?;
+    }
+    let select_buttons = document.query_selector_all(".select-player")?;
+    for index in 0..select_buttons.length() {
+        let Some(element) = select_buttons.item(index) else {
             continue;
         };
         let element = element.unchecked_into::<web_sys::Element>();
         let player_id = element.get_attribute("data-player-id").unwrap_or_default();
+        let team = element
+            .get_attribute("data-player-team")
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or_default();
+        let name = element
+            .get_attribute("aria-label")
+            .unwrap_or_else(|| "Player".into())
+            .trim_start_matches("Select ")
+            .trim_end_matches(" to move teams")
+            .to_owned();
         let event_app = Rc::clone(app);
         bind_dynamic_click(app, &element, move || {
-            if let Ok(player_id) = Uuid::parse_str(&player_id) {
-                send(&event_app, ClientMessage::RemoveBot { player_id });
+            let Ok(player_id) = Uuid::parse_str(&player_id) else {
+                return;
+            };
+            select_team_player(&event_app, player_id, team, &name);
+        });
+    }
+
+    let targets = document.query_selector_all(".team-drop-target")?;
+    for index in 0..targets.length() {
+        let Some(element) = targets.item(index) else {
+            continue;
+        };
+        let element = element.unchecked_into::<web_sys::Element>();
+        let team = element
+            .get_attribute("data-team")
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or_default();
+        let event_app = Rc::clone(app);
+        bind_dynamic_click(app, &element, move || send_selected_team(&event_app, team));
+    }
+
+    let cards = document.query_selector_all(".player-slot[draggable=\"true\"]")?;
+    for index in 0..cards.length() {
+        let Some(element) = cards.item(index) else {
+            continue;
+        };
+        let element = element.unchecked_into::<web_sys::Element>();
+        let player_id = element.get_attribute("data-player-id").unwrap_or_default();
+        let team = element
+            .get_attribute("data-player-team")
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or_default();
+        let name = element
+            .query_selector("strong")?
+            .and_then(|node| node.text_content())
+            .unwrap_or_else(|| "Player".into());
+        let drag_app = Rc::clone(app);
+        let drag_id = player_id.clone();
+        let drag_name = name.clone();
+        bind_dynamic_event(app, &element, "dragstart", move |event| {
+            let Ok(player_id) = Uuid::parse_str(&drag_id) else {
+                return;
+            };
+            if let Ok(Some(data)) = event
+                .dyn_into::<DragEvent>()
+                .map(|event| event.data_transfer())
+            {
+                let _ = data.set_data("text/plain", &drag_id);
+                data.set_effect_allowed("move");
+            }
+            select_team_player(&drag_app, player_id, team, &drag_name);
+            if let Some(card) = drag_app
+                .borrow()
+                .document
+                .query_selector(&format!(
+                    ".player-slot[data-player-id=\"{}\"]",
+                    attr(&drag_id)
+                ))
+                .ok()
+                .flatten()
+            {
+                let _ = card.set_attribute("data-dragging", "true");
+            }
+        });
+        let end_app = Rc::clone(app);
+        bind_dynamic_event(app, &element, "dragend", move |_| {
+            clear_roster_drag_state(&end_app);
+        });
+    }
+
+    let rosters = document.query_selector_all(".team-roster")?;
+    for index in 0..rosters.length() {
+        let Some(element) = rosters.item(index) else {
+            continue;
+        };
+        let element = element.unchecked_into::<web_sys::Element>();
+        let team = element
+            .get_attribute("data-team")
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or_default();
+        let over_element = element.clone();
+        let over_app = Rc::clone(app);
+        bind_dynamic_event(app, &element, "dragover", move |event| {
+            let Some(selection) = over_app.borrow().selected_team_player else {
+                return;
+            };
+            if selection.team == team {
+                return;
+            }
+            event.prevent_default();
+            let _ = over_element.set_attribute("data-drop-active", "true");
+        });
+        let leave_element = element.clone();
+        bind_dynamic_event(app, &element, "dragleave", move |_| {
+            let _ = leave_element.remove_attribute("data-drop-active");
+        });
+        let drop_element = element.clone();
+        let drop_app = Rc::clone(app);
+        bind_dynamic_event(app, &element, "drop", move |event| {
+            event.prevent_default();
+            let _ = drop_element.remove_attribute("data-drop-active");
+            let player_id = event
+                .dyn_into::<DragEvent>()
+                .ok()
+                .and_then(|event| event.data_transfer())
+                .and_then(|data| data.get_data("text/plain").ok())
+                .and_then(|value| Uuid::parse_str(&value).ok());
+            if let Some(player_id) = player_id {
+                send_team_change(&drop_app, player_id, team);
+            } else {
+                send_selected_team(&drop_app, team);
             }
         });
     }
-    for selector in [".player-team", ".player-soldiers"] {
-        let inputs = document.query_selector_all(selector)?;
-        for index in 0..inputs.length() {
-            let Some(element) = inputs.item(index) else {
-                continue;
+
+    let buttons = document.query_selector_all(".remove-player")?;
+    for index in 0..buttons.length() {
+        let Some(element) = buttons.item(index) else {
+            continue;
+        };
+        let element = element.unchecked_into::<web_sys::Element>();
+        let player_id = element.get_attribute("data-player-id").unwrap_or_default();
+        let is_bot = element.get_attribute("data-is-bot").as_deref() == Some("true");
+        let event_app = Rc::clone(app);
+        bind_dynamic_click(app, &element, move || {
+            let Ok(player_id) = Uuid::parse_str(&player_id) else {
+                return;
             };
-            let element = element.unchecked_into::<HtmlSelectElement>();
-            let player_id = element.get_attribute("data-player-id").unwrap_or_default();
-            let event_app = Rc::clone(app);
-            bind_dynamic_select_change(app, &element, move |input| {
-                let Ok(player_id) = Uuid::parse_str(&player_id) else {
-                    return;
-                };
-                let value = input.value().parse::<u8>().unwrap_or_default();
-                if selector == ".player-team" {
-                    send(
-                        &event_app,
-                        ClientMessage::SetTeam {
-                            player_id,
-                            team: value,
-                        },
-                    );
+            send(
+                &event_app,
+                if is_bot {
+                    ClientMessage::RemoveBot { player_id }
                 } else {
-                    send(
-                        &event_app,
-                        ClientMessage::SetSoldiers {
-                            player_id,
-                            soldiers: value,
-                        },
-                    );
-                }
-            })?;
-        }
+                    ClientMessage::KickPlayer { player_id }
+                },
+            );
+        });
     }
     Ok(())
+}
+
+fn bind_dynamic_event(
+    app: &SharedApp,
+    element: &web_sys::Element,
+    event_name: &str,
+    mut handler: impl FnMut(Event) + 'static,
+) {
+    let closure = Closure::<dyn FnMut(Event)>::new(move |event| handler(event));
+    let _ = element.add_event_listener_with_callback(event_name, closure.as_ref().unchecked_ref());
+    retain_dynamic_event_handler(app, closure);
+}
+
+fn select_team_player(app: &SharedApp, player_id: Uuid, team: u8, name: &str) {
+    {
+        let mut app_ref = app.borrow_mut();
+        app_ref.selected_team_player = Some(TeamMoveSelection { player_id, team });
+        let player_id = player_id.to_string();
+        if let Ok(buttons) = app_ref.document.query_selector_all(".select-player") {
+            for index in 0..buttons.length() {
+                if let Some(button) = buttons
+                    .item(index)
+                    .and_then(|button| button.dyn_into::<web_sys::Element>().ok())
+                {
+                    let selected = button.get_attribute("data-player-id").as_deref()
+                        == Some(player_id.as_str());
+                    let _ = button
+                        .set_attribute("aria-pressed", if selected { "true" } else { "false" });
+                }
+            }
+        }
+        if let Ok(cards) = app_ref.document.query_selector_all(".player-slot") {
+            for index in 0..cards.length() {
+                if let Some(card) = cards
+                    .item(index)
+                    .and_then(|card| card.dyn_into::<web_sys::Element>().ok())
+                {
+                    let selected =
+                        card.get_attribute("data-player-id").as_deref() == Some(player_id.as_str());
+                    if selected {
+                        let _ = card.set_attribute("data-selected", "true");
+                    } else {
+                        let _ = card.remove_attribute("data-selected");
+                    }
+                }
+            }
+        }
+        if let Ok(targets) = app_ref.document.query_selector_all(".team-drop-target") {
+            for index in 0..targets.length() {
+                if let Some(target) = targets
+                    .item(index)
+                    .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+                {
+                    let target_team = target
+                        .get_attribute("data-team")
+                        .and_then(|value| value.parse::<u8>().ok());
+                    let enabled = target_team.is_some_and(|target_team| target_team != team);
+                    let _ = target
+                        .set_attribute("aria-disabled", if enabled { "false" } else { "true" });
+                }
+            }
+        }
+        if let Some(status) = app_ref.document.get_element_by_id("roster-move-status") {
+            status.set_text_content(Some(&format!("{name} selected. Choose a target team.")));
+        }
+    }
+}
+
+fn send_selected_team(app: &SharedApp, target_team: u8) {
+    let selection = app.borrow().selected_team_player;
+    let Some(selection) = selection else {
+        announce(app, "Select a player before choosing a team");
+        return;
+    };
+    send_team_change(app, selection.player_id, target_team);
+}
+
+fn send_team_change(app: &SharedApp, player_id: Uuid, target_team: u8) {
+    let current_team = app
+        .borrow()
+        .model
+        .players
+        .iter()
+        .find(|player| player.id == player_id.to_string())
+        .map(|player| player.team);
+    let Some(current_team) = current_team else {
+        return;
+    };
+    if current_team == target_team {
+        announce(app, "Player is already on that team");
+        return;
+    }
+    app.borrow_mut().selected_team_player = None;
+    send(
+        app,
+        ClientMessage::SetTeam {
+            player_id,
+            team: target_team,
+        },
+    );
+}
+
+fn clear_roster_drag_state(app: &SharedApp) {
+    if let Ok(elements) = app
+        .borrow()
+        .document
+        .query_selector_all(".player-slot[data-dragging], .team-roster[data-drop-active]")
+    {
+        for index in 0..elements.length() {
+            if let Some(element) = elements
+                .item(index)
+                .and_then(|element| element.dyn_into::<web_sys::Element>().ok())
+            {
+                let _ = element.remove_attribute("data-dragging");
+                let _ = element.remove_attribute("data-drop-active");
+            }
+        }
+    }
 }
 
 fn update_preview(app: &SharedApp, function: &HtmlInputElement) {
@@ -1938,6 +2365,24 @@ fn bind_change(
     input.add_event_listener_with_callback("change", closure.as_ref().unchecked_ref())?;
     retain_event_handler(app, closure);
     Ok(())
+}
+
+fn set_create_room_password_visibility(document: &Document, private: bool) {
+    let Some(field) = document.get_element_by_id("room-password-field") else {
+        return;
+    };
+    let Some(input) = document
+        .get_element_by_id("room-password")
+        .and_then(|element| element.dyn_into::<HtmlInputElement>().ok())
+    else {
+        return;
+    };
+    let _ = set_boolean_attribute(&field, "hidden", !private);
+    input.set_disabled(!private);
+    input.set_required(private);
+    if !private {
+        input.set_value("");
+    }
 }
 
 fn input_value(form: &HtmlFormElement, id: &str) -> Option<String> {

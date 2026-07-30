@@ -673,9 +673,18 @@ async fn dispatch(
         ClientMessage::ListRooms => Ok(DispatchOutcome::private(ServerMessage::RoomList {
             rooms: rooms.public_snapshots(),
         })),
-        ClientMessage::CreateRoom { name, visibility } => {
-            let (snapshot, invite) =
-                rooms.create(user.id, user.display_name.clone(), name, visibility)?;
+        ClientMessage::CreateRoom {
+            name,
+            visibility,
+            password,
+        } => {
+            let (snapshot, invite) = rooms.create(
+                user.id,
+                user.display_name.clone(),
+                name,
+                visibility,
+                password,
+            )?;
             Ok(DispatchOutcome::accounts(
                 vec![user.id],
                 ServerMessage::RoomCreated { snapshot, invite },
@@ -772,6 +781,18 @@ async fn dispatch(
                 ServerMessage::Room { snapshot },
             )
             .with_lobby(rooms.public_snapshots()))
+        }
+        ClientMessage::KickPlayer { player_id } => {
+            let room_id = rooms.member_snapshot(user.id)?.id;
+            let snapshot = rooms.kick_player(user.id, player_id)?;
+            let mut outcome = DispatchOutcome::accounts(vec![player_id], ServerMessage::LeftRoom);
+            outcome.broadcasts.push(ScopedEvent {
+                audience: Audience::Room {
+                    players: rooms.member_ids(room_id),
+                },
+                message: ServerMessage::Room { snapshot },
+            });
+            Ok(outcome.with_lobby(rooms.public_snapshots()))
         }
         ClientMessage::StartGame => {
             let start = rooms.start_game(user.id)?;
@@ -983,6 +1004,7 @@ mod tests {
                     "Owner".into(),
                     "room".into(),
                     graphwar_protocol::RoomVisibility::Public,
+                    None,
                 )
                 .unwrap()
                 .0;
@@ -1011,6 +1033,7 @@ mod tests {
                 "Player".into(),
                 "room".into(),
                 graphwar_protocol::RoomVisibility::Public,
+                None,
             )
             .unwrap();
         state.socket_connected(player).await;
@@ -1038,6 +1061,7 @@ mod tests {
                     "Owner".into(),
                     "room".into(),
                     graphwar_protocol::RoomVisibility::Public,
+                    None,
                 )
                 .unwrap()
                 .0;
@@ -1068,6 +1092,7 @@ mod tests {
                     "Owner".into(),
                     "room".into(),
                     graphwar_protocol::RoomVisibility::Public,
+                    None,
                 )
                 .unwrap()
                 .0;
@@ -1100,6 +1125,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kick_targets_guest_and_updates_remaining_room() {
+        let state = test_state();
+        let owner = uuid::Uuid::new_v4();
+        let guest = uuid::Uuid::new_v4();
+        let owner_user = test_user(owner, "Owner");
+        let room_id = {
+            let mut rooms = state.rooms.write().await;
+            let room = rooms
+                .create(
+                    owner,
+                    "Owner".into(),
+                    "room".into(),
+                    graphwar_protocol::RoomVisibility::Public,
+                    None,
+                )
+                .unwrap()
+                .0;
+            rooms.join(guest, "Guest".into(), room.id, None).unwrap();
+            room.id
+        };
+
+        let outcome = dispatch(
+            &state,
+            &owner_user,
+            ClientMessage::KickPlayer { player_id: guest },
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.broadcasts.iter().any(|event| {
+            matches!(&event.audience, Audience::Accounts(players) if players == &[guest])
+                && matches!(event.message, ServerMessage::LeftRoom)
+        }));
+        assert!(outcome.broadcasts.iter().any(|event| {
+            matches!(&event.audience, Audience::Room { players } if players == &[owner])
+                && matches!(
+                    &event.message,
+                    ServerMessage::Room { snapshot }
+                        if snapshot.id == room_id
+                            && snapshot.players.len() == 1
+                            && snapshot.players[0].id == owner
+                )
+        }));
+        assert!(matches!(
+            state.rooms.read().await.member_snapshot(guest),
+            Err(RoomError::NotMember)
+        ));
+    }
+
+    #[tokio::test]
     async fn persistence_failure_rolls_back_mutation() {
         let state = failing_persistence_state();
         let user = test_user(uuid::Uuid::new_v4(), "Player");
@@ -1112,6 +1187,7 @@ mod tests {
                 ClientMessage::CreateRoom {
                     name: "room".into(),
                     visibility: graphwar_protocol::RoomVisibility::Public,
+                    password: None,
                 },
             )
             .await,
@@ -1135,6 +1211,7 @@ mod tests {
             ClientMessage::CreateRoom {
                 name: "private".into(),
                 visibility: graphwar_protocol::RoomVisibility::Private,
+                password: Some("room password".into()),
             },
         )
         .await
@@ -1144,12 +1221,25 @@ mod tests {
             matches!(&event.audience, Audience::Accounts(accounts) if accounts == &[player])
                 && matches!(
                     event.message,
-                    ServerMessage::RoomCreated {
-                        invite: Some(_),
-                        ..
-                    }
+                    ServerMessage::RoomCreated { invite: None, .. }
                 )
         }));
+        assert!(outcome.broadcasts.iter().any(|event| {
+            matches!(event.audience, Audience::Lobby)
+                && matches!(
+                    &event.message,
+                    ServerMessage::RoomList { rooms }
+                        if rooms.len() == 1
+                            && rooms[0].visibility
+                                == graphwar_protocol::RoomVisibility::Private
+                )
+        }));
+        let wire_messages = outcome
+            .broadcasts
+            .iter()
+            .map(|event| serde_json::to_string(&event.message).unwrap())
+            .collect::<String>();
+        assert!(!wire_messages.contains("room password"));
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 7;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RegisterRequest {
@@ -150,6 +150,8 @@ pub enum ClientMessage {
     CreateRoom {
         name: String,
         visibility: RoomVisibility,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password: Option<String>,
     },
     JoinRoom {
         room_id: Uuid,
@@ -174,6 +176,9 @@ pub enum ClientMessage {
         level: u8,
     },
     RemoveBot {
+        player_id: Uuid,
+    },
+    KickPlayer {
         player_id: Uuid,
     },
     StartGame,
@@ -251,7 +256,7 @@ mod tests {
             version: PROTOCOL_VERSION,
         };
         let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(json, r#"{"type":"hello","payload":{"version":5}}"#);
+        assert_eq!(json, r#"{"type":"hello","payload":{"version":7}}"#);
         let snap = SnapshotEnvelope {
             version: PROTOCOL_VERSION,
             sequence: 3,
@@ -261,6 +266,31 @@ mod tests {
             serde_json::from_str::<SnapshotEnvelope<Phase>>(&serde_json::to_string(&snap).unwrap())
                 .unwrap(),
             snap
+        );
+    }
+
+    #[test]
+    fn create_room_password_is_optional_and_round_trips() {
+        let message = ClientMessage::CreateRoom {
+            name: "Protected".into(),
+            visibility: RoomVisibility::Private,
+            password: Some("room secret".into()),
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&json).unwrap(),
+            message
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(
+                r#"{"type":"create_room","payload":{"name":"Public","visibility":"public"}}"#,
+            )
+            .unwrap(),
+            ClientMessage::CreateRoom {
+                name: "Public".into(),
+                visibility: RoomVisibility::Public,
+                password: None,
+            }
         );
     }
 
@@ -294,6 +324,7 @@ mod tests {
         for message in [
             ClientMessage::AddBot { level: 4 },
             ClientMessage::RemoveBot { player_id: bot },
+            ClientMessage::KickPlayer { player_id: bot },
         ] {
             let json = serde_json::to_string(&message).unwrap();
             assert_eq!(

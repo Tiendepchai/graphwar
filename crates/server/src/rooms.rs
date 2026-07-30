@@ -3,6 +3,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use graphwar_game_core::{
     Circle, Expr, GameState, Player, SeededGenerator, Soldier, Team, Terrain, TrajectoryMode,
     constants::{MAX_PLAYERS, MAX_SOLDIERS_PER_PLAYER, PLANE_HEIGHT, PLANE_LENGTH, SOLDIER_RADIUS},
@@ -13,6 +14,7 @@ use graphwar_protocol::{
     ChatEntry, GameMode, GameSnapshot, Phase, PlayerSnapshot, RoomSnapshot, RoomVisibility,
     ShotHistoryEntry, ShotResolved, SoldierPosition, SoldierSnapshot, TerrainCircle,
 };
+use password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -61,6 +63,7 @@ pub type RoomRegistry = std::sync::Arc<tokio::sync::RwLock<Registry>>;
 const TURN_DURATION: Duration = Duration::from_secs(60);
 const MAX_SHOT_HISTORY: usize = 40;
 const MAX_CHAT_HISTORY: usize = 100;
+const MAX_ROOM_PASSWORD_BYTES: usize = 1024;
 
 #[derive(Clone, Default)]
 pub struct Registry {
@@ -304,6 +307,7 @@ impl Registry {
         display_name: String,
         name: String,
         visibility: RoomVisibility,
+        password: Option<String>,
     ) -> Result<(RoomSnapshot, Option<String>), RoomError> {
         let name = name.trim();
         if name.is_empty() || name.len() > 64 {
@@ -312,6 +316,16 @@ impl Registry {
         if self.room_id_for(owner).is_some() {
             return Err(RoomError::Invalid("leave the current room first"));
         }
+        let invite = match (visibility, password) {
+            (RoomVisibility::Private, Some(password)) => Some(hash_room_password(&password)?),
+            (RoomVisibility::Private, None) => {
+                return Err(RoomError::Invalid("private room password is required"));
+            }
+            (RoomVisibility::Public, None) => None,
+            (RoomVisibility::Public, Some(_)) => {
+                return Err(RoomError::Invalid("public rooms cannot have a password"));
+            }
+        };
         let id = Uuid::new_v4();
         let snapshot = RoomSnapshot {
             id,
@@ -330,12 +344,11 @@ impl Registry {
                 is_bot: false,
             }],
         };
-        let invite = (visibility == RoomVisibility::Private).then(|| Uuid::new_v4().to_string());
         self.rooms.insert(
             id,
             Room {
                 snapshot: snapshot.clone(),
-                invite: invite.clone(),
+                invite,
                 members: HashMap::from([(owner, false)]),
                 bots: HashMap::new(),
                 game: None,
@@ -343,7 +356,7 @@ impl Registry {
                 chat_history: Vec::new(),
             },
         );
-        Ok((snapshot, invite))
+        Ok((snapshot, None))
     }
 
     pub fn join(
@@ -357,14 +370,28 @@ impl Registry {
             return Err(RoomError::Invalid("leave the current room first"));
         }
         let room = self.rooms.get_mut(&room_id).ok_or(RoomError::NotFound)?;
-        if room.snapshot.visibility == RoomVisibility::Private && room.invite.as_deref() != invite {
-            return Err(RoomError::Private);
-        }
+        let legacy_password = if room.snapshot.visibility == RoomVisibility::Private {
+            let stored = room.invite.as_deref().ok_or(RoomError::Private)?;
+            let submitted = invite
+                .filter(|password| {
+                    !password.is_empty() && password.len() <= MAX_ROOM_PASSWORD_BYTES
+                })
+                .ok_or(RoomError::Private)?;
+            if !verify_room_password(stored, submitted) {
+                return Err(RoomError::Private);
+            }
+            PasswordHash::new(stored).is_err()
+        } else {
+            false
+        };
         if room.snapshot.phase != Phase::Lobby {
             return Err(RoomError::WrongPhase);
         }
         if room.snapshot.players.len() >= MAX_PLAYERS && !room.members.contains_key(&player) {
             return Err(RoomError::Invalid("room is full"));
+        }
+        if legacy_password {
+            room.invite = Some(hash_room_password(invite.expect("verified password"))?);
         }
         if let std::collections::hash_map::Entry::Vacant(entry) = room.members.entry(player) {
             entry.insert(false);
@@ -529,7 +556,7 @@ impl Registry {
         if room.snapshot.phase != Phase::Lobby {
             return Err(RoomError::WrongPhase);
         }
-        if player != player_id && !(is_owner(room, player) && room.bots.contains_key(&player_id)) {
+        if player != player_id && !is_owner(room, player) {
             return Err(RoomError::NotSlotOwner);
         }
         if !(1..=2).contains(&team) {
@@ -649,6 +676,28 @@ impl Registry {
         room.snapshot.players.retain(|slot| slot.id != player_id);
         reset_readiness(room);
         room.snapshot.revision += 1;
+        Ok(room.snapshot.clone())
+    }
+
+    pub fn kick_player(&mut self, owner: Uuid, player_id: Uuid) -> Result<RoomSnapshot, RoomError> {
+        let room_id = self.room_id_for(owner).ok_or(RoomError::NotMember)?;
+        let room = self.rooms.get_mut(&room_id).expect("owner room");
+        if room.snapshot.phase != Phase::Lobby {
+            return Err(RoomError::WrongPhase);
+        }
+        if !is_owner(room, owner) {
+            return Err(RoomError::NotOwner);
+        }
+        if owner == player_id {
+            return Err(RoomError::Invalid("owner cannot kick themself"));
+        }
+        if room.bots.contains_key(&player_id) {
+            return Err(RoomError::Invalid("use remove bot for bot players"));
+        }
+        if !room.members.contains_key(&player_id) {
+            return Err(RoomError::NotMember);
+        }
+        remove_member(room, player_id);
         Ok(room.snapshot.clone())
     }
 
@@ -968,9 +1017,7 @@ impl Registry {
         self.rooms
             .values()
             .filter(|room| {
-                room.snapshot.visibility == RoomVisibility::Public
-                    && room.snapshot.phase == Phase::Lobby
-                    && room.snapshot.players.len() < MAX_PLAYERS
+                room.snapshot.phase == Phase::Lobby && room.snapshot.players.len() < MAX_PLAYERS
             })
             .map(|room| room.snapshot.clone())
             .collect()
@@ -1023,6 +1070,32 @@ fn normalize_feed_history(room: &mut PersistedRoom) -> Result<(), String> {
     Ok(())
 }
 
+fn hash_room_password(password: &str) -> Result<String, RoomError> {
+    if password.is_empty() || password.len() > MAX_ROOM_PASSWORD_BYTES {
+        return Err(RoomError::Invalid("room password must be 1-1024 bytes"));
+    }
+    Argon2::default()
+        .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
+        .map(|hash| hash.to_string())
+        .map_err(|_| RoomError::Storage)
+}
+
+fn verify_room_password(stored: &str, submitted: &str) -> bool {
+    PasswordHash::new(stored).map_or_else(
+        |_| Uuid::parse_str(stored).is_ok() && stored == submitted,
+        |hash| {
+            Argon2::default()
+                .verify_password(submitted.as_bytes(), &hash)
+                .is_ok()
+        },
+    )
+}
+
+fn valid_persisted_room_secret(secret: &str) -> bool {
+    Uuid::parse_str(secret).is_ok()
+        || (secret.starts_with("$argon2") && PasswordHash::new(secret).is_ok())
+}
+
 fn validate_persisted_room(room: &PersistedRoom) -> Result<(), String> {
     let snapshot = &room.snapshot;
     if snapshot.name.is_empty() || snapshot.name.len() > 64 || snapshot.players.is_empty() {
@@ -1062,10 +1135,11 @@ fn validate_persisted_room(room: &PersistedRoom) -> Result<(), String> {
     {
         return Err("inconsistent room membership".into());
     }
-    if snapshot.visibility == RoomVisibility::Private
-        && room.invite.as_deref().is_none_or(str::is_empty)
-    {
-        return Err("private room missing invite".into());
+    match (snapshot.visibility, room.invite.as_deref()) {
+        (RoomVisibility::Private, Some(secret)) if valid_persisted_room_secret(secret) => {}
+        (RoomVisibility::Private, _) => return Err("private room has invalid password data".into()),
+        (RoomVisibility::Public, None) => {}
+        (RoomVisibility::Public, Some(_)) => return Err("public room has password data".into()),
     }
     if room.chat_history.len() > MAX_CHAT_HISTORY
         || room.chat_history.iter().any(|entry| {
@@ -1513,7 +1587,13 @@ mod tests {
         let guest = Uuid::new_v4();
         let mut registry = Registry::default();
         let room = registry
-            .create(owner, "Owner".into(), "room".into(), RoomVisibility::Public)
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
             .unwrap()
             .0;
         registry.join(guest, "Guest".into(), room.id, None).unwrap();
@@ -1534,6 +1614,7 @@ mod tests {
                 "Owner".into(),
                 "room".into(),
                 RoomVisibility::Private,
+                Some("room password".into()),
             )
             .unwrap()
             .0;
@@ -1644,6 +1725,168 @@ mod tests {
     }
 
     #[test]
+    fn protected_rooms_hash_passwords_list_and_enforce_credentials() {
+        let owner = Uuid::new_v4();
+        let guest = Uuid::new_v4();
+        let mut registry = Registry::default();
+        let password = "correct horse battery staple";
+        let (room, returned_secret) = registry
+            .create(
+                owner,
+                "Owner".into(),
+                "protected".into(),
+                RoomVisibility::Private,
+                Some(password.into()),
+            )
+            .unwrap();
+
+        assert!(returned_secret.is_none());
+        assert_eq!(registry.public_snapshots(), std::slice::from_ref(&room));
+        let stored = registry.rooms[&room.id].invite.as_deref().unwrap();
+        assert_ne!(stored, password);
+        assert!(stored.starts_with("$argon2"));
+        assert!(!registry.persisted_json().unwrap().contains(password));
+        assert!(matches!(
+            registry.join(guest, "Guest".into(), room.id, None),
+            Err(RoomError::Private)
+        ));
+        assert!(matches!(
+            registry.join(guest, "Guest".into(), room.id, Some("wrong")),
+            Err(RoomError::Private)
+        ));
+        assert!(matches!(
+            registry.join(
+                guest,
+                "Guest".into(),
+                room.id,
+                Some(&"x".repeat(MAX_ROOM_PASSWORD_BYTES + 1)),
+            ),
+            Err(RoomError::Private)
+        ));
+        assert_eq!(
+            registry
+                .join(guest, "Guest".into(), room.id, Some(password))
+                .unwrap()
+                .players
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn room_password_validation_keeps_public_rooms_passwordless() {
+        let mut registry = Registry::default();
+        let owner = Uuid::new_v4();
+        assert!(matches!(
+            registry.create(
+                owner,
+                "Owner".into(),
+                "protected".into(),
+                RoomVisibility::Private,
+                None,
+            ),
+            Err(RoomError::Invalid("private room password is required"))
+        ));
+        assert!(matches!(
+            registry.create(
+                owner,
+                "Owner".into(),
+                "protected".into(),
+                RoomVisibility::Private,
+                Some(String::new()),
+            ),
+            Err(RoomError::Invalid("room password must be 1-1024 bytes"))
+        ));
+        assert!(matches!(
+            registry.create(
+                owner,
+                "Owner".into(),
+                "protected".into(),
+                RoomVisibility::Private,
+                Some("é".repeat(513)),
+            ),
+            Err(RoomError::Invalid("room password must be 1-1024 bytes"))
+        ));
+        assert!(matches!(
+            registry.create(
+                owner,
+                "Owner".into(),
+                "public".into(),
+                RoomVisibility::Public,
+                Some("unused".into()),
+            ),
+            Err(RoomError::Invalid("public rooms cannot have a password"))
+        ));
+
+        let room = registry
+            .create(
+                owner,
+                "Owner".into(),
+                "public".into(),
+                RoomVisibility::Public,
+                None,
+            )
+            .unwrap()
+            .0;
+        assert!(
+            registry
+                .join(Uuid::new_v4(), "Guest".into(), room.id, Some("ignored"),)
+                .is_ok()
+        );
+        assert!(registry.rooms[&room.id].invite.is_none());
+    }
+
+    #[test]
+    fn legacy_private_credentials_upgrade_after_successful_join() {
+        let owner = Uuid::new_v4();
+        let guest = Uuid::new_v4();
+        let legacy = Uuid::new_v4().to_string();
+        let mut registry = Registry::default();
+        let room = registry
+            .create(
+                owner,
+                "Owner".into(),
+                "legacy".into(),
+                RoomVisibility::Private,
+                Some("temporary".into()),
+            )
+            .unwrap()
+            .0;
+        registry.rooms.get_mut(&room.id).unwrap().invite = Some(legacy.clone());
+
+        let mut restored =
+            Registry::from_persisted_json(&registry.persisted_json().unwrap()).unwrap();
+        assert!(
+            restored
+                .join(guest, "Guest".into(), room.id, Some(&legacy))
+                .is_ok()
+        );
+        let upgraded = restored.rooms[&room.id].invite.as_deref().unwrap();
+        assert!(upgraded.starts_with("$argon2"));
+        assert!(verify_room_password(upgraded, &legacy));
+        assert!(!restored.persisted_json().unwrap().contains(&legacy));
+    }
+
+    #[test]
+    fn malformed_persisted_private_password_is_rejected() {
+        let owner = Uuid::new_v4();
+        let mut registry = Registry::default();
+        registry
+            .create(
+                owner,
+                "Owner".into(),
+                "protected".into(),
+                RoomVisibility::Private,
+                Some("password".into()),
+            )
+            .unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&registry.persisted_json().unwrap()).unwrap();
+        json["rooms"][0]["invite"] = serde_json::Value::String("malformed".into());
+        assert!(Registry::from_persisted_json(&json.to_string()).is_err());
+    }
+
+    #[test]
     fn fixed_match_seed_reproduces_layout() {
         let players = [
             PlayerSnapshot {
@@ -1687,10 +1930,24 @@ mod tests {
         let guest = Uuid::new_v4();
         let mut registry = Registry::default();
         let room = registry
-            .create(owner, "Owner".into(), "room".into(), RoomVisibility::Public)
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
             .unwrap()
             .0;
         registry.join(guest, "Guest".into(), room.id, None).unwrap();
+        let bot = registry
+            .add_bot(owner, 1)
+            .unwrap()
+            .players
+            .into_iter()
+            .find(|player| player.is_bot)
+            .unwrap()
+            .id;
         registry.set_ready(owner, true).unwrap();
         registry.set_ready(guest, true).unwrap();
 
@@ -1698,16 +1955,143 @@ mod tests {
             registry.set_mode(guest, GameMode::SecondOrder),
             Err(RoomError::NotOwner)
         ));
+        let snapshot = registry.set_team(owner, guest, 1).unwrap();
+        assert_eq!(
+            snapshot
+                .players
+                .iter()
+                .find(|player| player.id == guest)
+                .unwrap()
+                .team,
+            1
+        );
+        assert!(
+            snapshot
+                .players
+                .iter()
+                .all(|player| !player.ready || player.is_bot)
+        );
+
+        registry.set_ready(owner, true).unwrap();
+        registry.set_ready(guest, true).unwrap();
+        let snapshot = registry.set_team(owner, bot, 2).unwrap();
+        assert_eq!(
+            snapshot
+                .players
+                .iter()
+                .find(|player| player.id == bot)
+                .unwrap()
+                .team,
+            2
+        );
+        assert!(
+            snapshot
+                .players
+                .iter()
+                .all(|player| !player.ready || player.is_bot)
+        );
+
+        let snapshot = registry.set_team(guest, guest, 2).unwrap();
+        assert_eq!(
+            snapshot
+                .players
+                .iter()
+                .find(|player| player.id == guest)
+                .unwrap()
+                .team,
+            2
+        );
+        let revision = snapshot.revision;
+        assert_eq!(
+            registry.set_team(guest, guest, 2).unwrap().revision,
+            revision
+        );
         assert!(matches!(
-            registry.set_team(owner, guest, 1),
+            registry.set_team(guest, owner, 2),
             Err(RoomError::NotSlotOwner)
         ));
-        let snapshot = registry.set_soldiers(guest, guest, 4).unwrap();
-        assert_eq!(snapshot.players[1].soldiers, 4);
-        assert!(snapshot.players.iter().all(|player| !player.ready));
+        assert!(matches!(
+            registry.set_team(guest, bot, 1),
+            Err(RoomError::NotSlotOwner)
+        ));
         assert!(matches!(
             registry.set_team(guest, guest, 3),
             Err(RoomError::Invalid("team must be 1 or 2"))
+        ));
+    }
+
+    #[test]
+    fn team_changes_are_lobby_only() {
+        let (mut registry, _room_id, owner, guest) = started_registry();
+        assert!(matches!(
+            registry.set_team(owner, guest, 1),
+            Err(RoomError::WrongPhase)
+        ));
+    }
+
+    #[test]
+    fn lobby_kick_removes_human_and_enforces_authority() {
+        let owner = Uuid::new_v4();
+        let guest = Uuid::new_v4();
+        let mut registry = Registry::default();
+        let room = registry
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
+            .unwrap()
+            .0;
+        registry.join(guest, "Guest".into(), room.id, None).unwrap();
+        let third = Uuid::new_v4();
+        registry.join(third, "Third".into(), room.id, None).unwrap();
+        let bot = registry
+            .add_bot(owner, 1)
+            .unwrap()
+            .players
+            .into_iter()
+            .find(|player| player.is_bot)
+            .unwrap()
+            .id;
+
+        assert!(matches!(
+            registry.kick_player(guest, third),
+            Err(RoomError::NotOwner)
+        ));
+        assert!(matches!(
+            registry.kick_player(owner, owner),
+            Err(RoomError::Invalid("owner cannot kick themself"))
+        ));
+        assert!(matches!(
+            registry.kick_player(owner, bot),
+            Err(RoomError::Invalid("use remove bot for bot players"))
+        ));
+
+        let snapshot = registry.kick_player(owner, guest).unwrap();
+        assert!(snapshot.players.iter().all(|player| player.id != guest));
+        assert!(matches!(
+            registry.member_state(guest),
+            Err(RoomError::NotMember)
+        ));
+        assert!(
+            registry
+                .member_state(owner)
+                .unwrap()
+                .0
+                .players
+                .iter()
+                .any(|player| player.id == owner)
+        );
+    }
+
+    #[test]
+    fn kick_is_lobby_only() {
+        let (mut registry, _room_id, owner, guest) = started_registry();
+        assert!(matches!(
+            registry.kick_player(owner, guest),
+            Err(RoomError::WrongPhase)
         ));
     }
 
@@ -1717,7 +2101,13 @@ mod tests {
         let guest = Uuid::new_v4();
         let mut registry = Registry::default();
         let room = registry
-            .create(owner, "Owner".into(), "room".into(), RoomVisibility::Public)
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
             .unwrap()
             .0;
         registry.join(guest, "Guest".into(), room.id, None).unwrap();
@@ -1762,7 +2152,13 @@ mod tests {
         let guest = Uuid::new_v4();
         let mut registry = Registry::default();
         let room = registry
-            .create(owner, "Owner".into(), "room".into(), RoomVisibility::Public)
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
             .unwrap()
             .0;
         registry.join(guest, "Guest".into(), room.id, None).unwrap();
@@ -1781,7 +2177,13 @@ mod tests {
         let guest = Uuid::new_v4();
         let mut registry = Registry::default();
         let room = registry
-            .create(owner, "Owner".into(), "room".into(), RoomVisibility::Public)
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
             .unwrap()
             .0;
         registry.join(guest, "Guest".into(), room.id, None).unwrap();
@@ -1812,7 +2214,13 @@ mod tests {
         let guest = Uuid::new_v4();
         let mut registry = Registry::default();
         let room = registry
-            .create(owner, "Owner".into(), "room".into(), RoomVisibility::Public)
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
             .unwrap()
             .0;
         registry.join(guest, "Guest".into(), room.id, None).unwrap();
@@ -1828,7 +2236,13 @@ mod tests {
         let third = Uuid::new_v4();
         let mut registry = Registry::default();
         let room = registry
-            .create(owner, "Owner".into(), "room".into(), RoomVisibility::Public)
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
             .unwrap()
             .0;
         registry.join(guest, "Guest".into(), room.id, None).unwrap();
@@ -1998,7 +2412,13 @@ mod tests {
         let guest = Uuid::new_v4();
         let mut registry = Registry::default();
         let room = registry
-            .create(owner, "Owner".into(), "room".into(), RoomVisibility::Public)
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
             .unwrap()
             .0;
         registry.join(guest, "Guest".into(), room.id, None).unwrap();
@@ -2194,7 +2614,13 @@ mod tests {
             let guest = Uuid::new_v4();
             let mut registry = Registry::default();
             let room = registry
-                .create(owner, "Owner".into(), "room".into(), RoomVisibility::Public)
+                .create(
+                    owner,
+                    "Owner".into(),
+                    "room".into(),
+                    RoomVisibility::Public,
+                    None,
+                )
                 .unwrap()
                 .0;
             registry.join(guest, "Guest".into(), room.id, None).unwrap();
@@ -2222,7 +2648,13 @@ mod tests {
         let guest = Uuid::new_v4();
         let mut registry = Registry::default();
         let room = registry
-            .create(owner, "Owner".into(), "room".into(), RoomVisibility::Public)
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
             .unwrap()
             .0;
         registry.join(guest, "Guest".into(), room.id, None).unwrap();
@@ -2253,7 +2685,13 @@ mod tests {
         let guest = Uuid::new_v4();
         let mut registry = Registry::default();
         let room = registry
-            .create(owner, "Owner".into(), "room".into(), RoomVisibility::Public)
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
             .unwrap()
             .0;
         registry.join(guest, "Guest".into(), room.id, None).unwrap();
@@ -2304,7 +2742,13 @@ mod tests {
         let guest = Uuid::new_v4();
         let mut registry = Registry::default();
         let room = registry
-            .create(owner, "Owner".into(), "room".into(), RoomVisibility::Public)
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
             .unwrap()
             .0;
         registry.join(guest, "Guest".into(), room.id, None).unwrap();
@@ -2334,7 +2778,13 @@ mod tests {
         let owner = Uuid::new_v4();
         let mut registry = Registry::default();
         let room = registry
-            .create(owner, "Owner".into(), "room".into(), RoomVisibility::Public)
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
             .unwrap()
             .0;
         let bot_snapshot = registry.add_bot(owner, 1).unwrap();
@@ -2373,7 +2823,13 @@ mod tests {
         let owner = Uuid::new_v4();
         let mut registry = Registry::default();
         let room = registry
-            .create(owner, "Owner".into(), "room".into(), RoomVisibility::Public)
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
             .unwrap()
             .0;
         let snapshot = registry.add_bot(owner, 1).unwrap();
@@ -2412,7 +2868,13 @@ mod tests {
         let owner = Uuid::new_v4();
         let mut registry = Registry::default();
         let room = registry
-            .create(owner, "Owner".into(), "room".into(), RoomVisibility::Public)
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
             .unwrap()
             .0;
         let snapshot = registry.add_bot(owner, 1).unwrap();
@@ -2465,7 +2927,13 @@ mod tests {
         let guest = Uuid::new_v4();
         let mut registry = Registry::default();
         let room = registry
-            .create(owner, "Owner".into(), "room".into(), RoomVisibility::Public)
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
             .unwrap()
             .0;
         registry.join(guest, "Guest".into(), room.id, None).unwrap();
