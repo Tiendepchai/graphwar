@@ -1,153 +1,168 @@
+# Graphwar
 
-# Graphwar Tutorial
+Graphwar is a browser artillery game where mathematical expressions become shots on a Cartesian battlefield. Draw the line, avoid terrain and teammates, hit the opposing team.
 
-Graphwar is an artillery game in which you must hit your enemies using mathematical functions. The trajectory of your shot is determined by the function you wrote, and your goal is to avoid the obstacles and your teammates and hit your enemies. The game takes place in a Cartesian Plane.
+**Play:** [graphwar.tiendepchai.id.vn](https://graphwar.tiendepchai.id.vn)
 
-![cam](/../screenshots/ss1graphwar.png?raw=true)
+![Graphwar browser gameplay](assets/docs/gameplay.png)
 
-## Game Modes
+## Features
 
-## Normal Function 
+- Function, first-order ODE, and second-order ODE firing modes.
+- Server-authoritative turns, collisions, deaths, terrain, and match results.
+- Account registration, login, logout, session recovery, and reconnect state sync.
+- Public rooms, private invite-only rooms, automatic team assignment, soldier setup, and bot slots.
+- Room and in-match chat.
+- Responsive, keyboard-friendly browser UI with accessible canvas descriptions.
+- PostgreSQL-backed room and active-match snapshots for restart recovery.
 
-The Normal Function mode is the most basic mode. In this mode the function shot is simply the function you typed in, so the trajectory of your shot will be same trajectory as the function's graph. 
-However, there is a problem. The function must be shot by your soldier, but there's is no guarantee that the point where your soldier is standing belongs to the function. To solve this the function must be translated until the position of the soldier is part of the function, this is done adding a constant to the function. That means that if a function y = f(x) is typed the actual graph is actually going to be y = f(x)+c. 
+## How to play
 
+1. Register or sign in.
+2. Create or join a public room, or join a private room with its invite code.
+3. Review your assigned team, choose a soldier count and game mode, then add a bot if needed.
+4. Mark yourself ready. Start when every player is ready.
+5. On your turn, enter an expression, preview the path, then fire. In second-order mode, use the angle controls before firing.
+6. Eliminate the opposing team.
 
-## First Order Differential Equation
+The battlefield uses logical coordinates of `x = -25..25` and `y = -15..15`. Soldiers start on the negative-x side; Team Two sees the mirrored firing direction.
 
-In this mode you enter a first order differential equation instead of a function. For example:
+## Game modes
 
-* y' = 3*sin(x)+2
-* y' = -y/3
-* y' = 1/(x+y)
+### Function
 
-On this mode no constant is added to your function. Instead your soldier position is used as the initial condition to solve the differential equation and the graph fired is the actual solution.
+Enter `y = f(x)`. Graphwar translates the curve so it passes through the current soldier. Constants therefore do not change the resulting path: `2*x + 3`, `2*x - 8`, and `2*x` are equivalent shots.
 
+### First-order differential equation
 
-## Second Order Differential Equation
+Enter `y' = f(x, y)`. The soldier position supplies the initial condition; the fired curve is the numerical solution.
 
-The second order differential equation mode is very similar to the first order mode, but now you enter a second order differential equation:
+Examples:
 
-* y'' = -y + y' + 2*x - 1
-* y'' = 4*sin(x) + 2^x
-* y'' = 1.04^(-(x+ y)^2)
-
-To have a unique solution, a second order differential equation must have two initial conditions, the first is the soldier's position and the second is the firing angle. You can change the firing angle by pressing up and down on the keyboard. Also note that this is the only mode that the angle affects the function.
-
-
-## Common Pitfalls
-
-![cam](/../screenshots/ss2Graphwar.png?raw=true)
-
-The translation of the function have some confusing consequences. First, any constant added to your function is irrelevant to the result. For example, the functions y = 2*x + 3, y = 2*x - 8 and y = 2*x yield the exact same graph in the game.
-
-Other confusing fact is related to the fact that the x axis limits on the game are -25 and +25 and the y axis limits are -15 and 15. That means functions can get very big. For example the function y = x^2 has the value 100 when x equals 10. That means this function will hit the ceiling of the game very fast. If your soldier is positioned on a position where x is -15 this function will be very very steep, it will most likely appear as a straight line up or down. Remember that a huge constant will have to be added to this function, so the result is something very different from what you might be expecting. This problem can be solved by scaling the function appropriately, the function y = (x^2)/50 will produce a nice looking parabola.
-
-Another thing that may confuse you is that your soldiers will always be standing on negative values for x. Your team is located to the left of the y axis, so that is expected and it means functions like y = sqrt(x) will not like you and will explode immediately. You should try something like y = sqrt(abs(x)). 
-As was just pointed out functions may explode spontaneously. That means it had an invalid value at that point, a square root of a negative number or a function that gets vertical at a point will explode. Another possible reason for a function to explode is that it is too long, a sine with a high frequency may reach the maximum function length allowed and spontaneously explode.
-
-
-## Function Syntax
-
-### Variables
-
-* x
-* y
-* y'
-
-### Operators
-
-* \+
-* \-
-* /
-* \*
-* ^
-
-### Functions
-
-* sqrt()
-* log()
-* ln()
-* abs()
-* sin()
-* cos()
-* tan()
-* exp()
-
-### Other Examples
-
-* y = ((x-3)^2)/20
-* y = ln(abs(x))
-* y = sin(x/20)*5
-* y' = 1.2^x
-* y'' = (1.2^(-(x+3)^2))*(20*(-y))
-
-Using lots of parentheses is recommended to avoid misinterpretation, for example y = 1/x+2 is going to be understood as (1/x) + 2, you should use 1/(x+2).
-
-
-### Chat Commands
-
-The available commands are:
-
-* -skip : If everyone playing uses this command, the current map is skipped and a new one is generated.
-* -sayfunc : If you use this you are going to see on your chat the function that everyone else is using.
-* -stopsayfunc : This will stop the functions from appearing on your chat after you used -sayfunc.
-* -shownext : This will highlight the next soldier to play for each player with a dark circle. This is useful to plan functions ahead of time.
-* -stopshownext : Stops showing the next soldier to play.
-
-Just type them on the game chat to use them.
-
-## Connection and restart recovery
-
-The server remains a single authoritative writer. Room and active-match state is stored as a validated PostgreSQL snapshot before successful state-changing broadcasts. App restart restores rooms and matches; planning turns keep their player and receive a fresh 60-second deadline, while resolving turns settle once before resuming planning. Bot search memory is intentionally rebuilt.
-
-WebSocket reconnect uses indefinite exponential full-jitter retry, with no offline gameplay-command queue. A live socket rechecks session validity at most once per 60 seconds; cross-device logout can therefore take up to 60 seconds to terminate an idle socket. A short network interruption preserves active-match membership.
-
-For recovery testing, use a disposable stack: create a match, restart only `app` while retaining the PostgreSQL volume, then reconnect existing sessions and compare `StateSync` room, roster, terrain, shot history, and turn state. Never restart production for this test.
-
-## Rust/WASM deployment
-
-
-The production stack runs Graphwar, PostgreSQL, and the Cloudflare Tunnel with one Compose command.
-
-1. Copy `.env.example` to `.env`. Set a URL-safe `POSTGRES_PASSWORD`, keep `DOMAIN=graphwar.tiendepchai.id.vn`, and keep `CLOUDFLARE_TUNNEL_TOKEN_FILE=./cloudflare-tunnel-token`.
-2. Save the named-tunnel token in `cloudflare-tunnel-token`, outside Git, with restrictive permissions:
-
-   ```sh
-   printf '%s' "$CLOUDFLARE_TUNNEL_TOKEN" > cloudflare-tunnel-token
-   chmod 600 cloudflare-tunnel-token
-   ```
-
-3. In Cloudflare Tunnel → Public Hostnames, route `graphwar.tiendepchai.id.vn` to `http://127.0.0.1:18081`.
-4. Start the full stack:
-
-   ```sh
-   docker compose --env-file .env -f deploy/compose.yaml up -d --build --wait
-   ```
-
-`deploy/compose.yaml` keeps PostgreSQL private, exposes no host ports, and lets `cloudflared` reach the app over the Compose network. Check status with `docker compose --env-file .env -f deploy/compose.yaml ps`.
-
-`POSTGRES_PASSWORD` is PostgreSQL bootstrap input. Changing it after the `postgres-data` volume exists does not change the database role password. Rotate an existing deployment with the old credential: run a controlled `ALTER ROLE graphwar PASSWORD ...`, update the deployment secret, then recreate the app and PostgreSQL services. Never rotate by changing only the Compose environment.
-
-> The tunnel token is a credential. Rotate it if it was pasted into chat, shell history, or logs.
-
-```sh
-unset CLOUDFLARE_TUNNEL_TOKEN
+```text
+y' = 3*sin(x)+2
+y' = -y/3
+y' = 1/(x+y)
 ```
 
-The command above writes the token only from an environment variable; do not commit the token file.
+### Second-order differential equation
 
-## Running The Game
+Enter `y'' = f(x, y, y')`. The soldier position and firing angle provide the two initial conditions. Angle affects the path only in this mode.
 
-Compile the game using the make command (or on your favorite IDE).
+Examples:
 
-To run the game execute graphwar.jar.
+```text
+y'' = -y + y' + 2*x - 1
+y'' = 4*sin(x) + 2^x
+y'' = 1.04^(-(x+y)^2)
+```
 
-## Running Local Servers
+## Expression syntax
 
-To run a local server and connect to it you must pass the ip of the local server to graphwar
-and to the globalServer as a command line argument. So to start a server locally the commands are:
+Variables:
 
-* java -jar globalServer.jar [your-server-ip]
-* java -jar roomServer.jar [your-server-ip]
-* java -jar graphwar.jar [your-server-ip]
+```text
+x  y  y'
+```
+
+Operators:
+
+```text
++  -  *  /  ^
+```
+
+Functions:
+
+```text
+sqrt()  log()  ln()  abs()  sin()  cos()  tan()  exp()
+```
+
+Examples:
+
+```text
+y = ((x-3)^2)/20
+y = ln(abs(x))
+y = sin(x/20)*5
+y' = 1.2^x
+y'' = (1.2^(-(x+3)^2))*(20*(-y))
+```
+
+Use parentheses to make precedence explicit. For example, write `1/(x+2)` instead of relying on `1/x+2`. Avoid curves that leave the battlefield quickly, become undefined, or exceed the allowed path length: `sqrt(abs(x))` is safer than `sqrt(x)` for soldiers on negative x.
+
+The accepted parser rejects unknown text, unbalanced brackets, excessive expression size/depth, and non-finite results. See [`spec/parity.md`](spec/parity.md) for the compatibility checklist and deliberate browser-release differences.
+
+## Architecture
+
+Graphwar is a Rust workspace:
+
+- `crates/client-wasm` — Rust/WASM browser client and canvas renderer.
+- `crates/game-core` — game state, geometry, turns, collisions, and simulation.
+- `crates/protocol` — versioned JSON client/server messages.
+- `crates/server` — Axum HTTP/WebSocket server, authentication, rooms, bots, and snapshots.
+- `migrations` — PostgreSQL schema and migrations.
+- `assets/web` — static HTML/CSS and generated WASM bindings.
+- `scripts/e2e.mjs` — HTTP, WebSocket, browser, accessibility, responsive-layout, and gameplay checks.
+- `deploy` — Docker image and production Compose configuration.
+
+The browser client communicates over authenticated WebSockets. The server remains the authority for every state-changing gameplay result. The legacy Java implementation remains under `src/` and `rsc/` for reference; it is not interoperable with the browser release.
+
+## Development
+
+Requirements: Rust 1.85+, the `wasm32-unknown-unknown` target, Docker for image checks, and Node.js 22+ for browser E2E.
+
+Install the WASM target once:
+
+```sh
+rustup target add wasm32-unknown-unknown
+```
+
+Run the repository checks:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo check -p graphwar-client-wasm --target wasm32-unknown-unknown
+```
+
+Build the production image:
+
+```sh
+docker build -f deploy/Dockerfile .
+```
+
+The server requires PostgreSQL, `DATABASE_URL`, and `ALLOWED_ORIGINS`. For local development, use a disposable PostgreSQL instance and set `BIND_ADDR=127.0.0.1:8080`, `SECURE_COOKIES=false`, `GRAPHWAR_STATIC_DIR=assets/web`, plus the matching origin. Start the server with:
+
+```sh
+cargo run -p graphwar-server
+```
+
+Run browser delivery checks against a running server:
+
+```sh
+node scripts/e2e.mjs http://127.0.0.1:8080
+```
+
+## Docker Compose deployment
+
+The production stack uses `deploy/compose.yaml` for Graphwar, PostgreSQL, and `cloudflared`. The app shares the Cloudflare Tunnel network namespace; the tunnel routes its public hostname to `http://127.0.0.1:18081`. PostgreSQL has no host port and remains on the internal database network.
+
+1. Copy `.env.example` to `.env`.
+2. Set a strong `POSTGRES_PASSWORD`, the public `DOMAIN`, and `CLOUDFLARE_TUNNEL_TOKEN_FILE`.
+3. Store the Cloudflare tunnel token in the configured file. Keep that file outside Git; it is ignored by `.gitignore`.
+4. Configure the Cloudflare Public Hostname to route the domain to `http://127.0.0.1:18081`.
+5. Start and inspect the stack:
+
+```sh
+cp .env.example .env
+# Edit .env, then place the tunnel credential in the configured token file.
+docker compose --env-file .env -f deploy/compose.yaml up -d --build --wait
+docker compose --env-file .env -f deploy/compose.yaml ps
+docker compose --env-file .env -f deploy/compose.yaml exec app wget -qO- http://127.0.0.1:18081/healthz
+```
+
+Never paste tunnel tokens, database passwords, or `.env` contents into commits, chat, or logs. Changing `POSTGRES_PASSWORD` does not rotate an existing PostgreSQL role in an existing volume; perform credential rotation as a controlled database operation.
+
+## License
+
+GPL-3.0-or-later

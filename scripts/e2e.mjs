@@ -24,7 +24,8 @@ const CHROME_CANDIDATES = process.env.CHROME_BIN
           `${process.env["PROGRAMFILES(X86)"] ?? "C:\\Program Files (x86)"}\\Google\\Chrome\\Application\\chrome.exe`,
         ]
       : ["google-chrome", "chromium", "chromium-browser"];
-const PROTOCOL_VERSION = 5;
+const PROTOCOL_VERSION = 7;
+const CAPTURE_PATH = process.env.E2E_CAPTURE_PATH ? path.resolve(process.env.E2E_CAPTURE_PATH) : null;
 const timeoutMs = Number(process.env.E2E_TIMEOUT_MS ?? 15_000);
 if (BASE.protocol === "https:" && process.env.E2E_TLS_VERIFY === "false") {
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
@@ -364,7 +365,13 @@ class Cdp {
   on(method, handler) { this.events.set(method, [...(this.events.get(method) ?? []), handler]); }
   async evaluate(expression, awaitPromise = true) {
     const result = await this.command("Runtime.evaluate", {expression, awaitPromise, returnByValue: true});
-    if (result.exceptionDetails) throw new Error(`browser evaluation failed: ${result.exceptionDetails.text ?? "exception"}`);
+    if (result.exceptionDetails) {
+      const details = result.exceptionDetails;
+      const description = details.exception?.description ?? details.text ?? "exception";
+      const line = Number.isInteger(details.lineNumber) ? details.lineNumber + 1 : "?";
+      const column = Number.isInteger(details.columnNumber) ? details.columnNumber + 1 : "?";
+      throw new Error(`browser evaluation failed at ${line}:${column}: ${description}`);
+    }
     return result.result?.value;
   }
   close() { this.socket?.close(); }
@@ -453,7 +460,38 @@ async function browserSet(cdp, selector, value) {
 }
 async function browserSubmit(cdp, selector) { ok(await cdp.evaluate(`(() => { const e = document.querySelector(${JSON.stringify(selector)}); if (!e) return false; e.requestSubmit(); return true; })()`), `missing form ${selector}`); }
 async function browserClick(cdp, selector) { ok(await cdp.evaluate(`(() => { const e = document.querySelector(${JSON.stringify(selector)}); if (!e) return false; e.click(); return true; })()`), `missing control ${selector}`); }
+async function browserClickWithDialog(cdp, selector, response) {
+  let resolveDialog;
+  const dialog = new Promise(resolve => { resolveDialog = resolve; });
+  cdp.on("Page.javascriptDialogOpening", params => {
+    if (resolveDialog) {
+      const resolve = resolveDialog;
+      resolveDialog = null;
+      resolve(params);
+    }
+  });
+  const click = browserClick(cdp, selector);
+  const params = await withTimeout(dialog, timeoutMs, "browser password prompt");
+  ok(params.type === "prompt" && params.message === "Room password", "unexpected password dialog");
+  await cdp.command("Page.handleJavaScriptDialog", {
+    accept: response !== null,
+    ...(response === null ? {} : {promptText: response}),
+  });
+  await click;
+}
 async function browserText(cdp, selector) { return cdp.evaluate(`document.querySelector(${JSON.stringify(selector)})?.textContent ?? ""`); }
+async function browserCaptureGameplay(cdp) {
+  if (!CAPTURE_PATH) return;
+  await fs.mkdir(path.dirname(CAPTURE_PATH), {recursive: true});
+  const {data} = await cdp.command("Page.captureScreenshot", {
+    format: "png",
+    fromSurface: true,
+    captureBeyondViewport: false,
+  });
+  ok(data, "gameplay screenshot is empty");
+  await fs.writeFile(CAPTURE_PATH, Buffer.from(data, "base64"));
+  log(`gameplay screenshot: ${CAPTURE_PATH}`);
+}
 async function browserInstallRenderProbe(cdp, key, selectors) {
   ok(await cdp.evaluate(`(() => {
     const key = ${JSON.stringify(key)};
@@ -482,7 +520,7 @@ async function browserAssertRenderStable(cdp, key, label) {
 async function browserInstallGameRenderProbe(cdp) {
   await browserInstallRenderProbe(cdp, "game", [
     ".app-frame", "#screen", ".game-shell", "#game-canvas", "#fire-form", "#chat-form",
-    "#function-input", ".scoreboard ul", ".chat-panel ul",
+    "#function-input", ".soldier-name-labels", ".game-chat ul", ".fire-button", "#turn-timer",
   ]);
 }
 async function browserAssertGameStable(cdp, label) {
@@ -496,18 +534,24 @@ async function browserRegister(browser, user) {
   await browserSet(cdp, "#register-email", user.email);
   await browserSet(cdp, "#register-password", user.password);
   await browserSubmit(cdp, "#register-form");
-  await browserWait(cdp, "Boolean(document.querySelector('#create-room-form'))", "lobby screen");
+  await browserWait(cdp, "Boolean(document.querySelector('#create-room-open'))", "lobby screen");
   await browserWait(cdp, "Boolean(document.querySelector('.connection.is-online'))", "lobby connection");
 }
-async function browserCreate(cdp, name, visibility) {
+async function browserOpenCreate(cdp) {
+  await browserClick(cdp, "#create-room-open");
+  await browserWait(cdp, "document.querySelector('#create-room-dialog')?.open === true && document.activeElement?.id === 'room-name'", "create room dialog");
+}
+async function browserCreate(cdp, name, visibility, password = "") {
+  await browserOpenCreate(cdp);
   await browserSet(cdp, "#room-name", name);
   await cdp.evaluate(`document.querySelector('#room-visibility').value = ${JSON.stringify(visibility)}; document.querySelector('#room-visibility').dispatchEvent(new Event('change',{bubbles:true}))`);
+  if (visibility === "private") await browserSet(cdp, "#room-password", password);
   await browserSubmit(cdp, "#create-room-form");
   await browserWait(cdp, "Boolean(document.querySelector('#room-title'))", "room screen");
 }
 async function browserLeave(cdp) {
   await browserClick(cdp, "#leave-room");
-  await browserWait(cdp, "Boolean(document.querySelector('#create-room-form'))", "lobby after leave");
+  await browserWait(cdp, "Boolean(document.querySelector('#create-room-open'))", "lobby after leave");
 }
 
 async function browserFlows() {
@@ -540,6 +584,7 @@ async function browserFlows() {
     })()`), "login error replaced form or lost focus");
     await browserRegister(a, alpha);
     await browserRegister(b, bravo);
+    await browserOpenCreate(b.cdp);
     await browserSet(b.cdp, "#room-name", "preserved-lobby-draft");
     ok(await b.cdp.evaluate(`(() => {
       const input = document.querySelector('#room-name');
@@ -548,10 +593,23 @@ async function browserFlows() {
       return Boolean(input);
     })()`), "missing lobby draft input");
     await browserInstallRenderProbe(b.cdp, "lobby-list", [
-      ".app-frame", "#screen", ".lobby-shell", "#create-room-form", "#invite-room-form", "#room-name",
+      ".app-frame", "#screen", ".lobby-shell", "#create-room-dialog", "#create-room-form", "#room-name",
     ]);
     const publicName = `Public E2E ${crypto.randomUUID().slice(0, 8)}`;
     await browserCreate(a.cdp, publicName, "public");
+    await browserWait(a.cdp, `(() => {
+      const title = document.querySelector('#room-title');
+      const teamTwo = document.querySelector('.team-roster-2');
+      const row = document.querySelector('.player-slot');
+      return parseFloat(getComputedStyle(title).fontSize) <= 52
+        && document.querySelectorAll('.player-team').length === 0
+        && document.querySelectorAll('.player-soldiers').length === 1
+        && document.querySelectorAll('.remove-player').length === 0
+        && teamTwo?.querySelectorAll('.player-slot').length === 0
+        && teamTwo?.querySelector('.empty-team')?.tagName === 'P'
+        && row?.querySelector('.player-soldiers')
+        && !row?.querySelector('.remove-player');
+    })()`, "compact owner roster");
     const publicNameJs = JSON.stringify(publicName);
     await browserWait(b.cdp, `Boolean([...document.querySelectorAll('.room-list li')].find(li => li.querySelector('strong')?.textContent === ${publicNameJs}))`, "public room listing");
     await browserAssertRenderStable(b.cdp, "lobby-list", "lobby room-list update");
@@ -563,14 +621,302 @@ async function browserFlows() {
         && input.selectionEnd === 9
         && input.selectionDirection === 'forward';
     })()`), "lobby draft focus and caret lost");
-    ok(await b.cdp.evaluate(`(() => { const button = [...document.querySelectorAll('.room-list li')].find(li => li.querySelector('strong')?.textContent === ${publicNameJs})?.querySelector('.join-room'); if (!button) return false; button.click(); return true; })()`), "public room join control missing");
+    ok(await b.cdp.evaluate(`(() => { const button = [...document.querySelectorAll('.room-list li')].find(li => li.querySelector('strong')?.textContent === ${publicNameJs})?.querySelector('.join-room'); if (!button) return false; return button.dataset.roomProtected === 'false' && button.getAttribute('aria-label') === ${JSON.stringify(`Join room ${publicName}`)} && (button.click(), true); })()`), "public room join control missing or protected");
     await browserWait(b.cdp, "Boolean(document.querySelector('#room-title'))", "public roster guest");
     await browserWait(a.cdp, `(() => {
-      const rows = [...document.querySelectorAll('.roster li')];
-      return rows.length === 2
-        && rows.some(row => row.querySelector('strong')?.textContent === ${JSON.stringify(alpha.display_name)})
-        && rows.some(row => row.querySelector('strong')?.textContent === ${JSON.stringify(bravo.display_name)});
-    })()`, "public roster synchronization");
+      const teams = [...document.querySelectorAll('.team-roster')];
+      const roster = Object.fromEntries(teams.map(team => [
+        team.querySelector('ul')?.dataset.team,
+        [...team.querySelectorAll('.player-slot strong')].map(player => player.textContent),
+      ]));
+      const guestRow = [...document.querySelectorAll('.player-slot')]
+        .find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(bravo.display_name)});
+      const remove = guestRow?.querySelector('.remove-player');
+      const select = guestRow?.querySelector('.player-soldiers');
+      const removeRect = remove?.getBoundingClientRect();
+      const selectRect = select?.getBoundingClientRect();
+      return teams.length === 2
+        && teams.map(team => team.querySelector('h3')?.textContent).join('|') === 'Team One|Team Two'
+        && document.querySelectorAll('.roster li').length === 2
+        && document.querySelectorAll('.player-team').length === 0
+        && document.querySelectorAll('.player-soldiers').length === 2
+        && document.querySelectorAll('.remove-player').length === 1
+        && roster['1']?.includes(${JSON.stringify(alpha.display_name)})
+        && roster['2']?.includes(${JSON.stringify(bravo.display_name)})
+        && remove?.previousElementSibling?.querySelector('.player-soldiers') === select
+        && removeRect?.width >= 44
+        && removeRect?.height >= 44
+        && selectRect?.right <= removeRect?.left;
+    })()`, "public team roster synchronization");
+    await browserWait(b.cdp, `document.querySelectorAll('.player-soldiers').length === 2 && document.querySelectorAll('.remove-player').length === 0`, "guest roster controls");
+    for (const [cdp, owner] of [[a.cdp, true], [b.cdp, false]]) {
+      ok(await cdp.evaluate(`(() => {
+        const alpha = ${JSON.stringify(alpha.display_name)};
+        const bravo = ${JSON.stringify(bravo.display_name)};
+        const rowFor = name => [...document.querySelectorAll('.player-slot')]
+          .find(row => row.querySelector('strong')?.textContent === name);
+        const alphaRow = rowFor(alpha);
+        const bravoRow = rowFor(bravo);
+        const targets = [...document.querySelectorAll('.team-drop-target')];
+        return Boolean(alphaRow?.querySelector('.select-player')) === ${owner}
+          && Boolean(bravoRow?.querySelector('.select-player'))
+          && Boolean(alphaRow?.matches('[draggable="true"]')) === ${owner}
+          && Boolean(bravoRow?.matches('[draggable="true"]'))
+          && targets.length === 2
+          && targets.every(target => target.tabIndex >= 0
+            && target.getBoundingClientRect().width > 0
+            && target.getBoundingClientRect().height >= 44
+            && target.getAttribute('aria-disabled') === 'true');
+      })()`), `${owner ? "owner" : "guest"} team-transfer permissions or targets missing`);
+    }
+    const guestSoldiers = await a.cdp.evaluate(`(() => {
+      const row = [...document.querySelectorAll('.player-slot')]
+        .find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(bravo.display_name)});
+      return row?.querySelector('.player-soldiers')?.value;
+    })()`);
+    ok(guestSoldiers, "guest soldier count missing before team move");
+    await browserClick(a.cdp, "#ready-button");
+    await browserClick(b.cdp, "#ready-button");
+    await browserWait(a.cdp, "document.querySelector('#start-game')?.disabled === false", "ready before team move");
+    ok(await a.cdp.evaluate(`(() => {
+      const row = [...document.querySelectorAll('.player-slot')]
+        .find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(bravo.display_name)});
+      const move = row?.querySelector('.select-player');
+      move?.click();
+      return move
+        && row.closest('.team-roster')?.dataset.team === '2'
+        && move.getAttribute('aria-pressed') === 'true'
+        && document.querySelector('.team-drop-target[data-team="1"]')?.getAttribute('aria-disabled') === 'false'
+        && document.querySelector('.team-drop-target[data-team="2"]')?.getAttribute('aria-disabled') === 'true'
+        && document.querySelector('#roster-move-status')?.textContent.includes('selected');
+    })()`), "team selection should not optimistically move a card");
+    await browserClick(a.cdp, '.team-drop-target[data-team="1"]');
+    for (const cdp of [a.cdp, b.cdp]) {
+      await browserWait(cdp, `(() => {
+        const row = [...document.querySelectorAll('.player-slot')]
+          .find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(bravo.display_name)});
+        return row?.closest('.team-roster')?.dataset.team === '1'
+          && document.querySelector('#start-game')?.disabled === true
+          && row.querySelector('.player-soldiers')?.value === ${JSON.stringify(guestSoldiers)};
+      })()`, "authoritative owner team move");
+    }
+    ok(await a.cdp.evaluate(`(() => {
+      const button = [...document.querySelectorAll('.select-player')]
+        .find(button => button.closest('.player-slot')?.querySelector('strong')?.textContent === ${JSON.stringify(bravo.display_name)});
+      button?.focus();
+      return document.activeElement === button;
+    })()`), "owner move focus setup");
+    ok(await b.cdp.evaluate(`(() => {
+      const row = [...document.querySelectorAll('.player-slot')]
+        .find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(bravo.display_name)});
+      const move = row?.querySelector('.select-player');
+      move?.click();
+      return Boolean(move) && document.querySelector('.team-drop-target[data-team="2"]')?.getAttribute('aria-disabled') === 'false';
+    })()`), "guest self team selection missing");
+    await browserClick(b.cdp, '.team-drop-target[data-team="2"]');
+    for (const cdp of [a.cdp, b.cdp]) {
+      await browserWait(cdp, `(() => {
+        const row = [...document.querySelectorAll('.player-slot')]
+          .find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(bravo.display_name)});
+        return row?.closest('.team-roster')?.dataset.team === '2'
+          && row.querySelector('.player-soldiers')?.value === ${JSON.stringify(guestSoldiers)};
+      })()`, "authoritative guest self team move");
+    }
+    await browserWait(a.cdp, `(() => {
+      const active = document.activeElement;
+      return active?.matches('.select-player')
+        && active.closest('.player-slot')?.querySelector('strong')?.textContent === ${JSON.stringify(bravo.display_name)};
+    })()`, "team refresh focus restoration");
+    await browserWait(a.cdp, `document.querySelector('#announcements')?.textContent.includes(${JSON.stringify(`${bravo.display_name} moved to Team Two`)})`, "team move live announcement");
+    ok(await a.cdp.evaluate(`(() => {
+      const row = [...document.querySelectorAll('.player-slot')]
+        .find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(alpha.display_name)});
+      const source = row?.closest('.team-roster')?.dataset.team;
+      const target = source === '1' ? '2' : '1';
+      const roster = document.querySelector('.team-roster-' + target);
+      const data = new DataTransfer();
+      row?.dispatchEvent(new DragEvent('dragstart', {bubbles: true, cancelable: true, dataTransfer: data}));
+      const unchanged = row?.closest('.team-roster')?.dataset.team === source
+        && data.getData('text/plain') === row?.dataset.playerId;
+      roster?.dispatchEvent(new DragEvent('dragover', {bubbles: true, cancelable: true, dataTransfer: data}));
+      roster?.dispatchEvent(new DragEvent('drop', {bubbles: true, cancelable: true, dataTransfer: data}));
+      return unchanged;
+    })()`), "desktop drag setup should retain the card until server confirmation");
+    for (const cdp of [a.cdp, b.cdp]) {
+      await browserWait(cdp, `(() => {
+        const row = [...document.querySelectorAll('.player-slot')]
+          .find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(alpha.display_name)});
+        return row?.closest('.team-roster')?.dataset.team === '2';
+      })()`, "authoritative desktop drag move");
+    }
+    ok(await a.cdp.evaluate(`(() => {
+      const row = [...document.querySelectorAll('.player-slot')]
+        .find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(alpha.display_name)});
+      row?.querySelector('.select-player')?.click();
+      return Boolean(row);
+    })()`), "owner restore selection missing");
+    await browserClick(a.cdp, '.team-drop-target[data-team="1"]');
+    for (const cdp of [a.cdp, b.cdp]) {
+      await browserWait(cdp, `(() => {
+        const row = [...document.querySelectorAll('.player-slot')]
+          .find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(alpha.display_name)});
+        return row?.closest('.team-roster')?.dataset.team === '1';
+      })()`, "authoritative team restoration");
+    }
+    await browserWait(a.cdp, `(() => {
+      const first = document.querySelector('.team-roster-1')?.getBoundingClientRect();
+      const second = document.querySelector('.team-roster-2')?.getBoundingClientRect();
+      return first && second && first.left < second.left && Math.abs(first.top - second.top) < 4
+        && document.documentElement.scrollWidth <= innerWidth;
+    })()`, "desktop team roster layout");
+    await a.cdp.command("Emulation.setDeviceMetricsOverride", {width: 390, height: 844, deviceScaleFactor: 1, mobile: true});
+    await browserWait(a.cdp, `(() => {
+      const first = document.querySelector('.team-roster-1')?.getBoundingClientRect();
+      const second = document.querySelector('.team-roster-2')?.getBoundingClientRect();
+      return first && second && first.top < second.top && document.documentElement.scrollWidth <= innerWidth;
+    })()`, "mobile team roster stack");
+    await a.cdp.command("Emulation.setDeviceMetricsOverride", {width: 1280, height: 800, deviceScaleFactor: 1, mobile: false});
+    const roomChatLayout = await a.cdp.evaluate(`(() => {
+      const panel = document.querySelector('.room-chat');
+      const list = panel?.querySelector('ul');
+      const form = panel?.querySelector('#chat-form');
+      const rect = panel?.getBoundingClientRect();
+      const styles = panel ? getComputedStyle(panel) : null;
+      return {
+        className: panel?.className ?? null,
+        position: styles?.position ?? null,
+        bottomGap: rect ? innerHeight - rect.bottom : null,
+        left: rect?.left ?? null,
+        right: rect?.right ?? null,
+        width: rect?.width ?? null,
+        viewport: [innerWidth, innerHeight],
+        transform: styles?.transform ?? null,
+        backdropFilter: styles?.backdropFilter ?? styles?.webkitBackdropFilter ?? null,
+        backgroundColor: styles?.backgroundColor ?? null,
+        overflowY: list ? getComputedStyle(list).overflowY : null,
+        hasForm: Boolean(form),
+      };
+    })()`);
+    ok(roomChatLayout?.className?.includes('field-log')
+      && !roomChatLayout?.className?.includes('game-chat')
+      && roomChatLayout.position === 'fixed'
+      && roomChatLayout.bottomGap >= 0
+      && roomChatLayout.bottomGap <= 32
+      && roomChatLayout.left >= 0
+      && roomChatLayout.left <= 24
+      && roomChatLayout.right <= roomChatLayout.viewport[0]
+      && roomChatLayout.width <= 440
+      && roomChatLayout.transform === 'none'
+      && roomChatLayout.backdropFilter !== 'none'
+      && /^rgba\([^,]+,[^,]+,[^,]+,\s*0\.[0-9]+\)$/.test(roomChatLayout.backgroundColor)
+      && roomChatLayout.overflowY === 'auto'
+      && roomChatLayout.hasForm,
+    `room chat should be fixed at the viewport bottom: ${JSON.stringify(roomChatLayout)}`);
+    const roomChatOverflow = await a.cdp.evaluate(`(() => {
+      const panel = document.querySelector('.room-chat');
+      const list = panel?.querySelector('ul');
+      const form = panel?.querySelector('#chat-form');
+      const shell = document.querySelector('.room-shell');
+      const grid = document.querySelector('.room-grid');
+      if (!panel || !list || !form || !shell || !grid) return null;
+      const original = list.innerHTML;
+      const rows = count => Array.from({length: count}, (_, index) =>
+        '<li class="chat-message"><strong>Test:</strong> <span>Overflow message ' + index + '</span></li>'
+      ).join('');
+      const measure = () => ({
+        panelHeight: panel.getBoundingClientRect().height,
+        formTop: form.getBoundingClientRect().top,
+        formBottom: form.getBoundingClientRect().bottom,
+        shellHeight: shell.getBoundingClientRect().height,
+        gridHeight: grid.getBoundingClientRect().height,
+        documentHeight: document.documentElement.scrollHeight,
+      });
+      const empty = measure();
+      list.innerHTML = rows(40);
+      list.scrollTop = list.scrollHeight;
+      const first = measure();
+      list.innerHTML = rows(80);
+      list.scrollTop = list.scrollHeight;
+      const second = {
+        ...measure(),
+        scrollHeight: list.scrollHeight,
+        clientHeight: list.clientHeight,
+        scrollTop: list.scrollTop,
+        overflowY: getComputedStyle(list).overflowY,
+        maxHeight: getComputedStyle(list).maxHeight,
+        panelPosition: getComputedStyle(panel).position,
+        panelBottomGap: innerHeight - panel.getBoundingClientRect().bottom,
+        formInside: form.getBoundingClientRect().top >= panel.getBoundingClientRect().top - 1
+          && form.getBoundingClientRect().bottom <= panel.getBoundingClientRect().bottom + 1,
+        horizontalOverflow: document.documentElement.scrollWidth > innerWidth,
+      };
+      list.innerHTML = original;
+      return {empty, first, second};
+    })()`);
+    ok(roomChatOverflow
+      && roomChatOverflow.second.scrollHeight > roomChatOverflow.second.clientHeight
+      && roomChatOverflow.second.scrollTop > 0
+      && roomChatOverflow.second.overflowY === 'auto'
+      && roomChatOverflow.second.maxHeight === 'none'
+      && roomChatOverflow.second.panelPosition === 'fixed'
+      && roomChatOverflow.second.panelBottomGap >= 0
+      && roomChatOverflow.second.panelBottomGap <= 32
+      && roomChatOverflow.second.formInside
+      && Math.abs(roomChatOverflow.first.panelHeight - roomChatOverflow.empty.panelHeight) < 1
+      && Math.abs(roomChatOverflow.second.panelHeight - roomChatOverflow.first.panelHeight) < 1
+      && Math.abs(roomChatOverflow.second.formTop - roomChatOverflow.first.formTop) < 1
+      && Math.abs(roomChatOverflow.second.shellHeight - roomChatOverflow.first.shellHeight) < 1
+      && Math.abs(roomChatOverflow.second.gridHeight - roomChatOverflow.first.gridHeight) < 1
+      && Math.abs(roomChatOverflow.second.documentHeight - roomChatOverflow.first.documentHeight) < 1
+      && !roomChatOverflow.second.horizontalOverflow,
+    `room chat should scroll without growing the room layout: ${JSON.stringify(roomChatOverflow)}`);
+    await a.cdp.command("Emulation.setDeviceMetricsOverride", {width: 390, height: 844, deviceScaleFactor: 1, mobile: true});
+    const mobileRoomChat = await a.cdp.evaluate(`(() => {
+      const panel = document.querySelector('.room-chat');
+      const list = panel?.querySelector('ul');
+      const form = panel?.querySelector('#chat-form');
+      if (!panel || !list || !form) return null;
+      const original = list.innerHTML;
+      list.innerHTML = Array.from({length: 50}, (_, index) =>
+        '<li class="chat-message"><strong>Test:</strong> <span>Mobile overflow message ' + index + '</span></li>'
+      ).join('');
+      list.scrollTop = list.scrollHeight;
+      const panelRect = panel.getBoundingClientRect();
+      const formRect = form.getBoundingClientRect();
+      const result = {
+        position: getComputedStyle(panel).position,
+        overflowY: getComputedStyle(list).overflowY,
+        scrollHeight: list.scrollHeight,
+        clientHeight: list.clientHeight,
+        scrollTop: list.scrollTop,
+        bottomGap: innerHeight - panelRect.bottom,
+        left: panelRect.left,
+        right: panelRect.right,
+        width: panelRect.width,
+        viewportWidth: innerWidth,
+        transform: getComputedStyle(panel).transform,
+        formInside: formRect.top >= panelRect.top - 1 && formRect.bottom <= panelRect.bottom + 1,
+        horizontalOverflow: document.documentElement.scrollWidth > innerWidth,
+      };
+      list.innerHTML = original;
+      return result;
+    })()`);
+    ok(mobileRoomChat
+      && mobileRoomChat.position === 'fixed'
+      && mobileRoomChat.overflowY === 'auto'
+      && mobileRoomChat.scrollHeight > mobileRoomChat.clientHeight
+      && mobileRoomChat.scrollTop > 0
+      && mobileRoomChat.bottomGap >= 0
+      && mobileRoomChat.bottomGap <= 32
+      && mobileRoomChat.left >= 0
+      && mobileRoomChat.left <= 16
+      && mobileRoomChat.right <= mobileRoomChat.viewportWidth
+      && mobileRoomChat.width <= mobileRoomChat.viewportWidth
+      && mobileRoomChat.transform === 'none'
+      && mobileRoomChat.formInside
+      && !mobileRoomChat.horizontalOverflow,
+    `mobile room chat should remain bounded and usable: ${JSON.stringify(mobileRoomChat)}`);
+    await a.cdp.command("Emulation.setDeviceMetricsOverride", {width: 1280, height: 800, deviceScaleFactor: 1, mobile: false});
     ok(await a.cdp.evaluate(`(() => {
       const input = document.querySelector('#chat-input');
       if (!input) return false;
@@ -582,7 +928,7 @@ async function browserFlows() {
     await browserInstallRenderProbe(a.cdp, "room-roster", [
       ".app-frame", "#screen", ".room-shell", "#ready-button", "#chat-form", "#chat-input",
     ]);
-    await browserSet(b.cdp, ".player-soldiers", "1");
+    await browserSet(b.cdp, ".player-soldiers:not(:disabled)", "1");
     await browserWait(a.cdp, `(() => {
       const input = document.querySelector('#chat-input');
       return input?.value === 'draft-chat'
@@ -593,8 +939,7 @@ async function browserFlows() {
     })()`, "draft focus and caret preservation");
     await browserAssertRenderStable(a.cdp, "room-roster", "room roster update");
     ok(await a.cdp.evaluate(`(() => { const input = document.querySelector('#chat-input'); if (!input) return false; input.value = ''; return true; })()`), "missing draft chat input");
-    await browserSet(a.cdp, ".player-soldiers", "1");
-    await browserSet(b.cdp, ".player-team", "2");
+    await browserSet(a.cdp, ".player-soldiers:not(:disabled)", "1");
     ok(await a.cdp.evaluate(`(() => {
       const input = document.querySelector('#chat-input');
       const form = document.querySelector('#chat-form');
@@ -604,30 +949,88 @@ async function browserFlows() {
       form.requestSubmit();
       return true;
     })()`), "missing chat form");
-    await browserWait(b.cdp, "document.body.textContent.includes('public-chat')", "chat delivery");
+    await browserWait(b.cdp, `(() => {
+      const message = [...document.querySelectorAll('.room-chat .chat-message')]
+        .find(row => row.textContent.includes('public-chat'));
+      return message?.textContent.trim() === ${JSON.stringify(`${alpha.display_name}: public-chat`)};
+    })()`, "chat delivery and name-message format");
     await browserClick(a.cdp, "#ready-button");
     await browserClick(b.cdp, "#ready-button");
     await browserWait(a.cdp, "document.querySelector('#start-game')?.disabled === false", "start enabled");
     await browserClick(a.cdp, "#start-game");
     await browserWait(a.cdp, "Boolean(document.querySelector('#game-canvas'))", "public game owner", 20_000);
     await browserWait(b.cdp, "Boolean(document.querySelector('#game-canvas'))", "public game guest", 20_000);
+    await browserWait(a.cdp, "document.querySelectorAll('.soldier-name-label').length === 2 && document.querySelectorAll('.soldier-name-label.is-active').length === 1", "owner soldier labels", 20_000);
+    await browserWait(b.cdp, "document.querySelectorAll('.soldier-name-label').length === 2 && document.querySelectorAll('.soldier-name-label.is-active').length === 1", "guest soldier labels", 20_000);
+    const activeIsA = await a.cdp.evaluate("document.querySelector('#function-input')?.disabled === false");
+    const activeName = activeIsA ? alpha.display_name : bravo.display_name;
     for (const cdp of [a.cdp, b.cdp]) {
-      ok(await cdp.evaluate(`(() => {
+      const battlefieldSemantics = await cdp.evaluate(`(() => {
         const canvas = document.querySelector('#game-canvas');
         const summary = document.querySelector('#battlefield-summary');
-        const teams = [...document.querySelectorAll('.scoreboard .team-name')].map(node => node.textContent);
-        return canvas?.getAttribute('aria-label') === 'Graphwar battlefield'
-          && canvas?.getAttribute('aria-describedby') === summary?.id
-          && summary?.textContent.includes('Team One')
-          && summary?.textContent.includes('Team Two')
-          && teams.includes('Team One')
-          && teams.includes('Team Two')
-          && document.querySelector('.map-panel')?.classList.contains('field-map')
-          && document.querySelector('.chat-panel')?.classList.contains('field-log')
-          && document.querySelectorAll('.notices').length === 0
-          && Boolean(document.querySelector('.chat-panel ul'))
-          && !document.querySelector('.combat-log');
-      })()`), "battlefield accessibility semantics missing");
+        const field = document.querySelector('.battlefield');
+        const wrapper = document.querySelector('.soldier-name-labels');
+        const labels = [...document.querySelectorAll('.soldier-name-label')];
+        const activeLabel = document.querySelector('.soldier-name-label.is-active');
+        const fieldRect = field?.getBoundingClientRect();
+        const expectedNames = ${JSON.stringify([alpha.display_name, bravo.display_name])};
+        const keys = labels.map(label => label.dataset.playerId + ':' + label.dataset.soldierIndex);
+        const labelsFit = labels.every(label => {
+          const labelRect = label.getBoundingClientRect();
+          const x = Number.parseFloat(label.style.getPropertyValue('--soldier-x'));
+          const y = Number.parseFloat(label.style.getPropertyValue('--soldier-y'));
+          const soldierX = fieldRect?.left + fieldRect?.width * x / 100;
+          const soldierY = fieldRect?.top + fieldRect?.height * y / 100;
+          return label.dataset.playerId
+            && /^\\d+$/.test(label.dataset.soldierIndex)
+            && Number.isFinite(soldierX) && Number.isFinite(soldierY)
+            && labelRect.left >= fieldRect.left && labelRect.right <= fieldRect.right
+            && labelRect.top >= fieldRect.top && labelRect.bottom < soldierY
+            && Math.abs(labelRect.left + labelRect.width / 2 - soldierX) <= labelRect.width / 2 + 4;
+        });
+        const activeStyle = activeLabel && getComputedStyle(activeLabel);
+        const passiveLabel = labels.find(label => !label.classList.contains('is-active'));
+        const passiveStyle = passiveLabel && getComputedStyle(passiveLabel);
+        return {
+          canvas: canvas?.getAttribute('aria-label') === 'Graphwar battlefield'
+            && canvas?.getAttribute('aria-describedby') === summary?.id,
+          summary: summary?.textContent.includes('Team One')
+            && summary?.textContent.includes('Team Two')
+            && summary?.textContent.includes(${JSON.stringify(activeName)}),
+          wrapper: wrapper?.getAttribute('aria-hidden') === 'true',
+          labels: labels.length === 2
+            && expectedNames.every(name => labels.some(label => label.textContent === name))
+            && new Set(keys).size === labels.length,
+          active: activeLabel?.textContent === ${JSON.stringify(activeName)}
+            && activeStyle?.borderBottomColor !== passiveStyle?.borderBottomColor
+            && activeStyle?.textShadow !== passiveStyle?.textShadow,
+          labelsFit,
+          layout: !document.querySelector('.scoreboard')
+            && !document.body.textContent.includes('Field report')
+            && document.querySelector('.map-panel')?.classList.contains('field-map')
+            && document.querySelector('.game-chat')?.classList.contains('field-log')
+            && getComputedStyle(document.querySelector('.game-chat')).position !== 'fixed'
+            && !document.querySelector('.room-chat')
+            && document.querySelectorAll('.notices').length === 0
+            && Boolean(document.querySelector('.game-chat ul'))
+            && !document.querySelector('.combat-log'),
+        labelRects: labels.map(label => label.getBoundingClientRect().toJSON()),
+        fieldRect: fieldRect?.toJSON(),
+      };
+      })()`);
+      ok(Object.values(battlefieldSemantics).filter(value => typeof value === 'boolean').every(Boolean), `battlefield soldier labels or accessibility semantics missing: ${JSON.stringify(battlefieldSemantics)}`);
+      ok(await cdp.evaluate(`(() => {
+        const timer = document.querySelector('.fire-button #turn-timer');
+        const heading = document.querySelector('.map-heading');
+        const button = document.querySelector('.fire-button');
+        const progress = Number.parseFloat(getComputedStyle(button).getPropertyValue('--turn-progress'));
+        return heading?.querySelector('.eyebrow')?.textContent.trim() === 'Coordinate field / 01'
+          && heading?.querySelector('h2')?.textContent.trim() === 'Battlefield'
+          && timer?.getAttribute('role') === 'timer'
+          && /^\\d+s$/.test(timer.textContent.trim())
+          && button?.getAttribute('aria-describedby')?.split(/\\s+/).includes('turn-timer')
+          && progress >= 0 && progress <= 100;
+      })()`), "fire countdown semantics missing");
     }
     for (const viewport of [
       {width: 1920, height: 1080, deviceScaleFactor: 1},
@@ -650,10 +1053,26 @@ async function browserFlows() {
           && document.documentElement.scrollWidth <= ${viewport.width};
       })()`, `tactical layout ${viewport.width}x${viewport.height}`);
     }
+    const active = activeIsA ? a.cdp : b.cdp;
+    const inactive = activeIsA ? b.cdp : a.cdp;
+    const initialProgress = Number.parseFloat(await active.evaluate(
+      "getComputedStyle(document.querySelector('.fire-button')).getPropertyValue('--turn-progress')",
+    ));
+    await browserWait(active, `(() => {
+      const value = Number.parseFloat(getComputedStyle(document.querySelector('.fire-button')).getPropertyValue('--turn-progress'));
+      return Number.isFinite(value) && value < ${initialProgress};
+    })()`, "fire countdown progress", 3_000);
+    if (CAPTURE_PATH) {
+      await active.command("Emulation.setDeviceMetricsOverride", {width: 1440, height: 900, deviceScaleFactor: 1, mobile: false});
+      await browserSet(active, "#function-input", "sin(x)");
+      await browserWait(active, "document.querySelector('#function-error')?.textContent === ''", "gameplay capture preview");
+      await sleep(150);
+      await browserCaptureGameplay(active);
+    }
     const chatLayout = await a.cdp.evaluate(`(() => {
-      const list = document.querySelector('.command-stack .chat-panel ul');
-      const panel = document.querySelector('.command-stack .chat-panel');
-      const form = document.querySelector('.command-stack .chat-panel form');
+      const list = document.querySelector('.command-stack .game-chat ul');
+      const panel = document.querySelector('.command-stack .game-chat');
+      const form = document.querySelector('.command-stack .game-chat form');
       const stack = document.querySelector('.command-stack');
       const field = document.querySelector('.battlefield');
       if (!list || !panel || !form || !stack || !field) return null;
@@ -690,9 +1109,6 @@ async function browserFlows() {
       && Math.abs(chatLayout.documentHeight - chatLayout.documentHeightBefore) < 1,
     `game chat should scroll without growing the battlefield: ${JSON.stringify(chatLayout)}`);
     for (const cdp of [a.cdp, b.cdp]) await browserInstallGameRenderProbe(cdp);
-    const activeIsA = await a.cdp.evaluate("document.querySelector('#function-input')?.disabled === false");
-    const active = activeIsA ? a.cdp : b.cdp;
-    const inactive = activeIsA ? b.cdp : a.cdp;
     const previewExceptions = [];
     active.on("Runtime.exceptionThrown", ({exceptionDetails}) => previewExceptions.push(exceptionDetails.text ?? "browser exception"));
     await browserSet(active, "#function-input", "x+");
@@ -723,7 +1139,7 @@ async function browserFlows() {
       await browserSubmit(cdp, "#chat-form");
     }
     const orderedFeed = `(() => {
-      const rows = [...document.querySelectorAll('.chat-panel ul > li')];
+      const rows = [...document.querySelectorAll('.game-chat ul > li')];
       const sequences = rows.map(row => Number(row.dataset.sequence));
       return rows.length >= 3
         && new Set(sequences).size === rows.length
@@ -733,10 +1149,21 @@ async function browserFlows() {
         && rows.findIndex(row => row.classList.contains('shot-entry') && row.querySelector('code')?.textContent === 'sin(x)') + 1 === rows.findIndex(row => row.textContent.includes('chat-after'));
     })()`;
     await sendGameChat(active, "chat-before");
-    await browserWait(inactive, "document.querySelector('.chat-panel ul')?.textContent.includes('chat-before')", "pre-shot chat delivery");
+    await browserWait(inactive, "document.querySelector('.game-chat ul')?.textContent.includes('chat-before')", "pre-shot chat delivery");
     await browserSubmit(active, "#fire-form");
     await browserWait(active, "document.querySelector('#turn-timer')?.textContent.includes('Resolving')", "authoritative shot", 20_000);
     await browserWait(inactive, "document.querySelector('#turn-timer')?.textContent.includes('Resolving')", "remote authoritative shot", 20_000);
+    for (const cdp of [active, inactive]) {
+      ok(await cdp.evaluate(`(() => {
+        const button = document.querySelector('.fire-button');
+        const labels = document.querySelectorAll('.soldier-name-label');
+        const activeLabel = document.querySelector('.soldier-name-label.is-active');
+        return button?.disabled
+          && Number.parseFloat(getComputedStyle(button).getPropertyValue('--turn-progress')) === 0
+          && labels.length === 2
+          && activeLabel?.textContent === ${JSON.stringify(activeName)};
+      })()`), "resolving shot should retain all names and highlight the shooter");
+    }
     await sendGameChat(active, "chat-after");
     for (const cdp of [a.cdp, b.cdp]) {
       await browserWait(cdp, orderedFeed, "authoritative chat-shot-chat order");
@@ -747,9 +1174,17 @@ async function browserFlows() {
         ".app-frame", "#screen", ".game-shell", "#game-canvas", "#fire-form", "#chat-form", "#chat-input",
       ]);
     }
+    await browserWait(inactive, `(() => {
+      const input = document.querySelector('#function-input');
+      const labels = document.querySelectorAll('.soldier-name-label');
+      const activeLabel = document.querySelector('.soldier-name-label.is-active');
+      return input?.disabled === false
+        && labels.length === 2
+        && activeLabel?.textContent === ${JSON.stringify(activeIsA ? bravo.display_name : alpha.display_name)};
+    })()`, "next authoritative turn highlight", 20_000);
     await sendGameChat(active, "game-chat");
     await browserWait(inactive, `(() => {
-      const feed = document.querySelector('.chat-panel ul');
+      const feed = document.querySelector('.game-chat ul');
       return feed?.textContent.includes('game-chat')
         && [...feed.querySelectorAll('.shot-entry code')].some(code => code.textContent === 'sin(x)');
     })()`, "in-game unified feed delivery");
@@ -772,7 +1207,7 @@ async function browserFlows() {
     await browserWait(a.cdp, "Boolean(document.querySelector('#game-canvas'))", "state sync after refresh", 20_000);
     await browserWait(a.cdp, orderedFeed, "ordered feed after refresh");
     await browserWait(a.cdp, `(() => {
-      const rows = [...document.querySelectorAll('.chat-panel ul > li')];
+      const rows = [...document.querySelectorAll('.game-chat ul > li')];
       const sequences = rows.map(row => row.dataset.sequence);
       return rows.length >= 5 && new Set(sequences).size === rows.length;
     })()`, "deduplicated feed after refresh");
@@ -800,83 +1235,183 @@ async function browserFlows() {
     try {
       c = await launchBrowser(BASE);
       d = await launchBrowser(BASE);
+      const privateGuest = browserUser("private-guest");
       await browserRegister(c, browserUser("private-owner"));
-      await browserRegister(d, browserUser("private-guest"));
+      await browserRegister(d, privateGuest);
       await d.cdp.command("Emulation.setDeviceMetricsOverride", {width: 320, height: 800, deviceScaleFactor: 1, mobile: false});
       ok(await d.cdp.evaluate(`(() => {
-        const forms = [...document.querySelectorAll('#create-room-form, #invite-room-form')];
+        const button = document.querySelector('#create-room-open');
         return getComputedStyle(document.documentElement).colorScheme === 'light'
-          && forms.every(form => form.classList.contains('command-slip'))
+          && button?.getBoundingClientRect().right <= 320
+          && button?.getBoundingClientRect().height >= 44
+          && !document.querySelector('#create-room-dialog')?.open
+          && !document.querySelector('#invite-room-form')
           && document.querySelectorAll('.room-card').length >= 0
-          && document.documentElement.scrollWidth <= 320
-          && forms.every(form => form.getBoundingClientRect().right <= 320)
-          && [...document.querySelectorAll('#create-room-form button, #invite-room-form button, #create-room-form input, #invite-room-form input, #create-room-form select')]
-            .every(control => control.getBoundingClientRect().height >= 44);
-      })()`), "mobile lobby forms overflow or miss touch targets");
+          && document.documentElement.scrollWidth <= 320;
+      })()`), "mobile lobby create control overflow or misses touch target");
+      await browserOpenCreate(d.cdp);
+      const mobileCreateLayout = await d.cdp.evaluate(`(() => {
+        const dialog = document.querySelector('#create-room-dialog');
+        const form = document.querySelector('#create-room-form');
+        const password = document.querySelector('#room-password');
+        const controls = [...(form?.querySelectorAll('button, input, select') ?? [])]
+          .filter(control => control.offsetParent);
+        return {
+          open: Boolean(dialog?.open),
+          dialogLeft: dialog?.getBoundingClientRect().left,
+          dialogRight: dialog?.getBoundingClientRect().right,
+          formRight: form?.getBoundingClientRect().right,
+          passwordHidden: !document.querySelector('#room-password-field')?.offsetParent,
+          passwordDisabled: password?.disabled,
+          controlHeights: controls.map(control => control.getBoundingClientRect().height),
+          scrollWidth: document.documentElement.scrollWidth,
+          viewportWidth: innerWidth,
+        };
+      })()`);
+      ok(mobileCreateLayout.open
+        && mobileCreateLayout.dialogLeft >= 0
+        && mobileCreateLayout.dialogRight <= mobileCreateLayout.viewportWidth
+        && mobileCreateLayout.formRight <= mobileCreateLayout.viewportWidth
+        && mobileCreateLayout.passwordHidden
+        && mobileCreateLayout.passwordDisabled
+        && mobileCreateLayout.controlHeights.every(height => height >= 44)
+        && mobileCreateLayout.scrollWidth <= mobileCreateLayout.viewportWidth,
+      `mobile create dialog overflow or misses public form state: ${JSON.stringify(mobileCreateLayout)}`);
+      await browserClick(d.cdp, "#create-room-cancel");
+      await browserWait(d.cdp, "document.querySelector('#create-room-dialog')?.open === false", "create room cancel");
+      await browserWait(d.cdp, "document.activeElement?.id === 'create-room-open'", "create room cancel opener focus");
+      await browserOpenCreate(d.cdp);
+      await d.cdp.evaluate(`document.querySelector('#room-visibility').value = 'private'; document.querySelector('#room-visibility').dispatchEvent(new Event('change',{bubbles:true}))`);
+      ok(await d.cdp.evaluate(`(() => {
+        const field = document.querySelector('#room-password-field');
+        const password = document.querySelector('#room-password');
+        return !field?.hidden && !password?.disabled && password?.required;
+      })()`), "private room password field did not appear");
+      await browserSet(d.cdp, "#room-password", "discarded-password");
+      await d.cdp.evaluate(`document.querySelector('#room-visibility').value = 'public'; document.querySelector('#room-visibility').dispatchEvent(new Event('change',{bubbles:true}))`);
+      ok(await d.cdp.evaluate(`document.querySelector('#room-password-field')?.hidden && document.querySelector('#room-password')?.disabled && document.querySelector('#room-password')?.value === ''`), "public room kept a password field or draft");
+      await d.cdp.command("Input.dispatchKeyEvent", {type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27});
+      await d.cdp.command("Input.dispatchKeyEvent", {type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27});
+      await browserWait(d.cdp, "document.querySelector('#create-room-dialog')?.open === false", "create room escape");
+      await browserWait(d.cdp, "document.activeElement?.id === 'create-room-open'", "create room escape opener focus");
       await d.cdp.command("Emulation.setDeviceMetricsOverride", {width: 1280, height: 800, deviceScaleFactor: 1, mobile: false});
       const privateName = `Private E2E ${crypto.randomUUID().slice(0, 8)}`;
-      await browserCreate(c.cdp, privateName, "private");
-      const notice = await browserText(c.cdp, ".notices");
-      const invite = notice.match(/Private room:\s*([0-9a-f-]{36})\s*·\s*invite:\s*([0-9a-f-]{36})/i);
-      ok(invite, "private room invite not displayed");
-      ok(await c.cdp.evaluate(`(() => {
-        const list = document.querySelector('.notices');
-        const live = document.querySelector('#announcements');
-        return list?.getAttribute('aria-label') === 'Recent notices'
-          && live?.textContent.includes('Private room:')
-          && document.querySelectorAll('.invite-notice').length === 1;
-      })()`), "private invite was not announced exactly once");
-      ok(
-        !await d.cdp.evaluate(`[...document.querySelectorAll('.room-list strong')].some(node => node.textContent === ${JSON.stringify(privateName)})`),
-        "private room leaked into lobby listing",
-      );
+      const roomPassword = `room-${crypto.randomUUID()}`;
+      await browserCreate(c.cdp, privateName, "private", roomPassword);
+      const privateNameJs = JSON.stringify(privateName);
+      await browserWait(d.cdp, `Boolean([...document.querySelectorAll('.room-list li')].find(li => li.querySelector('strong')?.textContent === ${privateNameJs}))`, "guest protected room listing");
+      const privateRoom = await d.cdp.evaluate(`(() => {
+        const card = [...document.querySelectorAll('.room-list li')]
+          .find(li => li.querySelector('strong')?.textContent === ${privateNameJs});
+        const button = card?.querySelector('.join-room');
+        return card && button ? {
+          id: button.dataset.roomId,
+          protected: button.dataset.roomProtected,
+          label: button.getAttribute('aria-label'),
+          lockText: card.querySelector('.room-lock .sr-only')?.textContent,
+          buttonHeight: button.getBoundingClientRect().height,
+        } : null;
+      })()`);
+      ok(privateRoom?.id
+        && privateRoom.protected === 'true'
+        && privateRoom.label === `Join protected room ${privateName}`
+        && privateRoom.lockText === 'Protected room'
+        && privateRoom.buttonHeight >= 44,
+      `protected room card semantics missing: ${JSON.stringify(privateRoom)}`);
+      ok(!await d.cdp.evaluate(`document.body.textContent.includes(${JSON.stringify(roomPassword)})`), "room password leaked into browser DOM");
       const privateProtocol = await registerAndLogin("private-protocol");
       const privateWs = await openWs(privateProtocol.cookie);
       privateWs.sendText(JSON.stringify({type: "list_rooms"}));
       const privateRooms = JSON.parse((await privateWs.next("private websocket room list")).text);
+      const listedPrivate = privateRooms.payload.rooms.find(room => room.id === privateRoom.id);
       ok(
         privateRooms.type === "room_list"
-          && !privateRooms.payload.rooms.some(room => room.id === invite[1]),
-        "private room leaked into protocol room list",
+          && listedPrivate?.visibility === "private"
+          && !JSON.stringify(privateRooms).includes(roomPassword),
+        "private room missing from credential-free protocol listing",
       );
-      privateWs.sendText(JSON.stringify({type: "join_room", payload: {room_id: invite[1], invite: null}}));
-      const missingInvite = JSON.parse((await privateWs.next("missing private invite rejection")).text);
-      ok(missingInvite.type === "error" && missingInvite.payload.code === "private", "missing invite was accepted");
+      for (const invite of [null, "wrong-password"]) {
+        privateWs.sendText(JSON.stringify({type: "join_room", payload: {room_id: privateRoom.id, invite}}));
+        const rejected = JSON.parse((await privateWs.next("private credential rejection")).text);
+        ok(rejected.type === "error" && rejected.payload.code === "private", "invalid room password was accepted");
+      }
+      privateWs.sendText(JSON.stringify({type: "join_room", payload: {room_id: privateRoom.id, invite: roomPassword}}));
+      const joined = JSON.parse((await privateWs.next("private raw websocket join")).text);
+      ok(joined.type === "room" && joined.payload.snapshot.id === privateRoom.id, "correct raw password was rejected");
+      const joinedList = JSON.parse((await privateWs.next("private join room list")).text);
+      ok(joinedList.type === "room_list", "private join room list missing");
+      privateWs.sendText(JSON.stringify({type: "leave_room"}));
+      const left = JSON.parse((await privateWs.next("private raw websocket leave")).text);
+      ok(left.type === "left_room", `raw protected guest could not leave: ${JSON.stringify(left)}`);
       privateWs.close();
-      await browserSet(d.cdp, "#private-room-id", invite[1]);
-      await browserSet(d.cdp, "#invite-code", crypto.randomUUID());
-      ok(await d.cdp.evaluate(`(() => {
-        const input = document.querySelector('#invite-code');
-        input?.focus();
-        input?.setSelectionRange(3, 8, 'forward');
-        return Boolean(input);
-      })()`), "missing private invite input");
       await browserInstallRenderProbe(d.cdp, "lobby-notice", [
-        ".app-frame", "#screen", ".lobby-shell", "#create-room-form", "#invite-room-form", "#invite-code",
+        ".app-frame", "#screen", ".lobby-shell", "#create-room-open", "#create-room-dialog",
       ]);
-      await browserSubmit(d.cdp, "#invite-room-form");
-      await browserWait(d.cdp, "document.querySelector('.notices')?.textContent.includes('room is private')", "wrong private invite rejection");
-      await browserWait(d.cdp, "document.querySelector('#announcements')?.textContent.includes('room is private')", "private invite live error");
-      ok((await d.cdp.evaluate("document.querySelector('#announcements')?.textContent.match(/room is private/g)?.length ?? 0")) === 1, "private invite error announced more than once");
-      await browserAssertRenderStable(d.cdp, "lobby-notice", "lobby error notice");
-      ok(await d.cdp.evaluate(`(() => {
-        const input = document.querySelector('#invite-code');
-        return Boolean(document.querySelector('#create-room-form'))
-          && document.activeElement === input
-          && input.selectionStart === 3
-          && input.selectionEnd === 8
-          && input.selectionDirection === 'forward';
-      })()`), "wrong invite replaced lobby or lost focus");
-      await browserSet(d.cdp, "#invite-code", invite[2]);
-      await browserSubmit(d.cdp, "#invite-room-form");
-      await browserWait(d.cdp, "Boolean(document.querySelector('#room-title'))", "private invite join");
-      log("private room visibility and invite enforcement: pass");
-      await browserLeave(d.cdp);
+      const privateButton = `.join-room[data-room-id="${privateRoom.id}"]`;
+      await browserClickWithDialog(d.cdp, privateButton, null);
+      await sleep(150);
+      ok(await d.cdp.evaluate("Boolean(document.querySelector('#create-room-open')) && !document.querySelector('#create-room-dialog')?.open && !document.querySelector('.notices')?.textContent.includes('room is private')"), "cancelled password prompt changed lobby");
+      await browserClickWithDialog(d.cdp, privateButton, "");
+      await browserWait(d.cdp, "document.querySelector('.notices')?.textContent.includes('Room password is required')", "empty password notice");
+      await browserAssertRenderStable(d.cdp, "lobby-notice", "empty password notice");
+      await browserInstallRenderProbe(d.cdp, "lobby-wrong-password", [
+        ".app-frame", "#screen", ".lobby-shell", "#create-room-open", "#create-room-dialog",
+      ]);
+      await browserClickWithDialog(d.cdp, privateButton, "wrong-password");
+      await browserWait(d.cdp, "document.querySelector('.notices')?.textContent.includes('room is private')", "wrong password rejection");
+      await browserWait(d.cdp, "document.querySelector('#announcements')?.textContent.includes('room is private')", "wrong password live error");
+      await browserAssertRenderStable(d.cdp, "lobby-wrong-password", "wrong password notice");
+      ok(!await d.cdp.evaluate(`document.body.textContent.includes(${JSON.stringify(roomPassword)})`), "room password leaked after failed join");
+      await browserClickWithDialog(d.cdp, privateButton, roomPassword);
+      await browserWait(d.cdp, "Boolean(document.querySelector('#room-title'))", "protected password join");
+      await browserWait(c.cdp, `(() => {
+        const row = [...document.querySelectorAll('.player-slot')]
+          .find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(privateGuest.display_name)});
+        return row?.querySelector('.remove-player')?.getAttribute('data-is-bot') === 'false';
+      })()`, "protected guest kick control");
+      await browserClick(c.cdp, ".remove-player");
+      await browserWait(d.cdp, "Boolean(document.querySelector('#create-room-open'))", "kicked protected guest lobby");
+      await browserWait(c.cdp, `(() => {
+        const players = [...document.querySelectorAll('.player-slot strong')].map(row => row.textContent);
+        return players.length === 1 && !players.includes(${JSON.stringify(privateGuest.display_name)});
+      })()`, "owner roster after kick");
+      log("protected room listing, password enforcement, prompt flow, and kick: pass");
       await browserLeave(c.cdp);
 
       await browserCreate(c.cdp, "Bot E2E", "public");
       await browserClick(c.cdp, "#add-bot");
-      await browserWait(c.cdp, "document.body.textContent.includes('Computer')", "bot slot");
+      await browserWait(c.cdp, `(() => {
+        const rows = document.querySelectorAll('.player-slot');
+        const selectors = document.querySelectorAll('.player-soldiers');
+        const remove = document.querySelector('.remove-player');
+        return rows.length === 2
+          && selectors.length === 2
+          && remove?.getAttribute('data-is-bot') === 'true'
+          && document.querySelectorAll('.player-team').length === 0;
+      })()`, "bot slot");
+      const botTarget = await c.cdp.evaluate(`(() => {
+        const bot = [...document.querySelectorAll('.player-slot')]
+          .find(row => row.querySelector('.remove-player')?.dataset.isBot === 'true');
+        const source = bot?.closest('.team-roster')?.dataset.team;
+        const target = source === '1' ? '2' : '1';
+        const move = bot?.querySelector('.select-player');
+        move?.click();
+        return move?.getAttribute('aria-pressed') === 'true'
+          && document.querySelector('.team-drop-target[data-team="' + target + '"]')?.getAttribute('aria-disabled') === 'false'
+          ? target
+          : null;
+      })()`);
+      ok(botTarget, "owner bot transfer selection missing");
+      await browserClick(c.cdp, `#team-${botTarget}-target`);
+      await browserWait(c.cdp, `(() => {
+        const bot = [...document.querySelectorAll('.player-slot')]
+          .find(row => row.querySelector('.remove-player')?.dataset.isBot === 'true');
+        return bot?.closest('.team-roster')?.dataset.team === ${JSON.stringify(botTarget)};
+      })()`, "authoritative owner bot move");
+      await browserClick(c.cdp, ".remove-player");
+      await browserWait(c.cdp, "document.querySelectorAll('.player-slot').length === 1", "bot removal");
+      await browserClick(c.cdp, "#add-bot");
+      await browserWait(c.cdp, "document.querySelectorAll('.player-slot').length === 2 && document.querySelector('.remove-player')?.getAttribute('data-is-bot') === 'true'", "replacement bot slot");
       await browserClick(c.cdp, "#ready-button");
       await browserWait(c.cdp, "document.querySelector('#start-game')?.disabled === false", "bot start enabled");
       await c.cdp.command("Emulation.setEmulatedMedia", {media: "", features: [{name: "prefers-color-scheme", value: "dark"}]});
@@ -907,7 +1442,7 @@ async function browserFlows() {
       );
       await browserWait(
         c.cdp,
-        "document.querySelectorAll('.chat-panel .shot-entry').length >= 2",
+        "document.querySelectorAll('.game-chat .shot-entry').length >= 2",
         "bot function history",
       );
       await c.cdp.command("Emulation.setEmulatedMedia", {media: "", features: []});
