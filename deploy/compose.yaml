@@ -14,6 +14,7 @@ services:
       SECURE_COOKIES: true
       SESSION_TTL_SECONDS: 2592000
       GRAPHWAR_STATIC_DIR: /app/assets/web
+      GRAPHWAR_RSC_DIR: /app/assets/rsc
       RUST_LOG: graphwar_server=info,tower_http=info
     network_mode: service:cloudflared
     healthcheck:

@@ -11,8 +11,8 @@ use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
     AbortController, CanvasRenderingContext2d, CloseEvent, Document, DragEvent, ErrorEvent, Event,
-    HtmlCanvasElement, HtmlDialogElement, HtmlFormElement, HtmlInputElement, HtmlSelectElement,
-    MessageEvent, RequestCredentials, WebSocket, Window,
+    HtmlCanvasElement, HtmlDialogElement, HtmlFormElement, HtmlImageElement, HtmlInputElement,
+    HtmlSelectElement, MessageEvent, RequestCredentials, WebSocket, Window,
 };
 
 const PRESERVED_INPUTS: &[&str] = &[
@@ -60,7 +60,26 @@ struct App {
     viewport_handler: Option<Closure<dyn FnMut(Event)>>,
     expired_deadline: Option<i64>,
     shot_animation: Option<ShotAnimation>,
+    soldier_sprite: Option<HtmlImageElement>,
+    soldier_sprite_loaded: bool,
+    soldier_helmet_team_one: Option<HtmlImageElement>,
+    soldier_helmet_team_one_loaded: bool,
+    soldier_helmet_team_two: Option<HtmlImageElement>,
+    soldier_helmet_team_two_loaded: bool,
+    soldier_sprite_handlers: Vec<SoldierSpriteHandlers>,
     ws_url: String,
+}
+
+#[derive(Clone, Copy)]
+enum SoldierSpriteKind {
+    Body,
+    HelmetTeamOne,
+    HelmetTeamTwo,
+}
+
+struct SoldierSpriteHandlers {
+    _onload: Closure<dyn FnMut(Event)>,
+    _onerror: Closure<dyn FnMut(Event)>,
 }
 
 struct SocketHandlers {
@@ -148,9 +167,17 @@ pub fn start() -> Result<(), JsValue> {
         viewport_handler: None,
         expired_deadline: None,
         shot_animation: None,
+        soldier_sprite: None,
+        soldier_sprite_loaded: false,
+        soldier_helmet_team_one: None,
+        soldier_helmet_team_one_loaded: false,
+        soldier_helmet_team_two: None,
+        soldier_helmet_team_two_loaded: false,
+        soldier_sprite_handlers: Vec::new(),
         ws_url,
     }));
 
+    load_soldier_sprites(&app)?;
     render(&app)?;
     bind_events(&app)?;
     bind_viewport_events(&app)?;
@@ -158,6 +185,96 @@ pub fn start() -> Result<(), JsValue> {
     app.borrow_mut().clock = Some(Interval::new(1_000, move || update_timer(&clock_app)));
     restore_session(&app);
     Ok(())
+}
+
+fn load_soldier_sprites(app: &SharedApp) -> Result<(), JsValue> {
+    load_soldier_sprite(
+        app,
+        SoldierSpriteKind::Body,
+        "/rsc/soldiers/soldierNormal.png?v=20260731d",
+    )?;
+    load_soldier_sprite(
+        app,
+        SoldierSpriteKind::HelmetTeamOne,
+        "/rsc/soldiers/helmetTeamOne.png?v=20260731d",
+    )?;
+    load_soldier_sprite(
+        app,
+        SoldierSpriteKind::HelmetTeamTwo,
+        "/rsc/soldiers/helmetTeamTwo.png?v=20260731d",
+    )
+}
+
+fn load_soldier_sprite(
+    app: &SharedApp,
+    kind: SoldierSpriteKind,
+    source: &str,
+) -> Result<(), JsValue> {
+    let image = HtmlImageElement::new()?;
+    let load_app = Rc::clone(app);
+    let onload = Closure::<dyn FnMut(Event)>::new(move |_| {
+        let redraw = {
+            let mut app = load_app.borrow_mut();
+            set_soldier_sprite_loaded(&mut app, kind, true);
+            app.model.screen == Screen::Game
+        };
+        if redraw && let Err(error) = render_canvas(&load_app) {
+            log_error(&format!("soldier sprite render failed: {error:?}"));
+        }
+    });
+    image.set_onload(Some(onload.as_ref().unchecked_ref()));
+
+    let error_app = Rc::clone(app);
+    let onerror = Closure::<dyn FnMut(Event)>::new(move |_| {
+        let redraw = {
+            let mut app = error_app.borrow_mut();
+            set_soldier_sprite_loaded(&mut app, kind, false);
+            app.model.screen == Screen::Game
+        };
+        if redraw && let Err(error) = render_canvas(&error_app) {
+            log_error(&format!("soldier sprite render failed: {error:?}"));
+        }
+    });
+    image.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+    image.set_src(source);
+    let loaded = image.complete() && image.natural_width() > 0;
+    let mut app = app.borrow_mut();
+    set_soldier_sprite(&mut app, kind, image, loaded);
+    app.soldier_sprite_handlers.push(SoldierSpriteHandlers {
+        _onload: onload,
+        _onerror: onerror,
+    });
+    Ok(())
+}
+
+fn set_soldier_sprite(
+    app: &mut App,
+    kind: SoldierSpriteKind,
+    image: HtmlImageElement,
+    loaded: bool,
+) {
+    match kind {
+        SoldierSpriteKind::Body => {
+            app.soldier_sprite = Some(image);
+            app.soldier_sprite_loaded = loaded;
+        }
+        SoldierSpriteKind::HelmetTeamOne => {
+            app.soldier_helmet_team_one = Some(image);
+            app.soldier_helmet_team_one_loaded = loaded;
+        }
+        SoldierSpriteKind::HelmetTeamTwo => {
+            app.soldier_helmet_team_two = Some(image);
+            app.soldier_helmet_team_two_loaded = loaded;
+        }
+    }
+}
+
+fn set_soldier_sprite_loaded(app: &mut App, kind: SoldierSpriteKind, loaded: bool) {
+    match kind {
+        SoldierSpriteKind::Body => app.soldier_sprite_loaded = loaded,
+        SoldierSpriteKind::HelmetTeamOne => app.soldier_helmet_team_one_loaded = loaded,
+        SoldierSpriteKind::HelmetTeamTwo => app.soldier_helmet_team_two_loaded = loaded,
+    }
 }
 
 fn restore_session(app: &SharedApp) {
@@ -2440,6 +2557,19 @@ fn render_canvas(app: &SharedApp) -> Result<(), JsValue> {
         0.0,
     )?;
     let palette = canvas_palette();
+    context.set_image_smoothing_enabled(false);
+    let soldier_sprite = app
+        .soldier_sprite_loaded
+        .then(|| app.soldier_sprite.as_ref())
+        .flatten();
+    let soldier_helmet_team_one = app
+        .soldier_helmet_team_one_loaded
+        .then(|| app.soldier_helmet_team_one.as_ref())
+        .flatten();
+    let soldier_helmet_team_two = app
+        .soldier_helmet_team_two_loaded
+        .then(|| app.soldier_helmet_team_two.as_ref())
+        .flatten();
     context.set_fill_style_str(palette.background);
     context.fill_rect(0.0, 0.0, LOGICAL_WIDTH, LOGICAL_HEIGHT);
     draw_grid(&context, palette);
@@ -2470,6 +2600,12 @@ fn render_canvas(app: &SharedApp) -> Result<(), JsValue> {
             soldier.team,
             soldier.alive,
             soldier.active,
+            soldier_sprite,
+            if soldier.team == 1 {
+                soldier_helmet_team_one
+            } else {
+                soldier_helmet_team_two
+            },
             palette,
         );
     }
@@ -2602,6 +2738,53 @@ fn draw_path(
 }
 
 fn draw_soldier(
+    context: &CanvasRenderingContext2d,
+    x: f64,
+    y: f64,
+    team: u8,
+    alive: bool,
+    active: bool,
+    sprite: Option<&HtmlImageElement>,
+    helmet: Option<&HtmlImageElement>,
+    palette: CanvasPalette,
+) {
+    if alive && let Some(sprite) = sprite {
+        if active {
+            draw_soldier_fallback(context, x, y, team, alive, active, palette);
+        }
+        let drawn = if team == 2 {
+            context.save();
+            let result = context
+                .translate(x, y)
+                .and_then(|_| context.scale(-1.0, 1.0))
+                .and_then(|_| draw_soldier_layers(context, sprite, helmet, -10.0, -10.0));
+            context.restore();
+            result.is_ok()
+        } else {
+            draw_soldier_layers(context, sprite, helmet, x - 10.0, y - 10.0).is_ok()
+        };
+        if drawn || active {
+            return;
+        }
+    }
+    draw_soldier_fallback(context, x, y, team, alive, active, palette);
+}
+
+fn draw_soldier_layers(
+    context: &CanvasRenderingContext2d,
+    sprite: &HtmlImageElement,
+    helmet: Option<&HtmlImageElement>,
+    x: f64,
+    y: f64,
+) -> Result<(), JsValue> {
+    context.draw_image_with_html_image_element_and_dw_and_dh(sprite, x, y, 20.0, 20.0)?;
+    if let Some(helmet) = helmet {
+        let _ = context.draw_image_with_html_image_element_and_dw_and_dh(helmet, x, y, 20.0, 20.0);
+    }
+    Ok(())
+}
+
+fn draw_soldier_fallback(
     context: &CanvasRenderingContext2d,
     x: f64,
     y: f64,

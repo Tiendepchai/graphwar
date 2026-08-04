@@ -317,6 +317,11 @@ impl AppState {
 
 pub fn app(state: AppState) -> Router {
     let static_dir = state.config.static_dir.clone();
+    let rsc_dir = state
+        .config
+        .rsc_dir
+        .clone()
+        .unwrap_or_else(|| static_dir.join("rsc"));
     Router::new()
         .route("/healthz", get(healthz))
         .route("/auth/register", post(register))
@@ -324,6 +329,7 @@ pub fn app(state: AppState) -> Router {
         .route("/auth/me", get(current_user))
         .route("/auth/logout", post(logout))
         .route("/ws", get(websocket))
+        .nest_service("/rsc", ServeDir::new(rsc_dir))
         .fallback_service(ServeDir::new(static_dir).append_index_html_on_directories(true))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .with_state(state)
@@ -1240,6 +1246,112 @@ mod tests {
             .map(|event| serde_json::to_string(&event.message).unwrap())
             .collect::<String>();
         assert!(!wire_messages.contains("room password"));
+    }
+
+    #[tokio::test]
+    async fn serves_soldier_assets_without_spa_fallback() {
+        let mut config = Config::test();
+        let assets_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets");
+        config.static_dir = assets_dir.join("web");
+        config.rsc_dir = Some(assets_dir.join("rsc"));
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://127.0.0.1:1/unused")
+            .expect("test pool");
+        let app = app(AppState::test_without_persistence(pool, config));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rsc/soldiers/soldierNormal.png")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        for asset in [
+            "/rsc/soldiers/helmetTeamOne.png",
+            "/rsc/soldiers/helmetTeamTwo.png",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(asset)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/rsc/soldiers/missing.png")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn serves_resources_inside_custom_static_root() {
+        let static_dir =
+            std::env::temp_dir().join(format!("graphwar-static-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&static_dir);
+        let soldiers_dir = static_dir.join("rsc/soldiers");
+        std::fs::create_dir_all(&soldiers_dir).expect("soldiers dir");
+        std::fs::write(soldiers_dir.join("custom.png"), b"custom").expect("custom asset");
+        let mut config = Config::test();
+        config.static_dir = static_dir.clone();
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://127.0.0.1:1/unused")
+            .expect("test pool");
+        let app = app(AppState::test_without_persistence(pool, config));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/rsc/soldiers/custom.png")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        std::fs::remove_dir_all(static_dir).expect("remove static dir");
+    }
+
+    #[tokio::test]
+    async fn custom_static_root_does_not_serve_sibling_resources() {
+        let parent =
+            std::env::temp_dir().join(format!("graphwar-static-boundary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&parent);
+        let static_dir = parent.join("public");
+        std::fs::create_dir_all(parent.join("rsc")).expect("sibling rsc dir");
+        std::fs::create_dir_all(&static_dir).expect("static dir");
+        std::fs::write(parent.join("rsc/private.txt"), b"private").expect("private asset");
+        let mut config = Config::test();
+        config.static_dir = static_dir;
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://127.0.0.1:1/unused")
+            .expect("test pool");
+        let app = app(AppState::test_without_persistence(pool, config));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/rsc/private.txt")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(parent).expect("remove parent dir");
     }
 
     #[tokio::test]

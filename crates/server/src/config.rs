@@ -1,4 +1,9 @@
-use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    env,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context, bail};
 
@@ -11,6 +16,7 @@ pub struct Config {
     pub secure_cookies: bool,
     pub session_ttl: Duration,
     pub static_dir: PathBuf,
+    pub rsc_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -25,6 +31,15 @@ impl Config {
         if allowed_origins.is_empty() {
             bail!("ALLOWED_ORIGINS must contain an origin");
         }
+        let static_dir = env::var_os("GRAPHWAR_STATIC_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("assets/web"));
+        let rsc_dir = env::var_os("GRAPHWAR_RSC_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                (static_dir == Path::new("assets/web")).then(|| PathBuf::from("assets/rsc"))
+            });
         Ok(Self {
             bind_addr: env::var("BIND_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:8080".into())
@@ -40,9 +55,8 @@ impl Config {
                     .unwrap_or_else(|_| "2592000".into())
                     .parse()?,
             ),
-            static_dir: env::var_os("GRAPHWAR_STATIC_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("assets/web")),
+            static_dir,
+            rsc_dir,
         })
     }
 
@@ -56,6 +70,7 @@ impl Config {
             secure_cookies: false,
             session_ttl: Duration::from_secs(60),
             static_dir: PathBuf::from("assets/web"),
+            rsc_dir: None,
         }
     }
 }

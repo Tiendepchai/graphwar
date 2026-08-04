@@ -24,7 +24,8 @@ COPY assets ./assets
 COPY --from=builder /app/web ./assets/web
 COPY migrations ./migrations
 ENV BIND_ADDR=0.0.0.0:8080 \
-    GRAPHWAR_STATIC_DIR=/app/assets/web
+    GRAPHWAR_STATIC_DIR=/app/assets/web \
+    GRAPHWAR_RSC_DIR=/app/assets/rsc
 EXPOSE 8080
 USER 65532:65532
 ENTRYPOINT ["graphwar-server"]

@@ -1,6 +1,6 @@
 # Graphwar browser parity checklist
 
-Legacy references remain under `src/` and `rsc/`. The Rust/browser release preserves user-visible rules; confirmed correctness and authority bugs are intentionally not preserved.
+Rust/WASM is the sole supported implementation. The browser release preserves user-visible rules; confirmed correctness and authority bugs were intentionally not preserved. See the [legacy Java logic summary](../docs/legacy-java.md) for historical context.
 
 ## Modes and expressions
 
@@ -47,8 +47,7 @@ Legacy references remain under `src/` and `rsc/`. The Rust/browser release prese
 
 ## Deliberate incompatibilities
 
-- No Java client/server interoperability.
-- No raw TCP or numeric `&` wire protocol.
+- No compatibility with the removed Java client/server or its raw TCP numeric `&` wire protocol.
 - No image-mask buttons or fixed 800×600 Swing layout.
 - No client authority over hits, deaths, turn advancement, or game result.
 - Strict conventional parser semantics replace ignored characters and accidental associativity.
