@@ -1233,9 +1233,10 @@ fn new_match(seed: u64, players: &[PlayerSnapshot], mode: GameMode) -> Result<Ma
 }
 
 fn alternating_players(players: &[PlayerSnapshot]) -> Vec<&PlayerSnapshot> {
-    // Interleave the two teams so turns alternate even when the snapshot
-    // groups teammates together. Snapshot order is join order, which may be
-    // all of one team followed by the other.
+    // Interleave the two teams evenly, spread from the front. advance_turn
+    // enforces strict team alternation, so the initial roster order only
+    // decides who fires first (turn 0) — keep it fair by alternating evenly
+    // rather than grouping by team.
     let mut team_one: Vec<&PlayerSnapshot> =
         players.iter().filter(|player| player.team == 1).collect();
     let mut team_two: Vec<&PlayerSnapshot> =
@@ -1248,17 +1249,12 @@ fn alternating_players(players: &[PlayerSnapshot]) -> Vec<&PlayerSnapshot> {
             false
         } else if team_two.is_empty() {
             true
+        } else if team_one.len() > team_two.len() {
+            true
+        } else if team_two.len() > team_one.len() {
+            false
         } else {
-            // Serve the larger team first so a one-ply lead never forces an
-            // avoidable consecutive turn; on ties alternate by round.
-            let lead_one = team_one.len() > team_two.len();
-            if lead_one {
-                true
-            } else if team_two.len() > team_one.len() {
-                false
-            } else {
-                start_team_one
-            }
+            start_team_one
         };
         if take_one {
             result.push(team_one.remove(0));
@@ -1480,22 +1476,29 @@ fn advance_turn(game: &mut GameState) {
             player.current_soldier = index;
         }
     }
-    for offset in 1..=game.players.len() {
-        let candidate = (current + offset) % game.players.len();
-        let player = &mut game.players[candidate];
-        if player.living().next().is_some() {
-            if player.current().is_none_or(|soldier| !soldier.alive) {
-                let index = player
-                    .living()
-                    .next()
-                    .map(|(index, _)| index)
-                    .expect("candidate has a living soldier");
-                player.current_soldier = index;
-            }
-            game.turn = candidate;
-            return;
-        }
+    // Turns must strictly alternate between teams. The next shooter is the
+    // first living player on the OPPOSITE team, wrapping around the roster.
+    let current_team = game.players[current].team;
+    let next = (0..game.players.len())
+        .map(|offset| (current + 1 + offset) % game.players.len())
+        .find(|&candidate| {
+            game.players[candidate].team != current_team
+                && game.players[candidate].living().next().is_some()
+        });
+    let Some(candidate) = next else {
+        // No living player on the opposite team left.
+        return;
+    };
+    let player = &mut game.players[candidate];
+    if player.current().is_none_or(|soldier| !soldier.alive) {
+        let index = player
+            .living()
+            .next()
+            .map(|(index, _)| index)
+            .expect("candidate has a living soldier");
+        player.current_soldier = index;
     }
+    game.turn = candidate;
 }
 
 fn snapshot_for_game(room: &Room) -> GameSnapshot {
@@ -1595,6 +1598,32 @@ mod tests {
         assert_eq!(game.turn, 1);
         assert_eq!(game.players[1].current_soldier, 1);
         assert!(game.players[1].current().unwrap().alive);
+    }
+
+    #[test]
+    fn advance_turn_strictly_alternates_teams() {
+        // Two players on team 1, one on team 2 (3-player roster). Turns must
+        // never land on the same team twice in a row.
+        let mut team_one = Player::new(1, Team::One, vec![Soldier::new(1.0, 2.0)]);
+        team_one.current_soldier = 0;
+        let team_two = Player::new(2, Team::Two, vec![Soldier::new(3.0, 4.0)]);
+        let mut team_one_b = Player::new(3, Team::One, vec![Soldier::new(5.0, 6.0)]);
+        team_one_b.current_soldier = 0;
+        let mut game = GameState::new(vec![team_one, team_two, team_one_b]);
+
+        let mut sequence = Vec::new();
+        for _ in 0..6 {
+            let team = game.players[game.turn].team;
+            sequence.push(team);
+            advance_turn(&mut game);
+        }
+        assert!(
+            sequence.windows(2).all(|w| w[0] != w[1]),
+            "turns must strictly alternate teams, got {sequence:?}"
+        );
+        // Expected: T1, T2, T1, T2, T1, T2 (the single team-2 player turns every
+        // other shot).
+        assert_eq!(sequence, vec![Team::One, Team::Two, Team::One, Team::Two, Team::One, Team::Two]);
     }
 
     #[test]
