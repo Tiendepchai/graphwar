@@ -1476,29 +1476,45 @@ fn advance_turn(game: &mut GameState) {
             player.current_soldier = index;
         }
     }
-    // Turns must strictly alternate between teams. The next shooter is the
-    // first living player on the OPPOSITE team, wrapping around the roster.
+    // Turns strictly alternate between teams. Within the target team, rotate
+    // through the living players so no teammate is starved: each team keeps a
+    // cursor into the roster.
     let current_team = game.players[current].team;
-    let next = (0..game.players.len())
-        .map(|offset| (current + 1 + offset) % game.players.len())
-        .find(|&candidate| {
-            game.players[candidate].team != current_team
-                && game.players[candidate].living().next().is_some()
-        });
-    let Some(candidate) = next else {
-        // No living player on the opposite team left.
-        return;
+    let current_team_idx = match current_team {
+        Team::One => 0,
+        Team::Two => 1,
     };
-    let player = &mut game.players[candidate];
-    if player.current().is_none_or(|soldier| !soldier.alive) {
-        let index = player
-            .living()
-            .next()
-            .map(|(index, _)| index)
-            .expect("candidate has a living soldier");
-        player.current_soldier = index;
+    let target_team_idx = 1 - current_team_idx;
+    let target_team = if target_team_idx == 0 {
+        Team::One
+    } else {
+        Team::Two
+    };
+    let roster_len = game.players.len();
+    let mut cursor = game.team_turn[target_team_idx];
+    for _ in 0..roster_len {
+        let candidate = cursor % roster_len;
+        let candidate_team = game.players[candidate].team;
+        let next_cursor = cursor + 1;
+        if candidate_team == target_team
+            && game.players[candidate].living().next().is_some()
+        {
+            game.team_turn[target_team_idx] = next_cursor;
+            let player = &mut game.players[candidate];
+            if player.current().is_none_or(|soldier| !soldier.alive) {
+                let index = player
+                    .living()
+                    .next()
+                    .map(|(index, _)| index)
+                    .expect("candidate has a living soldier");
+                player.current_soldier = index;
+            }
+            game.turn = candidate;
+            return;
+        }
+        cursor = next_cursor;
     }
-    game.turn = candidate;
+    // No living player on the opposite team left.
 }
 
 fn snapshot_for_game(room: &Room) -> GameSnapshot {
@@ -1624,6 +1640,43 @@ mod tests {
         // Expected: T1, T2, T1, T2, T1, T2 (the single team-2 player turns every
         // other shot).
         assert_eq!(sequence, vec![Team::One, Team::Two, Team::One, Team::Two, Team::One, Team::Two]);
+    }
+
+    #[test]
+    fn advance_turn_rotates_through_teammates() {
+        // Two teams of two. After several shots every player must have had a
+        // turn — the per-team cursor must not starve a teammate.
+        let mk = |id: u32, team: Team| Player::new(id, team, vec![Soldier::new(1.0, 2.0)]);
+        // Roster: players[0]=T1, [1]=T2, [2]=T1, [3]=T2.
+        let mut game = GameState::new(vec![
+            mk(1, Team::One),
+            mk(2, Team::Two),
+            mk(3, Team::One),
+            mk(4, Team::Two),
+        ]);
+        let mut sequence = Vec::new();
+        for _ in 0..8 {
+            let id = game.players[game.turn].id;
+            let team = game.players[game.turn].team;
+            sequence.push((id, team));
+            advance_turn(&mut game);
+        }
+        let mut seen: Vec<u32> = sequence.iter().map(|(id, _)| *id).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert!(
+            seen.contains(&1) && seen.contains(&2) && seen.contains(&3) && seen.contains(&4),
+            "every player must get a turn, got {sequence:?}"
+        );
+        assert!(
+            sequence.windows(2).all(|w| w[0].1 != w[1].1),
+            "turns must alternate teams, got {sequence:?}"
+        );
+        // Expected pattern: T1,T2,T1,T2,... starting at players[0] (team 1).
+        assert_eq!(
+            sequence.iter().map(|(_, t)| *t).collect::<Vec<_>>(),
+            vec![Team::One, Team::Two, Team::One, Team::Two, Team::One, Team::Two, Team::One, Team::Two]
+        );
     }
 
     #[test]

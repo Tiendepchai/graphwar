@@ -60,11 +60,19 @@ impl Player {
 pub struct GameState {
     pub players: Vec<Player>,
     pub turn: usize,
+    /// Per-team cursor into `players` so turns rotate through every living
+    /// teammate instead of always landing on the same player of a team.
+    #[serde(default)]
+    pub team_turn: [usize; 2],
 }
 
 impl GameState {
     pub fn new(players: Vec<Player>) -> Self {
-        Self { players, turn: 0 }
+        Self {
+            players,
+            turn: 0,
+            team_turn: [0, 0],
+        }
     }
     pub fn starter(id: u32, team: Team, x: f64, y: f64) -> Player {
         Player::new(
