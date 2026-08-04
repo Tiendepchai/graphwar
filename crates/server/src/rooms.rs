@@ -1233,23 +1233,39 @@ fn new_match(seed: u64, players: &[PlayerSnapshot], mode: GameMode) -> Result<Ma
 }
 
 fn alternating_players(players: &[PlayerSnapshot]) -> Vec<&PlayerSnapshot> {
-    let mut result = Vec::with_capacity(players.len());
+    // Interleave the two teams so turns alternate even when the snapshot
+    // groups teammates together. Snapshot order is join order, which may be
+    // all of one team followed by the other.
+    let mut team_one: Vec<&PlayerSnapshot> =
+        players.iter().filter(|player| player.team == 1).collect();
+    let mut team_two: Vec<&PlayerSnapshot> =
+        players.iter().filter(|player| player.team == 2).collect();
     let first_team = if players.len() % 2 == 0 { 1 } else { 2 };
-    for offset in 0..2 {
-        let team = if offset == 0 {
-            first_team
+    let start_team_one = first_team == 1;
+    let mut result = Vec::with_capacity(players.len());
+    while !team_one.is_empty() || !team_two.is_empty() {
+        let take_one = if team_one.is_empty() {
+            false
+        } else if team_two.is_empty() {
+            true
         } else {
-            3 - first_team
+            // Serve the larger team first so a one-ply lead never forces an
+            // avoidable consecutive turn; on ties alternate by round.
+            let lead_one = team_one.len() > team_two.len();
+            if lead_one {
+                true
+            } else if team_two.len() > team_one.len() {
+                false
+            } else {
+                start_team_one
+            }
         };
-        result.extend(players.iter().filter(|player| player.team == team));
+        if take_one {
+            result.push(team_one.remove(0));
+        } else {
+            result.push(team_two.remove(0));
+        }
     }
-    result.sort_by_key(|player| {
-        let original = players
-            .iter()
-            .position(|candidate| candidate.id == player.id)
-            .unwrap_or(usize::MAX);
-        (original / 2, player.team != first_team)
-    });
     result
 }
 
@@ -2677,6 +2693,54 @@ mod tests {
                 .iter()
                 .all(|soldier| { [owner, guest].contains(&soldier.player_id) })
         );
+    }
+
+    #[test]
+    fn grouped_snapshot_still_alternates_teams() {
+        // Snapshot order is join order and can list all of one team before
+        // the other. Turns must still alternate between teams.
+        let shots: Vec<PlayerSnapshot> = vec![
+            PlayerSnapshot {
+                id: Uuid::new_v4(),
+                display_name: "A".into(),
+                owner: true,
+                ready: true,
+                team: 1,
+                soldiers: 2,
+                is_bot: false,
+            },
+            PlayerSnapshot {
+                id: Uuid::new_v4(),
+                display_name: "B".into(),
+                owner: false,
+                ready: true,
+                team: 1,
+                soldiers: 2,
+                is_bot: false,
+            },
+            PlayerSnapshot {
+                id: Uuid::new_v4(),
+                display_name: "C".into(),
+                owner: false,
+                ready: true,
+                team: 2,
+                soldiers: 2,
+                is_bot: false,
+            },
+            PlayerSnapshot {
+                id: Uuid::new_v4(),
+                display_name: "D".into(),
+                owner: false,
+                ready: true,
+                team: 2,
+                soldiers: 2,
+                is_bot: false,
+            },
+        ];
+        let order = alternating_players(&shots);
+        let teams: Vec<u8> = order.iter().map(|p| p.team).collect();
+        assert_eq!(teams, vec![1, 2, 1, 2], "turns must alternate across teams");
+        assert!(order.iter().all(|p| shots.contains(p)));
     }
 
     #[test]
