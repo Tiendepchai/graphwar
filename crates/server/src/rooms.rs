@@ -1496,9 +1496,7 @@ fn advance_turn(game: &mut GameState) {
         let candidate = cursor % roster_len;
         let candidate_team = game.players[candidate].team;
         let next_cursor = cursor + 1;
-        if candidate_team == target_team
-            && game.players[candidate].living().next().is_some()
-        {
+        if candidate_team == target_team && game.players[candidate].living().next().is_some() {
             game.team_turn[target_team_idx] = next_cursor;
             let player = &mut game.players[candidate];
             if player.current().is_none_or(|soldier| !soldier.alive) {
@@ -1639,7 +1637,17 @@ mod tests {
         );
         // Expected: T1, T2, T1, T2, T1, T2 (the single team-2 player turns every
         // other shot).
-        assert_eq!(sequence, vec![Team::One, Team::Two, Team::One, Team::Two, Team::One, Team::Two]);
+        assert_eq!(
+            sequence,
+            vec![
+                Team::One,
+                Team::Two,
+                Team::One,
+                Team::Two,
+                Team::One,
+                Team::Two
+            ]
+        );
     }
 
     #[test]
@@ -1675,7 +1683,16 @@ mod tests {
         // Expected pattern: T1,T2,T1,T2,... starting at players[0] (team 1).
         assert_eq!(
             sequence.iter().map(|(_, t)| *t).collect::<Vec<_>>(),
-            vec![Team::One, Team::Two, Team::One, Team::Two, Team::One, Team::Two, Team::One, Team::Two]
+            vec![
+                Team::One,
+                Team::Two,
+                Team::One,
+                Team::Two,
+                Team::One,
+                Team::Two,
+                Team::One,
+                Team::Two
+            ]
         );
     }
 
