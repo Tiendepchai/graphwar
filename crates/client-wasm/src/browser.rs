@@ -1277,7 +1277,9 @@ fn refresh_room_dom(app: &SharedApp) -> Result<(), JsValue> {
     }
     app.borrow_mut().dynamic_event_handlers.clear();
     bind_room_roster_events(app, &document)?;
-    if app.borrow().model.room_kind == Some(RoomKind::Practice) {
+    if app.borrow().model.screen == Screen::Room
+        && app.borrow().model.room_kind == Some(RoomKind::Practice)
+    {
         bind_practice_events(app, &document)?;
         render_practice_canvas(app)?;
     }
@@ -2277,7 +2279,9 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
         });
     }
     bind_room_roster_events(app, &document)?;
-    if app.borrow().model.room_kind == Some(RoomKind::Practice) {
+    if app.borrow().model.screen == Screen::Room
+        && app.borrow().model.room_kind == Some(RoomKind::Practice)
+    {
         bind_practice_events(app, &document)?;
         render_practice_canvas(app)?;
     }
