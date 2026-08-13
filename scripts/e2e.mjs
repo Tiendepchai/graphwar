@@ -24,7 +24,7 @@ const CHROME_CANDIDATES = process.env.CHROME_BIN
           `${process.env["PROGRAMFILES(X86)"] ?? "C:\\Program Files (x86)"}\\Google\\Chrome\\Application\\chrome.exe`,
         ]
       : ["google-chrome", "chromium", "chromium-browser"];
-const PROTOCOL_VERSION = 9;
+const PROTOCOL_VERSION = 10;
 const CAPTURE_PATH = process.env.E2E_CAPTURE_PATH ? path.resolve(process.env.E2E_CAPTURE_PATH) : null;
 const timeoutMs = Number(process.env.E2E_TIMEOUT_MS ?? 15_000);
 if (BASE.protocol === "https:" && process.env.E2E_TLS_VERIFY === "false") {

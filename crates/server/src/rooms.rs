@@ -12,7 +12,7 @@ use graphwar_game_core::{
         MAX_SOLDIERS_PER_PLAYER, PLANE_HEIGHT, PLANE_LENGTH, PRACTICE_TERRAIN_RADII,
         SOLDIER_RADIUS,
     },
-    parse, trace,
+    parse, projectile_hits, trace,
 };
 
 use graphwar_protocol::{
@@ -933,8 +933,13 @@ impl Registry {
             function: normalized_function,
             angle_deg,
         };
+        let projectile_hit_indexes = {
+            let game = room.game.as_ref().expect("checked above");
+            projectile_hits(&trajectory.points, &game.state)
+        };
         let game = room.game.as_mut().expect("checked above");
         append_shot_history(game, history_entry);
+        let projectile_casualties = apply_projectile_hits(game, &projectile_hit_indexes);
         let outcome = match trajectory.end {
             TrajectoryEnd::TerrainImpact { point: (x, y) } => {
                 let explosion = Circle {
@@ -942,10 +947,8 @@ impl Registry {
                     y,
                     radius: graphwar_game_core::constants::EXPLOSION_RADIUS,
                 };
-                let casualties = apply_explosion(game, explosion)
-                    .into_iter()
-                    .filter_map(|(player, soldier)| soldier_snapshot(game, player, soldier))
-                    .collect();
+                let mut casualties = projectile_casualties;
+                casualties.extend(apply_explosion(game, explosion));
                 game.terrain
                     .explode(explosion.x, explosion.y, explosion.radius);
                 ShotOutcome::TerrainImpact {
@@ -955,6 +958,7 @@ impl Registry {
             }
             TrajectoryEnd::Miss(reason) => ShotOutcome::Miss {
                 reason: shot_miss_reason(reason),
+                hits: projectile_casualties,
             },
         };
         let winner_team = winner(&game.state);
@@ -1844,7 +1848,27 @@ fn downsample_path(points: Vec<(f64, f64)>, limit: usize) -> Vec<(f64, f64)> {
         .collect()
 }
 
-fn apply_explosion(game: &mut Match, explosion: Circle) -> Vec<(usize, usize)> {
+fn apply_projectile_hits(game: &mut Match, hits: &[(usize, usize)]) -> Vec<SoldierSnapshot> {
+    let mut casualties = Vec::new();
+    for &(player_index, soldier_index) in hits {
+        if let Some(soldier) = game
+            .state
+            .players
+            .get_mut(player_index)
+            .and_then(|player| player.soldiers.get_mut(soldier_index))
+            && soldier.alive
+        {
+            soldier.alive = false;
+            casualties.push((player_index, soldier_index));
+        }
+    }
+    casualties
+        .into_iter()
+        .filter_map(|(player, soldier)| soldier_snapshot(game, player, soldier))
+        .collect()
+}
+
+fn apply_explosion(game: &mut Match, explosion: Circle) -> Vec<SoldierSnapshot> {
     let hit_radius = explosion.radius + SOLDIER_RADIUS;
     let hit_radius_squared = hit_radius * hit_radius;
     let mut casualties = Vec::new();
@@ -1861,6 +1885,9 @@ fn apply_explosion(game: &mut Match, explosion: Circle) -> Vec<(usize, usize)> {
         }
     }
     casualties
+        .into_iter()
+        .filter_map(|(player, soldier)| soldier_snapshot(game, player, soldier))
+        .collect()
 }
 
 fn shot_miss_reason(reason: TrajectoryMissReason) -> ShotMissReason {
@@ -2074,13 +2101,15 @@ mod tests {
             },
         );
 
-        assert_eq!(hits, vec![(0, 0)]);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].index, 0);
+        assert!(!hits[0].alive);
         assert!(!game.state.players[0].soldiers[0].alive);
         assert!(game.state.players[0].soldiers[1].alive);
     }
 
     #[test]
-    fn projectile_passing_through_soldier_does_not_damage() {
+    fn projectile_passing_through_soldier_damages_target() {
         let owner = Uuid::new_v4();
         let guest = Uuid::new_v4();
         let mut registry = Registry::default();
@@ -2113,19 +2142,24 @@ mod tests {
 
         let shot = registry.fire(owner, "0".into(), 0.0).unwrap().shot;
 
-        assert!(matches!(
-            shot.outcome,
-            ShotOutcome::Miss {
-                reason: ShotMissReason::WorldExit
-            }
-        ));
+        let ShotOutcome::Miss {
+            reason: ShotMissReason::WorldExit,
+            hits,
+        } = &shot.outcome
+        else {
+            panic!("expected world-exit miss");
+        };
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].player_id, guest);
+        assert!(!hits[0].alive);
+        assert_eq!(shot.winner_team, Some(1));
         let guest_soldier = shot
             .game
             .soldiers
             .iter()
             .find(|soldier| soldier.player_id == guest)
             .unwrap();
-        assert!(guest_soldier.alive);
+        assert!(!guest_soldier.alive);
     }
 
     #[test]
@@ -2165,14 +2199,14 @@ mod tests {
             explosions: Vec::new(),
         };
         game.state.players[0].soldiers[0] = Soldier::new(100.0, 225.0);
-        game.state.players[1].soldiers[0] = Soldier::new(130.0, 225.0);
+        game.state.players[1].soldiers[0] = Soldier::new(138.0, 243.0);
 
         let shot = registry.fire(owner, "0".into(), 0.0).unwrap().shot;
 
         let ShotOutcome::TerrainImpact { explosion, hits } = shot.outcome else {
             panic!("expected terrain impact");
         };
-        assert!((explosion.x - 130.0).hypot(explosion.y - 225.0) <= 12.0 + SOLDIER_RADIUS);
+        assert!((explosion.x - 138.0).hypot(explosion.y - 243.0) <= 12.0 + SOLDIER_RADIUS);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].player_id, guest);
         assert!(!hits[0].alive);
@@ -4124,8 +4158,9 @@ mod tests {
         assert!(matches!(
             outcome.shot.outcome,
             ShotOutcome::Miss {
-                reason: ShotMissReason::Numerical
-            }
+                reason: ShotMissReason::Numerical,
+                hits
+            } if hits.is_empty()
         ));
         assert_eq!(outcome.snapshot.phase, Phase::Resolving);
 

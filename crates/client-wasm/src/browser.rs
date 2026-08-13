@@ -964,16 +964,22 @@ fn shot_outcome_message(outcome: &ShotOutcome) -> String {
             "Terrain hit; no soldiers caught in the blast".into()
         }
         ShotOutcome::TerrainImpact { hits, .. } => {
-            format!("Terrain hit; {} soldier(s) caught in the blast", hits.len())
+            format!("Terrain hit; {} soldier(s) hit", hits.len())
+        }
+        ShotOutcome::Miss { hits, .. } if !hits.is_empty() => {
+            format!("Shot hit {} soldier(s)", hits.len())
         }
         ShotOutcome::Miss {
             reason: ShotMissReason::WorldExit,
+            ..
         } => "Shot missed: trajectory left the battlefield".into(),
         ShotOutcome::Miss {
             reason: ShotMissReason::Numerical,
+            ..
         } => "Shot missed: function became undefined".into(),
         ShotOutcome::Miss {
             reason: ShotMissReason::StepLimit,
+            ..
         } => "Shot missed: simulation limit reached".into(),
         ShotOutcome::Forfeit => "Player forfeited".into(),
     }

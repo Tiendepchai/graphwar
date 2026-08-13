@@ -23,5 +23,6 @@ pub use generation::SeededGenerator;
 pub use model::{GameState, Player, Soldier, Team};
 pub use terrain::{Circle, Terrain};
 pub use trajectory::{
-    Trajectory, TrajectoryEnd, TrajectoryError, TrajectoryMissReason, TrajectoryMode, trace,
+    Trajectory, TrajectoryEnd, TrajectoryError, TrajectoryMissReason, TrajectoryMode,
+    projectile_hits, trace,
 };

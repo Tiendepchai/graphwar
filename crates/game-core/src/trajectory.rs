@@ -40,6 +40,34 @@ pub enum TrajectoryError {
     InvalidState,
 }
 
+pub fn projectile_hits(points: &[(f64, f64)], game: &GameState) -> Vec<(usize, usize)> {
+    let shooter = game
+        .players
+        .get(game.turn)
+        .map(|player| (game.turn, player.current_soldier));
+    let mut hits = Vec::new();
+    for (player_index, player) in game.players.iter().enumerate() {
+        for (soldier_index, soldier) in player.living() {
+            if !finite_point((soldier.x, soldier.y)) {
+                continue;
+            }
+            if Some((player_index, soldier_index)) != shooter
+                && points.windows(2).any(|segment| {
+                    segment_hits_circle(
+                        segment[0],
+                        segment[1],
+                        (soldier.x, soldier.y),
+                        SOLDIER_RADIUS,
+                    )
+                })
+            {
+                hits.push((player_index, soldier_index));
+            }
+        }
+    }
+    hits
+}
+
 pub fn trace(
     expr: &Expr,
     mode: TrajectoryMode,
@@ -170,6 +198,19 @@ fn world_exit_point(from: (f64, f64), to: (f64, f64)) -> Option<(f64, f64)> {
     }
     let point = (from.0 + dx * t, from.1 + dy * t);
     finite_point(point).then_some(point)
+}
+
+fn segment_hits_circle(from: (f64, f64), to: (f64, f64), center: (f64, f64), radius: f64) -> bool {
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    let length_squared = dx.mul_add(dx, dy * dy);
+    if length_squared == 0.0 {
+        return (from.0 - center.0).hypot(from.1 - center.1) <= radius;
+    }
+    let t =
+        (((center.0 - from.0) * dx + (center.1 - from.1) * dy) / length_squared).clamp(0.0, 1.0);
+    let closest = (from.0 + t * dx, from.1 + t * dy);
+    (closest.0 - center.0).hypot(closest.1 - center.1) <= radius
 }
 
 fn distinct_points(first: (f64, f64), second: (f64, f64)) -> Vec<(f64, f64)> {
@@ -436,12 +477,13 @@ mod tests {
     }
 
     #[test]
-    fn soldier_contact_does_not_end_path() {
+    fn soldier_contact_does_not_end_path_but_reports_projectile_hit() {
+        let game = game_with_target(180.0, 225.0);
         let path = trace(
             &parse("0").unwrap(),
             TrajectoryMode::Function,
             &Terrain::default(),
-            &game_with_target(180.0, 225.0),
+            &game,
             false,
         )
         .unwrap();
@@ -450,6 +492,7 @@ mod tests {
             TrajectoryEnd::Miss(TrajectoryMissReason::WorldExit)
         );
         assert_eq!(path.points.last().unwrap().0, PLANE_LENGTH as f64);
+        assert_eq!(projectile_hits(&path.points, &game), vec![(1, 0)]);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RegisterRequest {
@@ -178,6 +178,8 @@ pub enum ShotOutcome {
     },
     Miss {
         reason: ShotMissReason,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        hits: Vec<SoldierSnapshot>,
     },
     Forfeit,
 }
@@ -319,7 +321,7 @@ mod tests {
             version: PROTOCOL_VERSION,
         };
         let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(json, r#"{"type":"hello","payload":{"version":9}}"#);
+        assert_eq!(json, r#"{"type":"hello","payload":{"version":10}}"#);
         let snap = SnapshotEnvelope {
             version: PROTOCOL_VERSION,
             sequence: 3,
@@ -612,12 +614,24 @@ mod tests {
             },
             ShotOutcome::Miss {
                 reason: ShotMissReason::WorldExit,
+                hits: Vec::new(),
+            },
+            ShotOutcome::Miss {
+                reason: ShotMissReason::WorldExit,
+                hits: vec![SoldierSnapshot {
+                    player_id: Uuid::new_v4(),
+                    index: 0,
+                    team: 2,
+                    alive: false,
+                }],
             },
             ShotOutcome::Miss {
                 reason: ShotMissReason::Numerical,
+                hits: Vec::new(),
             },
             ShotOutcome::Miss {
                 reason: ShotMissReason::StepLimit,
+                hits: Vec::new(),
             },
             ShotOutcome::Forfeit,
         ];

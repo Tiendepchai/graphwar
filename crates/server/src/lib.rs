@@ -1097,6 +1097,7 @@ mod tests {
             path: vec![(769.999_999, 449.999_999); 2_048],
             outcome: ShotOutcome::Miss {
                 reason: ShotMissReason::StepLimit,
+                hits: Vec::new(),
             },
             winner_team: None,
             game: game.clone(),

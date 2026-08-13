@@ -357,16 +357,29 @@ fn apply_shot(model: &mut Model, shot: graphwar_protocol::ShotResolved) {
                 "Terrain hit; no soldiers caught in the blast".into()
             } else {
                 model.notices.push(format!("{hit_count} soldier(s) hit"));
-                format!("Terrain hit; {hit_count} soldier(s) caught in the blast")
+                format!("Terrain hit; {hit_count} soldier(s) hit")
             }
         }
-        ShotOutcome::Miss { reason } => {
-            model.shot_hits.clear();
+        ShotOutcome::Miss { reason, hits } => {
+            let hit_count = hits.len();
+            model.shot_hits = hits
+                .into_iter()
+                .map(|hit| HitView {
+                    player_id: hit.player_id.to_string(),
+                    index: hit.index,
+                })
+                .collect();
             model.shot_explosion = None;
-            match reason {
-                ShotMissReason::WorldExit => "Shot missed: trajectory left the battlefield".into(),
-                ShotMissReason::Numerical => "Shot missed: function became undefined".into(),
-                ShotMissReason::StepLimit => "Shot missed: simulation limit reached".into(),
+            let miss = match reason {
+                ShotMissReason::WorldExit => "trajectory left the battlefield",
+                ShotMissReason::Numerical => "function became undefined",
+                ShotMissReason::StepLimit => "simulation limit reached",
+            };
+            if hit_count == 0 {
+                format!("Shot missed: {miss}")
+            } else {
+                model.notices.push(format!("{hit_count} soldier(s) hit"));
+                format!("Shot hit {hit_count} soldier(s); {miss}")
             }
         }
         ShotOutcome::Forfeit => {
@@ -1402,6 +1415,7 @@ mod tests {
                     path: vec![(100.0, 225.0), (120.0, 225.0)],
                     outcome: ShotOutcome::Miss {
                         reason: ShotMissReason::WorldExit,
+                        hits: Vec::new(),
                     },
                     winner_team: None,
                     game: GameSnapshot {
@@ -1434,6 +1448,51 @@ mod tests {
         );
         assert!(model.shot_hits.is_empty());
         assert!(model.shot_explosion.is_none());
+    }
+
+    #[test]
+    fn miss_populates_projectile_hits_without_explosion() {
+        let room_id = Uuid::new_v4();
+        let player_id = Uuid::new_v4();
+        let mut model = Model {
+            room_id: Some(room_id.to_string()),
+            room_revision: Some(0),
+            ..Model::default()
+        };
+        apply_shot(
+            &mut model,
+            graphwar_protocol::ShotResolved {
+                path: vec![(100.0, 225.0), (120.0, 225.0)],
+                outcome: ShotOutcome::Miss {
+                    reason: ShotMissReason::WorldExit,
+                    hits: vec![graphwar_protocol::SoldierSnapshot {
+                        player_id,
+                        index: 0,
+                        team: 2,
+                        alive: false,
+                    }],
+                },
+                winner_team: None,
+                game: GameSnapshot {
+                    room_id,
+                    revision: 1,
+                    mode: GameMode::Function,
+                    winner_team: None,
+                    turn_player_id: None,
+                    turn_deadline_at: None,
+                    soldiers: Vec::new(),
+                    terrain: Vec::new(),
+                    terrain_cuts: Vec::new(),
+                    shot_history: Vec::new(),
+                },
+            },
+        );
+        assert_eq!(model.shot_hits.len(), 1);
+        assert!(model.shot_explosion.is_none());
+        assert_eq!(
+            model.shot_status.as_deref(),
+            Some("Shot hit 1 soldier(s); trajectory left the battlefield")
+        );
     }
 
     #[test]
@@ -1481,7 +1540,7 @@ mod tests {
         assert!(model.shot_explosion.is_some());
         assert_eq!(
             model.shot_status.as_deref(),
-            Some("Terrain hit; 1 soldier(s) caught in the blast")
+            Some("Terrain hit; 1 soldier(s) hit")
         );
     }
 
@@ -1504,6 +1563,7 @@ mod tests {
                 path: vec![(100.0, 225.0)],
                 outcome: ShotOutcome::Miss {
                     reason: ShotMissReason::WorldExit,
+                    hits: Vec::new(),
                 },
                 winner_team: None,
                 game: GameSnapshot {
@@ -1645,6 +1705,7 @@ mod tests {
                     path: vec![(100.0, 225.0), (120.0, 225.0)],
                     outcome: ShotOutcome::Miss {
                         reason: ShotMissReason::WorldExit,
+                        hits: Vec::new(),
                     },
                     winner_team: None,
                     game,
@@ -1693,7 +1754,10 @@ mod tests {
                 &mut model,
                 graphwar_protocol::ShotResolved {
                     path: vec![(100.0, 225.0)],
-                    outcome: ShotOutcome::Miss { reason },
+                    outcome: ShotOutcome::Miss {
+                        reason,
+                        hits: Vec::new(),
+                    },
                     winner_team: None,
                     game: GameSnapshot {
                         room_id,

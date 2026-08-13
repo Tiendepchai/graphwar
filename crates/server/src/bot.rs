@@ -1,5 +1,6 @@
 use graphwar_game_core::{
-    Expr, GameState, Team, Terrain, TrajectoryEnd, TrajectoryMode, UnaryFunction, parse, trace,
+    Expr, GameState, Team, Terrain, TrajectoryEnd, TrajectoryMode, UnaryFunction, parse,
+    projectile_hits, trace,
 };
 use graphwar_protocol::GameMode;
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -298,10 +299,14 @@ fn score(trajectory: &graphwar_game_core::Trajectory, state: &GameState, team: T
         TrajectoryEnd::TerrainImpact { point } => Some(point),
         TrajectoryEnd::Miss(_) => None,
     };
-    let will_hit = |_player: usize, _soldier: usize, x: f64, y: f64| {
-        explosion.is_some_and(|point| {
-            (point.0 - x).hypot(point.1 - y) <= graphwar_game_core::constants::EXPLOSION_RADIUS
-        })
+    let projectile_hits = projectile_hits(&trajectory.points, state);
+    let will_hit = |player: usize, soldier: usize, x: f64, y: f64| {
+        projectile_hits.contains(&(player, soldier))
+            || explosion.is_some_and(|point| {
+                (point.0 - x).hypot(point.1 - y)
+                    <= graphwar_game_core::constants::EXPLOSION_RADIUS
+                        + graphwar_game_core::constants::SOLDIER_RADIUS
+            })
     };
     let mut total = 0.0;
     for (player_index, player) in state.players.iter().enumerate() {
@@ -842,20 +847,20 @@ mod tests {
     }
 
     #[test]
-    fn only_terrain_impact_scores_explosion_damage() {
+    fn projectile_and_terrain_impact_score_damage() {
         let state = state();
+        let miss = graphwar_game_core::Trajectory {
+            points: vec![(100.0, 225.0), (650.0, 225.0)],
+            end: TrajectoryEnd::Miss(graphwar_game_core::TrajectoryMissReason::WorldExit),
+        };
         let impact = graphwar_game_core::Trajectory {
             points: vec![(638.0, 225.0)],
             end: TrajectoryEnd::TerrainImpact {
                 point: (638.0, 225.0),
             },
         };
-        let miss = graphwar_game_core::Trajectory {
-            points: impact.points.clone(),
-            end: TrajectoryEnd::Miss(graphwar_game_core::TrajectoryMissReason::WorldExit),
-        };
+        assert!(score(&miss, &state, Team::One) >= ENEMY_HIT_SCORE);
         assert!(score(&impact, &state, Team::One) >= ENEMY_HIT_SCORE);
-        assert!(score(&miss, &state, Team::One) < ENEMY_HIT_SCORE);
     }
 
     #[test]
