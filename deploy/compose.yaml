@@ -52,6 +52,8 @@ services:
       - run
       - --token-file
       - /run/secrets/cloudflare-tunnel-token
+      - --url
+      - http://127.0.0.1:18081
     secrets:
       - cloudflare-tunnel-token
     networks:
