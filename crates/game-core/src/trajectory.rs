@@ -17,22 +17,27 @@ pub enum TrajectoryMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Hit {
-    pub player: usize,
-    pub soldier: usize,
-    pub step: usize,
+pub enum TrajectoryMissReason {
+    WorldExit,
+    Numerical,
+    StepLimit,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TrajectoryEnd {
+    TerrainImpact { point: (f64, f64) },
+    Miss(TrajectoryMissReason),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Trajectory {
     pub points: Vec<(f64, f64)>,
-    pub hits: Vec<Hit>,
+    pub end: TrajectoryEnd,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrajectoryError {
     InvalidState,
-    NonFinite,
 }
 
 pub fn trace(
@@ -48,21 +53,30 @@ pub fn trace(
     let Some(soldier) = shooter.current() else {
         return Err(TrajectoryError::InvalidState);
     };
+    if !soldier.x.is_finite() || !soldier.y.is_finite() || !inside_world((soldier.x, soldier.y)) {
+        return Err(TrajectoryError::InvalidState);
+    }
+
     let mut state = State::from_screen(soldier.x, soldier.y, inverted);
+    let start = state.screen(inverted);
+    let numerical = || Trajectory {
+        points: vec![start],
+        end: TrajectoryEnd::Miss(TrajectoryMissReason::Numerical),
+    };
     let angle = match mode {
         TrajectoryMode::Function => function_angle(expr, state.x),
         TrajectoryMode::FirstOrder => first_angle(expr, state.x, state.y),
         TrajectoryMode::SecondOrder { angle } => angle,
     };
     if !angle.is_finite() {
-        return Err(TrajectoryError::NonFinite);
+        return Ok(numerical());
     }
     let radius = PLANE_GAME_LENGTH * SOLDIER_RADIUS / PLANE_LENGTH as f64;
     state.x += radius * angle.cos();
     state.y += radius * angle.sin();
     state.dy = angle.tan();
     if !state.finite() {
-        return Err(TrajectoryError::NonFinite);
+        return Ok(numerical());
     }
     let offset = match mode {
         TrajectoryMode::Function => {
@@ -76,34 +90,98 @@ pub fn trace(
         _ => 0.0,
     };
     if !offset.is_finite() {
-        return Err(TrajectoryError::NonFinite);
+        return Ok(numerical());
     }
-    let mut result = Trajectory {
-        points: vec![state.screen(inverted)],
-        hits: Vec::new(),
-    };
+
+    let launch = state.screen(inverted);
+    if !inside_world(launch) {
+        let edge = world_exit_point(start, launch).unwrap_or(start);
+        return Ok(Trajectory {
+            points: distinct_points(start, edge),
+            end: TrajectoryEnd::Miss(TrajectoryMissReason::WorldExit),
+        });
+    }
+    let mut points = distinct_points(start, launch);
     let mut previous = state;
-    for step in 1..FUNC_MAX_STEPS {
+    for _ in 1..FUNC_MAX_STEPS {
         let Some(next) = adaptive_step(expr, mode, previous, offset) else {
-            break;
+            return Ok(Trajectory {
+                points,
+                end: TrajectoryEnd::Miss(TrajectoryMissReason::Numerical),
+            });
         };
         let from = previous.screen(inverted);
         let to = next.screen(inverted);
-        if !to.0.is_finite() || !to.1.is_finite() {
-            break;
+        if !finite_point(to) {
+            return Ok(Trajectory {
+                points,
+                end: TrajectoryEnd::Miss(TrajectoryMissReason::Numerical),
+            });
         }
-        if let Some(collision) = terrain.segment_collision_point(from, to) {
-            result.points.push(collision);
-            collect_hits(&mut result.hits, from, collision, game, step);
-            break;
+
+        let edge = world_exit_point(from, to);
+        let segment_end = edge.unwrap_or(to);
+        if let Some(point) = terrain.segment_collision_point(from, segment_end) {
+            push_distinct(&mut points, point);
+            return Ok(Trajectory {
+                points,
+                end: TrajectoryEnd::TerrainImpact { point },
+            });
         }
-        result.points.push(to);
-        collect_hits(&mut result.hits, from, to, game, step);
+        push_distinct(&mut points, segment_end);
+        if edge.is_some() {
+            return Ok(Trajectory {
+                points,
+                end: TrajectoryEnd::Miss(TrajectoryMissReason::WorldExit),
+            });
+        }
         previous = next;
     }
-    (result.points.len() > 1)
-        .then_some(result)
-        .ok_or(TrajectoryError::NonFinite)
+    Ok(Trajectory {
+        points,
+        end: TrajectoryEnd::Miss(TrajectoryMissReason::StepLimit),
+    })
+}
+
+fn finite_point(point: (f64, f64)) -> bool {
+    point.0.is_finite() && point.1.is_finite()
+}
+
+fn inside_world(point: (f64, f64)) -> bool {
+    (0.0..=PLANE_LENGTH as f64).contains(&point.0) && (0.0..=PLANE_HEIGHT as f64).contains(&point.1)
+}
+
+fn world_exit_point(from: (f64, f64), to: (f64, f64)) -> Option<(f64, f64)> {
+    if !inside_world(from) || inside_world(to) {
+        return None;
+    }
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    let mut t: f64 = 1.0;
+    if dx < 0.0 {
+        t = t.min((0.0 - from.0) / dx);
+    } else if dx > 0.0 {
+        t = t.min((PLANE_LENGTH as f64 - from.0) / dx);
+    }
+    if dy < 0.0 {
+        t = t.min((0.0 - from.1) / dy);
+    } else if dy > 0.0 {
+        t = t.min((PLANE_HEIGHT as f64 - from.1) / dy);
+    }
+    let point = (from.0 + dx * t, from.1 + dy * t);
+    finite_point(point).then_some(point)
+}
+
+fn distinct_points(first: (f64, f64), second: (f64, f64)) -> Vec<(f64, f64)> {
+    let mut points = vec![first];
+    push_distinct(&mut points, second);
+    points
+}
+
+fn push_distinct(points: &mut Vec<(f64, f64)>, point: (f64, f64)) {
+    if points.last().copied() != Some(point) {
+        points.push(point);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -112,6 +190,7 @@ struct State {
     y: f64,
     dy: f64,
 }
+
 impl State {
     fn from_screen(mut x: f64, y: f64, inverted: bool) -> Self {
         if inverted {
@@ -123,6 +202,7 @@ impl State {
             dy: 0.0,
         }
     }
+
     fn screen(self, inverted: bool) -> (f64, f64) {
         let mut x = PLANE_LENGTH as f64 * self.x / PLANE_GAME_LENGTH + PLANE_LENGTH as f64 / 2.0;
         if inverted {
@@ -133,6 +213,7 @@ impl State {
             -PLANE_LENGTH as f64 * self.y / PLANE_GAME_LENGTH + PLANE_HEIGHT as f64 / 2.0,
         )
     }
+
     fn finite(self) -> bool {
         self.x.is_finite() && self.y.is_finite() && self.dy.is_finite()
     }
@@ -220,6 +301,7 @@ fn function_angle(expr: &Expr, x: f64) -> f64 {
         ((f(final_x + STEP_SIZE) - f(final_x)) / STEP_SIZE).atan()
     })
 }
+
 fn first_angle(expr: &Expr, x: f64, y: f64) -> f64 {
     converge_angle(|angle| {
         let radius = PLANE_GAME_LENGTH * SOLDIER_RADIUS / PLANE_LENGTH as f64;
@@ -231,6 +313,7 @@ fn first_angle(expr: &Expr, x: f64, y: f64) -> f64 {
         .atan()
     })
 }
+
 fn converge_angle(mut update: impl FnMut(f64) -> f64) -> f64 {
     let mut angle: f64 = 0.0;
     for _ in 0..MAX_ANGLE_LOOPS {
@@ -246,43 +329,6 @@ fn converge_angle(mut update: impl FnMut(f64) -> f64) -> f64 {
     f64::NAN
 }
 
-fn collect_hits(
-    hits: &mut Vec<Hit>,
-    from: (f64, f64),
-    to: (f64, f64),
-    game: &GameState,
-    step: usize,
-) {
-    for (player_index, player) in game.players.iter().enumerate() {
-        for (soldier_index, soldier) in player.living() {
-            if player_index == game.turn && soldier_index == player.current_soldier {
-                continue;
-            }
-            if distance_to_segment((soldier.x, soldier.y), from, to) <= SOLDIER_RADIUS
-                && !hits
-                    .iter()
-                    .any(|hit| hit.player == player_index && hit.soldier == soldier_index)
-            {
-                hits.push(Hit {
-                    player: player_index,
-                    soldier: soldier_index,
-                    step,
-                });
-            }
-        }
-    }
-}
-fn distance_to_segment(point: (f64, f64), from: (f64, f64), to: (f64, f64)) -> f64 {
-    let dx = to.0 - from.0;
-    let dy = to.1 - from.1;
-    let length = dx * dx + dy * dy;
-    if length == 0.0 {
-        return (point.0 - from.0).hypot(point.1 - from.1);
-    }
-    let t = (((point.0 - from.0) * dx + (point.1 - from.1) * dy) / length).clamp(0.0, 1.0);
-    (point.0 - (from.0 + t * dx)).hypot(point.1 - (from.1 + t * dy))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,6 +337,7 @@ mod tests {
         parse,
         terrain::Circle,
     };
+
     fn game() -> GameState {
         GameState::new(vec![Player::new(
             1,
@@ -305,19 +352,24 @@ mod tests {
             Player::new(2, Team::Two, vec![Soldier::new(x, y)]),
         ])
     }
+
     #[test]
-    fn nan_stops_without_poisoning_points() {
+    fn nan_is_a_bounded_miss() {
+        let path = trace(
+            &parse("sqrt(-1)").unwrap(),
+            TrajectoryMode::Function,
+            &Terrain::default(),
+            &game(),
+            false,
+        )
+        .unwrap();
         assert_eq!(
-            trace(
-                &parse("sqrt(-1)").unwrap(),
-                TrajectoryMode::Function,
-                &Terrain::default(),
-                &game(),
-                false,
-            ),
-            Err(TrajectoryError::NonFinite)
+            path.end,
+            TrajectoryEnd::Miss(TrajectoryMissReason::Numerical)
         );
+        assert!(path.points.iter().all(|point| finite_point(*point)));
     }
+
     #[test]
     fn adaptive_step_enforces_distance() {
         let path = trace(
@@ -333,18 +385,20 @@ mod tests {
                 (pair[1].0 - pair[0].0).hypot(pair[1].1 - pair[0].1)
                     <= PLANE_LENGTH as f64 / PLANE_GAME_LENGTH
                         * FUNC_MAX_STEP_DISTANCE_SQUARED.sqrt()
+                        + SOLDIER_RADIUS
                         + 1e-9
             );
         }
     }
+
     #[test]
-    fn all_modes_produce_finite_points() {
+    fn all_modes_exit_world_with_finite_points() {
         for mode in [
             TrajectoryMode::Function,
             TrajectoryMode::FirstOrder,
             TrajectoryMode::SecondOrder { angle: 0.0 },
         ] {
-            let p = trace(
+            let path = trace(
                 &parse("0").unwrap(),
                 mode,
                 &Terrain::default(),
@@ -352,39 +406,19 @@ mod tests {
                 false,
             )
             .unwrap();
-            assert!(
-                p.points.len() > 1
-                    && p.points
-                        .iter()
-                        .all(|point| point.0.is_finite() && point.1.is_finite())
+            assert_eq!(
+                path.end,
+                TrajectoryEnd::Miss(TrajectoryMissReason::WorldExit)
             );
+            assert!(path.points.len() > 1 && path.points.iter().all(|point| finite_point(*point)));
+            assert!((path.points.last().unwrap().0 - PLANE_LENGTH as f64).abs() < 1e-9);
         }
     }
 
     #[test]
-    fn terrain_clips_path_and_blocks_target_behind_it() {
+    fn terrain_clips_path_at_first_material() {
         let terrain = Terrain::new(vec![Circle {
             x: 200.0,
-            y: 225.0,
-            radius: 10.0,
-        }]);
-        let path = trace(
-            &parse("0").unwrap(),
-            TrajectoryMode::Function,
-            &terrain,
-            &game_with_target(250.0, 225.0),
-            false,
-        )
-        .unwrap();
-        let endpoint = path.points.last().unwrap();
-        assert!((endpoint.0 - 190.0).abs() < 0.01);
-        assert!(path.hits.is_empty());
-    }
-
-    #[test]
-    fn target_before_terrain_is_hit() {
-        let terrain = Terrain::new(vec![Circle {
-            x: 250.0,
             y: 225.0,
             radius: 10.0,
         }]);
@@ -396,32 +430,49 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(
-            path.hits
-                .iter()
-                .any(|hit| hit.player == 1 && hit.soldier == 0)
-        );
+        let endpoint = *path.points.last().unwrap();
+        assert!((endpoint.0 - 190.0).abs() < 0.01);
+        assert_eq!(path.end, TrajectoryEnd::TerrainImpact { point: endpoint });
     }
 
     #[test]
-    fn tangent_target_is_hit() {
+    fn soldier_contact_does_not_end_path() {
         let path = trace(
             &parse("0").unwrap(),
             TrajectoryMode::Function,
             &Terrain::default(),
-            &game_with_target(180.0, 225.0 + SOLDIER_RADIUS),
+            &game_with_target(180.0, 225.0),
             false,
         )
         .unwrap();
-        assert!(
-            path.hits
-                .iter()
-                .any(|hit| hit.player == 1 && hit.soldier == 0)
+        assert_eq!(
+            path.end,
+            TrajectoryEnd::Miss(TrajectoryMissReason::WorldExit)
         );
+        assert_eq!(path.points.last().unwrap().0, PLANE_LENGTH as f64);
     }
 
     #[test]
-    fn angle_non_convergence_fails() {
+    fn terrain_before_edge_wins() {
+        let terrain = Terrain::new(vec![Circle {
+            x: 765.0,
+            y: 225.0,
+            radius: 2.0,
+        }]);
+        let path = trace(
+            &parse("0").unwrap(),
+            TrajectoryMode::Function,
+            &terrain,
+            &game(),
+            false,
+        )
+        .unwrap();
+        assert!(matches!(path.end, TrajectoryEnd::TerrainImpact { .. }));
+        assert!(path.points.last().unwrap().0 < PLANE_LENGTH as f64);
+    }
+
+    #[test]
+    fn angle_non_convergence_is_numerical_miss() {
         assert!(converge_angle(|angle| if angle == 0.0 { 1.0 } else { 0.0 }).is_nan());
     }
 }

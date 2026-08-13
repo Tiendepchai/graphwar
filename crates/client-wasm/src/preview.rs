@@ -9,19 +9,19 @@ pub fn trace_preview(
     model: &Model,
     function: &str,
     angle_deg: f64,
-) -> Result<Vec<(f64, f64)>, &'static str> {
+) -> Result<Vec<(f64, f64)>, String> {
     let active = model
         .soldiers
         .iter()
         .position(|soldier| soldier.active && soldier.alive)
-        .ok_or("No active soldier")?;
-    let expression = parse(function).map_err(|_| "Invalid function")?;
+        .ok_or_else(|| "No active soldier".to_string())?;
+    let expression = parse(function).map_err(|error| error.to_string())?;
     let game_mode = model.game_mode.unwrap_or(GameMode::Function);
     if !expression.variables_allowed(
         game_mode != GameMode::Function,
         game_mode == GameMode::SecondOrder,
     ) {
-        return Err("Variable unavailable in this mode");
+        return Err("Variable unavailable in this mode".into());
     }
     let mut order = Vec::with_capacity(model.soldiers.len());
     order.push(active);
@@ -66,7 +66,7 @@ pub fn trace_preview(
         team(model.soldiers[active].team) == Team::Two,
     )
     .map(|trajectory| trajectory.points)
-    .map_err(|_| "Function has no finite trajectory")
+    .map_err(|_| "Unable to preview from the current game state".into())
 }
 
 fn circle(view: &crate::state::TerrainView) -> Circle {
@@ -113,26 +113,35 @@ mod tests {
             ..Model::default()
         };
         assert!(trace_preview(&model, "0", 0.0).unwrap().len() > 1);
-        assert_eq!(
-            trace_preview(&model, "garbage", 0.0),
-            Err("Invalid function")
+        assert!(
+            trace_preview(&model, "garbage", 0.0)
+                .unwrap_err()
+                .contains("byte 0")
         );
-        assert_eq!(trace_preview(&model, "x+", 0.0), Err("Invalid function"));
+        assert!(
+            trace_preview(&model, "x+", 0.0)
+                .unwrap_err()
+                .contains("byte 2")
+        );
         assert!(trace_preview(&model, "sin(x)", 0.0).is_ok());
+        assert!(trace_preview(&model, r#"\frac{\sin(x)}{\sqrt{2}}"#, 0.0).is_ok());
         assert_eq!(
             trace_preview(&model, "y", 0.0),
-            Err("Variable unavailable in this mode")
+            Err("Variable unavailable in this mode".into())
         );
         model.game_mode = Some(GameMode::FirstOrder);
         assert!(trace_preview(&model, "y", 0.0).is_ok());
         assert_eq!(
             trace_preview(&model, "y'", 0.0),
-            Err("Variable unavailable in this mode")
+            Err("Variable unavailable in this mode".into())
         );
         model.game_mode = Some(GameMode::SecondOrder);
         assert!(trace_preview(&model, "y + y'", 0.0).is_ok());
 
         model.soldiers[0].active = false;
-        assert_eq!(trace_preview(&model, "0", 0.0), Err("No active soldier"));
+        assert_eq!(
+            trace_preview(&model, "0", 0.0),
+            Err("No active soldier".into())
+        );
     }
 }

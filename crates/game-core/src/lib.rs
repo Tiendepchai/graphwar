@@ -18,8 +18,10 @@ pub mod model;
 pub mod terrain;
 pub mod trajectory;
 
-pub use expression::{Ast, EvalVars, Expr, ParseError, parse};
+pub use expression::{Ast, BinaryFunction, EvalVars, Expr, ParseError, UnaryFunction, parse};
 pub use generation::SeededGenerator;
 pub use model::{GameState, Player, Soldier, Team};
 pub use terrain::{Circle, Terrain};
-pub use trajectory::{Hit, Trajectory, TrajectoryError, TrajectoryMode, trace};
+pub use trajectory::{
+    Trajectory, TrajectoryEnd, TrajectoryError, TrajectoryMissReason, TrajectoryMode, trace,
+};

@@ -35,6 +35,7 @@ use rooms::{LeaveBroadcast, RoomError, RoomRegistry};
 
 const MAX_WS_MESSAGE_BYTES: usize = 8 * 1024;
 const MAX_WS_TRANSPORT_BYTES: usize = 16 * 1024;
+const MAX_WS_OUTBOUND_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 16 * 1024;
 const MAX_MESSAGES_PER_WINDOW: usize = 120;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -249,25 +250,17 @@ impl AppState {
     }
 
     async fn cleanup_disconnected(&self, player: uuid::Uuid) {
-        let cleanup = {
+        let (cleanup, public_rooms) = {
             let mut presence = self.presence.write().await;
             if presence.get(&player).is_some_and(|count| *count > 0) {
                 return;
             }
             let mut rooms = self.rooms.write().await;
-            let old_room = rooms
-                .member_snapshot(player)
-                .map(|snapshot| snapshot.id)
-                .ok();
-            let cleanup = match old_room {
-                Some(old_room) => {
+            let cleanup = match rooms.member_snapshot(player) {
+                Ok(_) => {
                     let previous = rooms.clone();
-                    match rooms.disconnect(player) {
-                        Ok(snapshot) if self.persist_rooms(&rooms).await.is_ok() => Some((
-                            snapshot,
-                            rooms.member_ids(old_room),
-                            rooms.public_snapshots(),
-                        )),
+                    match rooms.leave(player) {
+                        Ok(leave) if self.persist_rooms(&rooms).await.is_ok() => Some(leave),
                         Ok(_) => {
                             *rooms = previous;
                             return;
@@ -275,22 +268,27 @@ impl AppState {
                         Err(_) => None,
                     }
                 }
-                None => Some((None, Vec::new(), rooms.public_snapshots())),
+                Err(RoomError::NotMember) => None,
+                Err(_) => return,
             };
+            let public_rooms = rooms.public_snapshots();
             presence.remove(&player);
             self.account_events
                 .write()
                 .expect("account event lock")
                 .remove(&player);
-            cleanup
+            (cleanup, public_rooms)
         };
-        let Some((snapshot, players, public_rooms)) = cleanup else {
-            return;
-        };
-        if let Some(snapshot) = snapshot {
+        if let Some(leave) = cleanup
+            && let Some(broadcast) = leave.broadcast
+        {
+            let rooms = self.rooms.read().await;
+            let message = leave_broadcast_message(&rooms, broadcast);
+            let players = rooms.member_ids(leave.room_id);
+            drop(rooms);
             self.publish(ScopedEvent {
                 audience: Audience::Room { players },
-                message: ServerMessage::Room { snapshot },
+                message,
             });
         }
         self.publish(ScopedEvent {
@@ -591,11 +589,11 @@ async fn send_message<S, E>(socket: &mut S, message: &ServerMessage) -> Result<(
 where
     S: Sink<Message, Error = E> + Unpin,
 {
-    send_frame(
-        socket,
-        Message::Text(serde_json::to_string(message).map_err(|_| ())?.into()),
-    )
-    .await
+    let text = serde_json::to_string(message).map_err(|_| ())?;
+    if text.len() > MAX_WS_OUTBOUND_MESSAGE_BYTES {
+        return Err(());
+    }
+    send_frame(socket, Message::Text(text.into())).await
 }
 
 async fn send_frame<S, E>(socket: &mut S, message: Message) -> Result<(), ()>
@@ -663,6 +661,42 @@ impl DispatchOutcome {
     }
 }
 
+fn room_message(
+    rooms: &rooms::Registry,
+    snapshot: graphwar_protocol::RoomSnapshot,
+) -> ServerMessage {
+    let practice_setup = rooms.practice_setup(snapshot.id);
+    ServerMessage::Room {
+        snapshot,
+        practice_setup,
+    }
+}
+
+fn leave_broadcast_message(rooms: &rooms::Registry, broadcast: LeaveBroadcast) -> ServerMessage {
+    match broadcast {
+        LeaveBroadcast::Room(snapshot) => room_message(rooms, snapshot),
+        LeaveBroadcast::StateSync {
+            snapshot,
+            game,
+            chat_history,
+        } => {
+            let practice_setup = rooms.practice_setup(snapshot.id);
+            ServerMessage::StateSync {
+                snapshot,
+                game: Some(game),
+                practice_setup,
+                chat_history,
+            }
+        }
+        LeaveBroadcast::TurnStarted { snapshot, game } => {
+            ServerMessage::TurnStarted { snapshot, game }
+        }
+        LeaveBroadcast::GameFinished { snapshot, shot } => {
+            ServerMessage::GameFinished { snapshot, shot }
+        }
+    }
+}
+
 async fn dispatch(
     state: &AppState,
     user: &auth::User,
@@ -682,18 +716,25 @@ async fn dispatch(
         ClientMessage::CreateRoom {
             name,
             visibility,
+            kind,
             password,
         } => {
-            let (snapshot, invite) = rooms.create(
+            let (snapshot, invite) = rooms.create_with_kind(
                 user.id,
                 user.display_name.clone(),
                 name,
                 visibility,
+                kind,
                 password,
             )?;
+            let practice_setup = rooms.practice_setup(snapshot.id);
             Ok(DispatchOutcome::accounts(
                 vec![user.id],
-                ServerMessage::RoomCreated { snapshot, invite },
+                ServerMessage::RoomCreated {
+                    snapshot,
+                    invite,
+                    practice_setup,
+                },
             )
             .with_lobby(rooms.public_snapshots()))
         }
@@ -706,7 +747,7 @@ async fn dispatch(
             )?;
             Ok(DispatchOutcome::room(
                 rooms.member_ids(snapshot.id),
-                ServerMessage::Room { snapshot },
+                room_message(&rooms, snapshot),
             )
             .with_lobby(rooms.public_snapshots()))
         }
@@ -714,24 +755,7 @@ async fn dispatch(
             let leave = rooms.leave(user.id)?;
             let mut outcome = DispatchOutcome::accounts(vec![user.id], ServerMessage::LeftRoom);
             if let Some(broadcast) = leave.broadcast {
-                let message = match broadcast {
-                    LeaveBroadcast::Room(snapshot) => ServerMessage::Room { snapshot },
-                    LeaveBroadcast::StateSync {
-                        snapshot,
-                        game,
-                        chat_history,
-                    } => ServerMessage::StateSync {
-                        snapshot,
-                        game: Some(game),
-                        chat_history,
-                    },
-                    LeaveBroadcast::TurnStarted { snapshot, game } => {
-                        ServerMessage::TurnStarted { snapshot, game }
-                    }
-                    LeaveBroadcast::GameFinished { snapshot, shot } => {
-                        ServerMessage::GameFinished { snapshot, shot }
-                    }
-                };
+                let message = leave_broadcast_message(&rooms, broadcast);
                 outcome.broadcasts.push(ScopedEvent {
                     audience: Audience::Room {
                         players: rooms.member_ids(leave.room_id),
@@ -741,25 +765,33 @@ async fn dispatch(
             }
             Ok(outcome.with_lobby(rooms.public_snapshots()))
         }
+        ClientMessage::ReturnToLobby => {
+            let snapshot = rooms.return_to_lobby(user.id)?;
+            Ok(DispatchOutcome::room(
+                rooms.member_ids(snapshot.id),
+                room_message(&rooms, snapshot),
+            )
+            .with_lobby(rooms.public_snapshots()))
+        }
         ClientMessage::SetReady { ready } => {
             let snapshot = rooms.set_ready(user.id, ready)?;
             Ok(DispatchOutcome::room(
                 rooms.member_ids(snapshot.id),
-                ServerMessage::Room { snapshot },
+                room_message(&rooms, snapshot),
             ))
         }
         ClientMessage::SetMode { mode } => {
             let snapshot = rooms.set_mode(user.id, mode)?;
             Ok(DispatchOutcome::room(
                 rooms.member_ids(snapshot.id),
-                ServerMessage::Room { snapshot },
+                room_message(&rooms, snapshot),
             ))
         }
         ClientMessage::SetTeam { player_id, team } => {
             let snapshot = rooms.set_team(user.id, player_id, team)?;
             Ok(DispatchOutcome::room(
                 rooms.member_ids(snapshot.id),
-                ServerMessage::Room { snapshot },
+                room_message(&rooms, snapshot),
             ))
         }
         ClientMessage::SetSoldiers {
@@ -769,14 +801,24 @@ async fn dispatch(
             let snapshot = rooms.set_soldiers(user.id, player_id, soldiers)?;
             Ok(DispatchOutcome::room(
                 rooms.member_ids(snapshot.id),
-                ServerMessage::Room { snapshot },
+                room_message(&rooms, snapshot),
+            ))
+        }
+        ClientMessage::SetPracticeSetup {
+            base_revision,
+            setup,
+        } => {
+            let snapshot = rooms.set_practice_setup(user.id, base_revision, setup)?;
+            Ok(DispatchOutcome::room(
+                rooms.member_ids(snapshot.id),
+                room_message(&rooms, snapshot),
             ))
         }
         ClientMessage::AddBot { level } => {
             let snapshot = rooms.add_bot(user.id, level)?;
             Ok(DispatchOutcome::room(
                 rooms.member_ids(snapshot.id),
-                ServerMessage::Room { snapshot },
+                room_message(&rooms, snapshot),
             )
             .with_lobby(rooms.public_snapshots()))
         }
@@ -784,7 +826,7 @@ async fn dispatch(
             let snapshot = rooms.remove_bot(user.id, player_id)?;
             Ok(DispatchOutcome::room(
                 rooms.member_ids(snapshot.id),
-                ServerMessage::Room { snapshot },
+                room_message(&rooms, snapshot),
             )
             .with_lobby(rooms.public_snapshots()))
         }
@@ -796,7 +838,7 @@ async fn dispatch(
                 audience: Audience::Room {
                     players: rooms.member_ids(room_id),
                 },
-                message: ServerMessage::Room { snapshot },
+                message: room_message(&rooms, snapshot),
             });
             Ok(outcome.with_lobby(rooms.public_snapshots()))
         }
@@ -856,11 +898,15 @@ where
     let messages = {
         let rooms = state.rooms.read().await;
         let room = match rooms.member_state(player) {
-            Ok((snapshot, game, chat_history)) => ServerMessage::StateSync {
-                snapshot,
-                game,
-                chat_history,
-            },
+            Ok((snapshot, game, chat_history)) => {
+                let practice_setup = rooms.member_practice_setup(player).map_err(|_| ())?;
+                ServerMessage::StateSync {
+                    snapshot,
+                    game,
+                    practice_setup,
+                    chat_history,
+                }
+            }
             Err(RoomError::NotMember) => ServerMessage::LeftRoom,
             Err(_) => return Err(()),
         };
@@ -961,6 +1007,125 @@ mod tests {
     use super::*;
 
     #[test]
+    fn maximum_valid_outbound_messages_fit_hard_limit() {
+        use graphwar_protocol::{
+            ChatEntry, GameMode, GameSnapshot, Phase, PlayerSnapshot, RoomKind, RoomSnapshot,
+            RoomVisibility, ShotHistoryEntry, ShotMissReason, ShotOutcome, ShotResolved,
+            SoldierPosition, TerrainCircle,
+        };
+
+        let room_id = uuid::Uuid::new_v4();
+        let players = (0..10)
+            .map(|index| PlayerSnapshot {
+                id: uuid::Uuid::new_v4(),
+                display_name: "x".repeat(32),
+                owner: index == 0,
+                ready: true,
+                team: if index % 2 == 0 { 1 } else { 2 },
+                soldiers: 4,
+                is_bot: index != 0,
+            })
+            .collect::<Vec<_>>();
+        let snapshot = RoomSnapshot {
+            id: room_id,
+            name: "x".repeat(64),
+            visibility: RoomVisibility::Public,
+            phase: Phase::Planning,
+            revision: u64::MAX - 1,
+            mode: GameMode::SecondOrder,
+            kind: RoomKind::Standard,
+            players: players.clone(),
+        };
+        let game = GameSnapshot {
+            room_id,
+            revision: u64::MAX - 1,
+            mode: GameMode::SecondOrder,
+            winner_team: None,
+            turn_player_id: Some(players[0].id),
+            turn_deadline_at: Some(i64::MAX),
+            soldiers: players
+                .iter()
+                .flat_map(|player| {
+                    (0..4).map(move |index| SoldierPosition {
+                        player_id: player.id,
+                        index,
+                        team: player.team,
+                        x: 769.999_999,
+                        y: 449.999_999,
+                        alive: true,
+                        active: false,
+                    })
+                })
+                .collect(),
+            terrain: vec![
+                TerrainCircle {
+                    x: 769.999_999,
+                    y: 449.999_999,
+                    radius: 999.999_999,
+                };
+                512
+            ],
+            terrain_cuts: vec![
+                TerrainCircle {
+                    x: 769.999_999,
+                    y: 449.999_999,
+                    radius: 12.0,
+                };
+                512
+            ],
+            shot_history: (1..=40)
+                .map(|sequence| ShotHistoryEntry {
+                    sequence,
+                    player_id: players[0].id,
+                    display_name: "x".repeat(32),
+                    team: 1,
+                    function: "x".repeat(256),
+                    angle_deg: -90.0,
+                })
+                .collect(),
+        };
+        let chat_history = (1..=100)
+            .map(|sequence| ChatEntry {
+                room_id,
+                sequence,
+                player_id: players[0].id,
+                display_name: "x".repeat(32),
+                text: "x".repeat(500),
+            })
+            .collect::<Vec<_>>();
+        let shot = ShotResolved {
+            path: vec![(769.999_999, 449.999_999); 2_048],
+            outcome: ShotOutcome::Miss {
+                reason: ShotMissReason::StepLimit,
+            },
+            winner_team: None,
+            game: game.clone(),
+        };
+        let messages = [
+            ServerMessage::StateSync {
+                snapshot: snapshot.clone(),
+                game: Some(game),
+                practice_setup: None,
+                chat_history,
+            },
+            ServerMessage::ShotResolved {
+                snapshot: snapshot.clone(),
+                shot,
+            },
+            ServerMessage::RoomList {
+                rooms: vec![snapshot; 256],
+            },
+        ];
+        for message in messages {
+            let size = serde_json::to_vec(&message).unwrap().len();
+            assert!(
+                size <= MAX_WS_OUTBOUND_MESSAGE_BYTES,
+                "{size} byte outbound message"
+            );
+        }
+    }
+
+    #[test]
     fn accepts_only_configured_websocket_origins() {
         let config = Config::test();
         let mut headers = HeaderMap::new();
@@ -1055,10 +1220,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_disconnect_keeps_room_membership_and_clears_presence() {
+    async fn non_member_disconnect_keeps_public_room_list() {
+        let state = test_state();
+        let owner = uuid::Uuid::new_v4();
+        let disconnected = uuid::Uuid::new_v4();
+        let observer = uuid::Uuid::new_v4();
+        state
+            .rooms
+            .write()
+            .await
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                graphwar_protocol::RoomVisibility::Public,
+                None,
+            )
+            .unwrap();
+        let mut observer_events = state.subscribe(observer);
+        state.socket_connected(disconnected).await;
+        assert!(state.release_socket(disconnected).await);
+
+        state.cleanup_disconnected(disconnected).await;
+
+        let ServerMessage::RoomList { rooms } = observer_events.recv().await.unwrap() else {
+            panic!("observer should receive the current room list");
+        };
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0].name, "room");
+    }
+
+    #[tokio::test]
+    async fn active_disconnect_forfeits_and_removes_member() {
         let state = test_state();
         let owner = uuid::Uuid::new_v4();
         let guest = uuid::Uuid::new_v4();
+        let mut guest_events = state.subscribe(guest);
         {
             let mut rooms = state.rooms.write().await;
             let room = rooms
@@ -1080,8 +1277,14 @@ mod tests {
         assert!(state.release_socket(owner).await);
         state.cleanup_disconnected(owner).await;
 
-        assert!(state.rooms.read().await.member_snapshot(owner).is_ok());
+        assert!(state.rooms.read().await.member_snapshot(owner).is_err());
         assert!(state.presence.read().await.get(&owner).is_none());
+        let ServerMessage::GameFinished { snapshot, shot } = guest_events.recv().await.unwrap()
+        else {
+            panic!("remaining player should receive the forfeit result");
+        };
+        assert_eq!(snapshot.phase, graphwar_protocol::Phase::Finished);
+        assert_eq!(shot.winner_team, Some(2));
     }
 
     #[tokio::test]
@@ -1168,7 +1371,7 @@ mod tests {
             matches!(&event.audience, Audience::Room { players } if players == &[owner])
                 && matches!(
                     &event.message,
-                    ServerMessage::Room { snapshot }
+                    ServerMessage::Room { snapshot, .. }
                         if snapshot.id == room_id
                             && snapshot.players.len() == 1
                             && snapshot.players[0].id == owner
@@ -1193,6 +1396,7 @@ mod tests {
                 ClientMessage::CreateRoom {
                     name: "room".into(),
                     visibility: graphwar_protocol::RoomVisibility::Public,
+                    kind: graphwar_protocol::RoomKind::Standard,
                     password: None,
                 },
             )
@@ -1217,6 +1421,7 @@ mod tests {
             ClientMessage::CreateRoom {
                 name: "private".into(),
                 visibility: graphwar_protocol::RoomVisibility::Private,
+                kind: graphwar_protocol::RoomKind::Standard,
                 password: Some("room password".into()),
             },
         )

@@ -5,20 +5,26 @@ use std::{
 
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use graphwar_game_core::{
-    Circle, Expr, GameState, Player, SeededGenerator, Soldier, Team, Terrain, TrajectoryMode,
-    constants::{MAX_PLAYERS, MAX_SOLDIERS_PER_PLAYER, PLANE_HEIGHT, PLANE_LENGTH, SOLDIER_RADIUS},
+    Circle, Expr, GameState, Player, SeededGenerator, Soldier, Team, Terrain, TrajectoryEnd,
+    TrajectoryMissReason, TrajectoryMode,
+    constants::{
+        MAX_GAME_TERRAIN_CIRCLES, MAX_PLAYERS, MAX_PRACTICE_TERRAIN_CIRCLES,
+        MAX_SOLDIERS_PER_PLAYER, PLANE_HEIGHT, PLANE_LENGTH, PRACTICE_TERRAIN_RADII,
+        SOLDIER_RADIUS,
+    },
     parse, trace,
 };
 
 use graphwar_protocol::{
-    ChatEntry, GameMode, GameSnapshot, Phase, PlayerSnapshot, RoomSnapshot, RoomVisibility,
-    ShotHistoryEntry, ShotResolved, SoldierPosition, SoldierSnapshot, TerrainCircle,
+    ChatEntry, GameMode, GameSnapshot, Phase, PlayerSnapshot, PracticePlayerPlacement,
+    PracticeSetup, RoomKind, RoomSnapshot, RoomVisibility, SetupPoint, ShotHistoryEntry,
+    ShotMissReason, ShotOutcome, ShotResolved, SoldierPosition, SoldierSnapshot, TerrainCircle,
 };
 use password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-const REGISTRY_FORMAT_VERSION: u32 = 1;
+const REGISTRY_FORMAT_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 struct PersistedRegistry {
@@ -33,6 +39,8 @@ struct PersistedRoom {
     members: HashMap<Uuid, bool>,
     bots: HashMap<Uuid, PersistedBot>,
     game: Option<PersistedMatch>,
+    #[serde(default)]
+    practice_setup: Option<PracticeSetup>,
     #[serde(default)]
     event_sequence: u64,
     #[serde(default)]
@@ -63,7 +71,10 @@ pub type RoomRegistry = std::sync::Arc<tokio::sync::RwLock<Registry>>;
 const TURN_DURATION: Duration = Duration::from_secs(60);
 const MAX_SHOT_HISTORY: usize = 40;
 const MAX_CHAT_HISTORY: usize = 100;
+const MAX_TERRAIN_CUTS: usize = 512;
+const MAX_TRAJECTORY_POINTS: usize = 2_048;
 const MAX_ROOM_PASSWORD_BYTES: usize = 1024;
+const MAX_ROOMS: usize = 256;
 
 #[derive(Clone, Default)]
 pub struct Registry {
@@ -77,6 +88,7 @@ struct Room {
     members: HashMap<Uuid, bool>,
     bots: HashMap<Uuid, BotSpec>,
     game: Option<Match>,
+    practice_setup: Option<PracticeSetup>,
     event_sequence: u64,
     chat_history: Vec<ChatEntry>,
 }
@@ -186,11 +198,14 @@ impl Registry {
     pub(crate) fn from_persisted_json(input: &str) -> Result<Self, String> {
         let persisted: PersistedRegistry =
             serde_json::from_str(input).map_err(|error| error.to_string())?;
-        if persisted.version != REGISTRY_FORMAT_VERSION {
+        if !matches!(persisted.version, 1 | REGISTRY_FORMAT_VERSION) {
             return Err(format!(
                 "unsupported registry snapshot version {}",
                 persisted.version
             ));
+        }
+        if persisted.rooms.len() > MAX_ROOMS {
+            return Err("too many rooms".into());
         }
         let mut rooms = HashMap::with_capacity(persisted.rooms.len());
         for mut persisted in persisted.rooms {
@@ -230,6 +245,7 @@ impl Registry {
                     members: persisted.members,
                     bots,
                     game,
+                    practice_setup: persisted.practice_setup,
                     event_sequence: persisted.event_sequence,
                     chat_history: persisted.chat_history,
                 },
@@ -269,6 +285,7 @@ impl Registry {
                         turn_deadline_at: game.turn_deadline_at,
                         shot_history: game.shot_history.clone(),
                     }),
+                    practice_setup: room.practice_setup.clone(),
                     event_sequence: room.event_sequence,
                     chat_history: room.chat_history.clone(),
                 })
@@ -309,12 +326,34 @@ impl Registry {
         visibility: RoomVisibility,
         password: Option<String>,
     ) -> Result<(RoomSnapshot, Option<String>), RoomError> {
+        self.create_with_kind(
+            owner,
+            display_name,
+            name,
+            visibility,
+            RoomKind::Standard,
+            password,
+        )
+    }
+
+    pub fn create_with_kind(
+        &mut self,
+        owner: Uuid,
+        display_name: String,
+        name: String,
+        visibility: RoomVisibility,
+        kind: RoomKind,
+        password: Option<String>,
+    ) -> Result<(RoomSnapshot, Option<String>), RoomError> {
         let name = name.trim();
         if name.is_empty() || name.len() > 64 {
             return Err(RoomError::Invalid("room name must be 1-64 characters"));
         }
         if self.room_id_for(owner).is_some() {
             return Err(RoomError::Invalid("leave the current room first"));
+        }
+        if self.rooms.len() >= MAX_ROOMS {
+            return Err(RoomError::Invalid("room limit reached"));
         }
         let invite = match (visibility, password) {
             (RoomVisibility::Private, Some(password)) => Some(hash_room_password(&password)?),
@@ -334,6 +373,7 @@ impl Registry {
             phase: Phase::Lobby,
             revision: 0,
             mode: GameMode::Function,
+            kind,
             players: vec![PlayerSnapshot {
                 id: owner,
                 display_name,
@@ -344,6 +384,9 @@ impl Registry {
                 is_bot: false,
             }],
         };
+        let practice_setup = (kind == RoomKind::Practice)
+            .then(|| reconcile_practice_setup(None, &snapshot.players, id))
+            .transpose()?;
         self.rooms.insert(
             id,
             Room {
@@ -352,6 +395,7 @@ impl Registry {
                 members: HashMap::from([(owner, false)]),
                 bots: HashMap::new(),
                 game: None,
+                practice_setup,
                 event_sequence: 0,
                 chat_history: Vec::new(),
             },
@@ -390,12 +434,13 @@ impl Registry {
         if room.snapshot.players.len() >= MAX_PLAYERS && !room.members.contains_key(&player) {
             return Err(RoomError::Invalid("room is full"));
         }
-        if legacy_password {
-            room.invite = Some(hash_room_password(invite.expect("verified password"))?);
-        }
-        if let std::collections::hash_map::Entry::Vacant(entry) = room.members.entry(player) {
-            entry.insert(false);
-            room.snapshot.players.push(PlayerSnapshot {
+        if !room.members.contains_key(&player) {
+            let mut candidate = room.clone();
+            if legacy_password {
+                candidate.invite = Some(hash_room_password(invite.expect("verified password"))?);
+            }
+            candidate.members.insert(player, false);
+            candidate.snapshot.players.push(PlayerSnapshot {
                 id: player,
                 display_name,
                 owner: false,
@@ -404,7 +449,10 @@ impl Registry {
                 soldiers: 2,
                 is_bot: false,
             });
-            room.snapshot.revision += 1;
+            reconcile_room_practice_setup(&mut candidate)?;
+            reset_readiness(&mut candidate);
+            candidate.snapshot.revision += 1;
+            *room = candidate;
         }
         Ok(room.snapshot.clone())
     }
@@ -414,15 +462,23 @@ impl Registry {
         let phase = self.rooms[&id].snapshot.phase;
         if matches!(phase, Phase::Lobby | Phase::Finished) {
             let room = self.rooms.get_mut(&id).expect("room ID came from registry");
-            if phase == Phase::Finished {
-                room.snapshot.phase = Phase::Lobby;
-                room.game = None;
-                reset_readiness(room);
-            }
-            if remove_member(room, player) {
+            let mut candidate = room.clone();
+            if remove_member(&mut candidate, player) {
+                reconcile_room_practice_setup(&mut candidate)?;
+                reset_readiness(&mut candidate);
+                let broadcast = if phase == Phase::Finished {
+                    LeaveBroadcast::StateSync {
+                        snapshot: candidate.snapshot.clone(),
+                        game: snapshot_for_game(&candidate),
+                        chat_history: candidate.chat_history.clone(),
+                    }
+                } else {
+                    LeaveBroadcast::Room(candidate.snapshot.clone())
+                };
+                *room = candidate;
                 Ok(LeaveOutcome {
                     room_id: id,
-                    broadcast: Some(LeaveBroadcast::Room(room.snapshot.clone())),
+                    broadcast: Some(broadcast),
                 })
             } else {
                 self.rooms.remove(&id);
@@ -433,8 +489,9 @@ impl Registry {
             }
         } else {
             let room = self.rooms.get_mut(&id).expect("room ID came from registry");
+            let mut candidate = room.clone();
             let (current, winner_team) = {
-                let game = room.game.as_mut().ok_or(RoomError::WrongPhase)?;
+                let game = candidate.game.as_mut().ok_or(RoomError::WrongPhase)?;
                 let slot = game
                     .player_ids
                     .iter()
@@ -445,24 +502,26 @@ impl Registry {
                 }
                 (game.state.turn == slot, winner(&game.state))
             };
-            if !remove_member(room, player) {
+            if !remove_member(&mut candidate, player) {
                 self.rooms.remove(&id);
                 return Ok(LeaveOutcome {
                     room_id: id,
                     broadcast: None,
                 });
             }
+            reconcile_room_practice_setup(&mut candidate)?;
             if let Some(winner_team) = winner_team {
-                room.snapshot.phase = Phase::Finished;
-                let game_snapshot = snapshot_for_game(room);
+                candidate.snapshot.phase = Phase::Finished;
+                let game_snapshot = snapshot_for_game(&candidate);
+                let snapshot = candidate.snapshot.clone();
+                *room = candidate;
                 return Ok(LeaveOutcome {
                     room_id: id,
                     broadcast: Some(LeaveBroadcast::GameFinished {
-                        snapshot: room.snapshot.clone(),
+                        snapshot,
                         shot: ShotResolved {
                             path: Vec::new(),
-                            hits: Vec::new(),
-                            explosion: None,
+                            outcome: ShotOutcome::Forfeit,
                             winner_team: Some(winner_team),
                             game: game_snapshot,
                         },
@@ -470,48 +529,49 @@ impl Registry {
                 });
             }
             if phase == Phase::Planning && current {
-                let game = room.game.as_mut().expect("active game exists");
+                let game = candidate.game.as_mut().expect("active game exists");
                 advance_turn(&mut game.state);
                 game.turn_deadline_at = turn_deadline();
-                let game_snapshot = snapshot_for_game(room);
+                let game_snapshot = snapshot_for_game(&candidate);
+                let snapshot = candidate.snapshot.clone();
+                *room = candidate;
                 Ok(LeaveOutcome {
                     room_id: id,
                     broadcast: Some(LeaveBroadcast::TurnStarted {
-                        snapshot: room.snapshot.clone(),
+                        snapshot,
                         game: game_snapshot,
                     }),
                 })
             } else {
-                let game_snapshot = snapshot_for_game(room);
+                let game_snapshot = snapshot_for_game(&candidate);
+                let snapshot = candidate.snapshot.clone();
+                let chat_history = candidate.chat_history.clone();
+                *room = candidate;
                 Ok(LeaveOutcome {
                     room_id: id,
                     broadcast: Some(LeaveBroadcast::StateSync {
-                        snapshot: room.snapshot.clone(),
+                        snapshot,
                         game: game_snapshot,
-                        chat_history: room.chat_history.clone(),
+                        chat_history,
                     }),
                 })
             }
         }
     }
 
-    pub fn disconnect(&mut self, player: Uuid) -> Result<Option<RoomSnapshot>, RoomError> {
-        let id = self.room_id_for(player).ok_or(RoomError::NotMember)?;
-        let room = self.rooms.get_mut(&id).expect("room ID came from registry");
-        if !matches!(room.snapshot.phase, Phase::Lobby | Phase::Finished) {
+    pub fn return_to_lobby(&mut self, player: Uuid) -> Result<RoomSnapshot, RoomError> {
+        let room = self.member_room_mut(player)?;
+        if room.snapshot.phase != Phase::Finished {
             return Err(RoomError::WrongPhase);
         }
-        if room.snapshot.phase == Phase::Finished {
-            room.snapshot.phase = Phase::Lobby;
-            room.game = None;
-            reset_readiness(room);
+        if !is_owner(room, player) {
+            return Err(RoomError::NotOwner);
         }
-        if remove_member(room, player) {
-            Ok(Some(room.snapshot.clone()))
-        } else {
-            self.rooms.remove(&id);
-            Ok(None)
-        }
+        room.snapshot.phase = Phase::Lobby;
+        room.game = None;
+        reset_readiness(room);
+        room.snapshot.revision += 1;
+        Ok(room.snapshot.clone())
     }
 
     pub fn set_ready(&mut self, player: Uuid, ready: bool) -> Result<RoomSnapshot, RoomError> {
@@ -519,14 +579,16 @@ impl Registry {
         if room.snapshot.phase != Phase::Lobby {
             return Err(RoomError::WrongPhase);
         }
-        *room.members.get_mut(&player).expect("member room") = ready;
-        room.snapshot
-            .players
-            .iter_mut()
-            .find(|member| member.id == player)
-            .expect("member room")
-            .ready = ready;
-        room.snapshot.revision += 1;
+        if room.members[&player] != ready {
+            *room.members.get_mut(&player).expect("member room") = ready;
+            room.snapshot
+                .players
+                .iter_mut()
+                .find(|member| member.id == player)
+                .expect("member room")
+                .ready = ready;
+            room.snapshot.revision += 1;
+        }
         Ok(room.snapshot.clone())
     }
 
@@ -562,16 +624,26 @@ impl Registry {
         if !(1..=2).contains(&team) {
             return Err(RoomError::Invalid("team must be 1 or 2"));
         }
-        let member = room
+        let current_team = room
             .snapshot
             .players
-            .iter_mut()
+            .iter()
             .find(|member| member.id == player_id)
-            .ok_or(RoomError::NotMember)?;
-        if member.team != team {
-            member.team = team;
-            reset_readiness(room);
-            room.snapshot.revision += 1;
+            .ok_or(RoomError::NotMember)?
+            .team;
+        if current_team != team {
+            let mut candidate = room.clone();
+            candidate
+                .snapshot
+                .players
+                .iter_mut()
+                .find(|member| member.id == player_id)
+                .expect("validated member")
+                .team = team;
+            reconcile_room_practice_setup(&mut candidate)?;
+            reset_readiness(&mut candidate);
+            candidate.snapshot.revision += 1;
+            *room = candidate;
         }
         Ok(room.snapshot.clone())
     }
@@ -592,17 +664,53 @@ impl Registry {
         if soldiers == 0 || usize::from(soldiers) > MAX_SOLDIERS_PER_PLAYER {
             return Err(RoomError::Invalid("soldiers must be 1-4"));
         }
-        let member = room
+        let current = room
             .snapshot
             .players
-            .iter_mut()
+            .iter()
             .find(|member| member.id == player_id)
-            .ok_or(RoomError::NotMember)?;
-        if member.soldiers != soldiers {
-            member.soldiers = soldiers;
-            reset_readiness(room);
-            room.snapshot.revision += 1;
+            .ok_or(RoomError::NotMember)?
+            .soldiers;
+        if current != soldiers {
+            let mut candidate = room.clone();
+            candidate
+                .snapshot
+                .players
+                .iter_mut()
+                .find(|member| member.id == player_id)
+                .expect("validated member")
+                .soldiers = soldiers;
+            reconcile_room_practice_setup(&mut candidate)?;
+            reset_readiness(&mut candidate);
+            candidate.snapshot.revision += 1;
+            *room = candidate;
         }
+        Ok(room.snapshot.clone())
+    }
+
+    pub fn set_practice_setup(
+        &mut self,
+        player: Uuid,
+        base_revision: u64,
+        setup: PracticeSetup,
+    ) -> Result<RoomSnapshot, RoomError> {
+        let room = self.member_room_mut(player)?;
+        if room.snapshot.phase != Phase::Lobby {
+            return Err(RoomError::WrongPhase);
+        }
+        if !is_owner(room, player) {
+            return Err(RoomError::NotOwner);
+        }
+        if room.snapshot.kind != RoomKind::Practice {
+            return Err(RoomError::Invalid("room is not a practice room"));
+        }
+        if room.snapshot.revision != base_revision {
+            return Err(RoomError::Invalid("room setup is stale"));
+        }
+        validate_practice_setup(&setup, &room.snapshot.players)?;
+        room.practice_setup = Some(setup);
+        reset_readiness(room);
+        room.snapshot.revision += 1;
         Ok(room.snapshot.clone())
     }
 
@@ -638,8 +746,9 @@ impl Registry {
         } else {
             2
         };
-        room.members.insert(id, true);
-        room.bots.insert(
+        let mut candidate = room.clone();
+        candidate.members.insert(id, true);
+        candidate.bots.insert(
             id,
             BotSpec {
                 level,
@@ -647,17 +756,19 @@ impl Registry {
                 memory: crate::bot::SearchMemory::default(),
             },
         );
-        room.snapshot.players.push(PlayerSnapshot {
+        candidate.snapshot.players.push(PlayerSnapshot {
             id,
-            display_name: format!("Bot {}", room.bots.len()),
+            display_name: format!("Bot {}", candidate.bots.len()),
             owner: false,
             ready: true,
             team,
             soldiers: 2,
             is_bot: true,
         });
-        reset_readiness(room);
-        room.snapshot.revision += 1;
+        reconcile_room_practice_setup(&mut candidate)?;
+        reset_readiness(&mut candidate);
+        candidate.snapshot.revision += 1;
+        *room = candidate;
         Ok(room.snapshot.clone())
     }
 
@@ -669,13 +780,20 @@ impl Registry {
         if !is_owner(room, player) {
             return Err(RoomError::NotOwner);
         }
-        if room.bots.remove(&player_id).is_none() {
+        if !room.bots.contains_key(&player_id) {
             return Err(RoomError::Invalid("player is not a bot"));
         }
-        room.members.remove(&player_id);
-        room.snapshot.players.retain(|slot| slot.id != player_id);
-        reset_readiness(room);
-        room.snapshot.revision += 1;
+        let mut candidate = room.clone();
+        candidate.bots.remove(&player_id);
+        candidate.members.remove(&player_id);
+        candidate
+            .snapshot
+            .players
+            .retain(|slot| slot.id != player_id);
+        reconcile_room_practice_setup(&mut candidate)?;
+        reset_readiness(&mut candidate);
+        candidate.snapshot.revision += 1;
+        *room = candidate;
         Ok(room.snapshot.clone())
     }
 
@@ -697,7 +815,11 @@ impl Registry {
         if !room.members.contains_key(&player_id) {
             return Err(RoomError::NotMember);
         }
-        remove_member(room, player_id);
+        let mut candidate = room.clone();
+        remove_member(&mut candidate, player_id);
+        reconcile_room_practice_setup(&mut candidate)?;
+        reset_readiness(&mut candidate);
+        *room = candidate;
         Ok(room.snapshot.clone())
     }
 
@@ -714,11 +836,20 @@ impl Registry {
         {
             return Err(RoomError::WrongPhase);
         }
-        let game_state = new_match(
-            match_seed(room.snapshot.id),
-            &room.snapshot.players,
-            room.snapshot.mode,
-        )?;
+        let game_state = match room.snapshot.kind {
+            RoomKind::Standard => new_match(
+                match_seed(room.snapshot.id),
+                &room.snapshot.players,
+                room.snapshot.mode,
+            )?,
+            RoomKind::Practice => new_practice_match(
+                room.practice_setup
+                    .as_ref()
+                    .ok_or(RoomError::Invalid("practice setup is missing"))?,
+                &room.snapshot.players,
+                room.snapshot.mode,
+            )?,
+        };
         room.snapshot.phase = Phase::Planning;
         room.snapshot.revision += 1;
         room.game = Some(game_state);
@@ -785,6 +916,14 @@ impl Registry {
             trace(&expr, mode, &game.terrain, &game.state, inverted)
                 .map_err(|_| RoomError::Invalid("function produced no finite trajectory"))?
         };
+        if matches!(trajectory.end, TrajectoryEnd::TerrainImpact { .. })
+            && room
+                .game
+                .as_ref()
+                .is_some_and(|game| game.terrain.explosions.len() >= MAX_TERRAIN_CUTS)
+        {
+            return Err(RoomError::Invalid("terrain cut limit reached"));
+        }
         let sequence = next_event_sequence(room)?;
         let history_entry = ShotHistoryEntry {
             sequence,
@@ -796,17 +935,28 @@ impl Registry {
         };
         let game = room.game.as_mut().expect("checked above");
         append_shot_history(game, history_entry);
-        let explosion = trajectory.points.last().copied().map(|(x, y)| Circle {
-            x,
-            y,
-            radius: graphwar_game_core::constants::EXPLOSION_RADIUS,
-        });
-        apply_hits(game, &trajectory.hits);
-        if let Some(explosion) = explosion {
-            apply_explosion(game, explosion);
-            game.terrain
-                .explode(explosion.x, explosion.y, explosion.radius);
-        }
+        let outcome = match trajectory.end {
+            TrajectoryEnd::TerrainImpact { point: (x, y) } => {
+                let explosion = Circle {
+                    x,
+                    y,
+                    radius: graphwar_game_core::constants::EXPLOSION_RADIUS,
+                };
+                let casualties = apply_explosion(game, explosion)
+                    .into_iter()
+                    .filter_map(|(player, soldier)| soldier_snapshot(game, player, soldier))
+                    .collect();
+                game.terrain
+                    .explode(explosion.x, explosion.y, explosion.radius);
+                ShotOutcome::TerrainImpact {
+                    explosion: circle_snapshot(explosion),
+                    hits: casualties,
+                }
+            }
+            TrajectoryEnd::Miss(reason) => ShotOutcome::Miss {
+                reason: shot_miss_reason(reason),
+            },
+        };
         let winner_team = winner(&game.state);
         if winner_team.is_some() {
             room.snapshot.phase = Phase::Finished;
@@ -816,13 +966,8 @@ impl Registry {
         }
         room.snapshot.revision += 1;
         let shot = ShotResolved {
-            path: trajectory.points,
-            hits: trajectory
-                .hits
-                .into_iter()
-                .filter_map(|hit| soldier_snapshot(game, hit.player, hit.soldier))
-                .collect(),
-            explosion: explosion.map(circle_snapshot),
+            path: downsample_path(trajectory.points, MAX_TRAJECTORY_POINTS),
+            outcome,
             winner_team,
             game: snapshot_for_game(room),
         };
@@ -981,6 +1126,17 @@ impl Registry {
         Ok(self.rooms[&id].snapshot.clone())
     }
 
+    pub fn practice_setup(&self, room_id: Uuid) -> Option<PracticeSetup> {
+        self.rooms
+            .get(&room_id)
+            .and_then(|room| room.practice_setup.clone())
+    }
+
+    pub fn member_practice_setup(&self, player: Uuid) -> Result<Option<PracticeSetup>, RoomError> {
+        let id = self.room_id_for(player).ok_or(RoomError::NotMember)?;
+        Ok(self.rooms[&id].practice_setup.clone())
+    }
+
     pub fn member_state(
         &self,
         player: Uuid,
@@ -1098,7 +1254,11 @@ fn valid_persisted_room_secret(secret: &str) -> bool {
 
 fn validate_persisted_room(room: &PersistedRoom) -> Result<(), String> {
     let snapshot = &room.snapshot;
-    if snapshot.name.is_empty() || snapshot.name.len() > 64 || snapshot.players.is_empty() {
+    if snapshot.name.trim().is_empty()
+        || snapshot.name.len() > 64
+        || snapshot.players.is_empty()
+        || snapshot.revision == u64::MAX
+    {
         return Err("invalid room snapshot".into());
     }
     if snapshot.players.len() > MAX_PLAYERS
@@ -1109,8 +1269,7 @@ fn validate_persisted_room(room: &PersistedRoom) -> Result<(), String> {
             .count()
             != 1
         || snapshot.players.iter().any(|player| {
-            player.display_name.is_empty()
-                || player.display_name.len() > 32
+            !(2..=32).contains(&player.display_name.chars().count())
                 || !(1..=2).contains(&player.team)
                 || player.soldiers == 0
                 || usize::from(player.soldiers) > MAX_SOLDIERS_PER_PLAYER
@@ -1141,13 +1300,19 @@ fn validate_persisted_room(room: &PersistedRoom) -> Result<(), String> {
         (RoomVisibility::Public, None) => {}
         (RoomVisibility::Public, Some(_)) => return Err("public room has password data".into()),
     }
+    match (snapshot.kind, room.practice_setup.as_ref()) {
+        (RoomKind::Standard, None) => {}
+        (RoomKind::Practice, Some(setup)) => {
+            validate_practice_setup(setup, &snapshot.players).map_err(|error| error.to_string())?
+        }
+        _ => return Err("inconsistent practice setup".into()),
+    }
     if room.chat_history.len() > MAX_CHAT_HISTORY
         || room.chat_history.iter().any(|entry| {
             entry.room_id != snapshot.id
                 || entry.sequence == 0
                 || entry.sequence > room.event_sequence
-                || entry.display_name.is_empty()
-                || entry.display_name.len() > 32
+                || !(2..=32).contains(&entry.display_name.chars().count())
                 || entry.text.trim().is_empty()
                 || entry.text.len() > 500
         })
@@ -1155,24 +1320,44 @@ fn validate_persisted_room(room: &PersistedRoom) -> Result<(), String> {
         return Err("invalid chat history".into());
     }
     match (&snapshot.phase, &room.game) {
-        (Phase::Lobby, None) | (Phase::Finished, None) => return Ok(()),
+        (Phase::Lobby, None) => return Ok(()),
         (Phase::Planning | Phase::Resolving | Phase::Finished, Some(game)) => {
+            let slots = game
+                .player_ids
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, id)| (id, index))
+                .collect::<HashMap<_, _>>();
+            let finished = snapshot.phase == Phase::Finished;
             if game.mode != snapshot.mode
                 || game.state.players.len() != game.player_ids.len()
                 || game.state.turn >= game.state.players.len()
-                || game
-                    .player_ids
-                    .iter()
-                    .collect::<std::collections::HashSet<_>>()
-                    .len()
-                    != game.player_ids.len()
+                || slots.len() != game.player_ids.len()
+                || (winner(&game.state).is_some() != finished)
+                || snapshot.players.iter().any(|player| {
+                    slots.get(&player.id).is_none_or(|index| {
+                        let slot = &game.state.players[*index];
+                        slot.team != team(player.team)
+                            || slot.soldiers.len() != usize::from(player.soldiers)
+                    })
+                })
+                || (!finished
+                    && game.player_ids.iter().enumerate().any(|(index, id)| {
+                        !player_ids.contains(id)
+                            && game.state.players[index]
+                                .soldiers
+                                .iter()
+                                .any(|soldier| soldier.alive)
+                    }))
+                || game.terrain.circles.len() > MAX_GAME_TERRAIN_CIRCLES
+                || game.terrain.explosions.len() > MAX_TERRAIN_CUTS
                 || game.shot_history.len() > MAX_SHOT_HISTORY
                 || game.shot_history.iter().any(|shot| {
                     shot.sequence == 0
                         || shot.sequence > room.event_sequence
                         || !(1..=2).contains(&shot.team)
-                        || shot.display_name.is_empty()
-                        || shot.display_name.len() > 32
+                        || !(2..=32).contains(&shot.display_name.chars().count())
                         || shot.function.is_empty()
                         || shot.function.len() > 256
                         || !shot.angle_deg.is_finite()
@@ -1195,10 +1380,14 @@ fn validate_persisted_room(room: &PersistedRoom) -> Result<(), String> {
                     player.current_soldier >= player.soldiers.len()
                         || player.soldiers.is_empty()
                         || player.soldiers.len() > MAX_SOLDIERS_PER_PLAYER
-                        || player
-                            .soldiers
-                            .iter()
-                            .any(|soldier| !soldier.x.is_finite() || !soldier.y.is_finite())
+                        || player.soldiers.iter().any(|soldier| {
+                            !soldier.x.is_finite()
+                                || !soldier.y.is_finite()
+                                || soldier.x - SOLDIER_RADIUS < 0.0
+                                || soldier.x + SOLDIER_RADIUS >= f64::from(PLANE_LENGTH)
+                                || soldier.y - SOLDIER_RADIUS < 0.0
+                                || soldier.y + SOLDIER_RADIUS >= f64::from(PLANE_HEIGHT)
+                        })
                 })
             {
                 return Err("invalid terrain or soldiers".into());
@@ -1232,6 +1421,229 @@ fn new_match(seed: u64, players: &[PlayerSnapshot], mode: GameMode) -> Result<Ma
     })
 }
 
+fn new_practice_match(
+    setup: &PracticeSetup,
+    players: &[PlayerSnapshot],
+    mode: GameMode,
+) -> Result<Match, RoomError> {
+    validate_practice_setup(setup, players)?;
+    let terrain = Terrain::new(
+        setup
+            .terrain
+            .iter()
+            .map(|circle| Circle {
+                x: circle.x,
+                y: circle.y,
+                radius: circle.radius,
+            })
+            .collect(),
+    );
+    let placements = setup
+        .players
+        .iter()
+        .map(|placement| (placement.player_id, &placement.soldiers))
+        .collect::<HashMap<_, _>>();
+    let slots = alternating_players(players);
+    let player_ids = slots.iter().map(|player| player.id).collect();
+    let game_players = slots
+        .into_iter()
+        .enumerate()
+        .map(|(index, player)| {
+            let soldiers = placements[&player.id]
+                .iter()
+                .map(|point| Soldier::new(point.x, point.y))
+                .collect();
+            Player::new(index as u32, team(player.team), soldiers)
+        })
+        .collect();
+    Ok(Match {
+        mode,
+        terrain,
+        state: GameState::new(game_players),
+        player_ids,
+        turn_deadline_at: turn_deadline(),
+        shot_history: Vec::new(),
+    })
+}
+
+fn validate_practice_setup(
+    setup: &PracticeSetup,
+    players: &[PlayerSnapshot],
+) -> Result<(), RoomError> {
+    if setup.terrain.len() > MAX_PRACTICE_TERRAIN_CIRCLES {
+        return Err(RoomError::Invalid("practice terrain has too many circles"));
+    }
+    if setup.terrain.iter().any(|circle| {
+        !circle.x.is_finite()
+            || !circle.y.is_finite()
+            || !PRACTICE_TERRAIN_RADII.contains(&circle.radius)
+            || circle.x - circle.radius < 0.0
+            || circle.x + circle.radius > f64::from(PLANE_LENGTH)
+            || circle.y - circle.radius < 0.0
+            || circle.y + circle.radius > f64::from(PLANE_HEIGHT)
+    }) {
+        return Err(RoomError::Invalid("practice terrain circle is invalid"));
+    }
+    if setup.players.len() != players.len() {
+        return Err(RoomError::Invalid(
+            "practice placements do not match roster",
+        ));
+    }
+    let terrain = Terrain::new(
+        setup
+            .terrain
+            .iter()
+            .map(|circle| Circle {
+                x: circle.x,
+                y: circle.y,
+                radius: circle.radius,
+            })
+            .collect(),
+    );
+    let roster = players
+        .iter()
+        .map(|player| (player.id, usize::from(player.soldiers)))
+        .collect::<HashMap<_, _>>();
+    let mut seen = std::collections::HashSet::with_capacity(players.len());
+    let mut placed = Vec::new();
+    for placement in &setup.players {
+        let Some(expected) = roster.get(&placement.player_id) else {
+            return Err(RoomError::Invalid("practice placement has unknown player"));
+        };
+        if !seen.insert(placement.player_id) || placement.soldiers.len() != *expected {
+            return Err(RoomError::Invalid(
+                "practice placements do not match roster",
+            ));
+        }
+        for point in &placement.soldiers {
+            if !point.x.is_finite()
+                || !point.y.is_finite()
+                || point.x - SOLDIER_RADIUS < 0.0
+                || point.x + SOLDIER_RADIUS >= f64::from(PLANE_LENGTH)
+                || point.y - SOLDIER_RADIUS < 0.0
+                || point.y + SOLDIER_RADIUS >= f64::from(PLANE_HEIGHT)
+                || terrain.collides_circle(point.x, point.y, SOLDIER_RADIUS)
+                || placed.iter().any(|other: &SetupPoint| {
+                    (other.x - point.x).abs() < 20.0 && (other.y - point.y).abs() < 20.0
+                })
+            {
+                return Err(RoomError::Invalid("practice soldier position is invalid"));
+            }
+            placed.push(point.clone());
+        }
+    }
+    if seen.len() != players.len() {
+        return Err(RoomError::Invalid(
+            "practice placements do not match roster",
+        ));
+    }
+    Ok(())
+}
+
+fn reconcile_practice_setup(
+    setup: Option<&PracticeSetup>,
+    players: &[PlayerSnapshot],
+    seed: Uuid,
+) -> Result<PracticeSetup, RoomError> {
+    let terrain = setup.map_or_else(Vec::new, |setup| setup.terrain.clone());
+    let old = setup
+        .into_iter()
+        .flat_map(|setup| &setup.players)
+        .map(|placement| (placement.player_id, &placement.soldiers))
+        .collect::<HashMap<_, _>>();
+    let terrain_model = Terrain::new(
+        terrain
+            .iter()
+            .map(|circle| Circle {
+                x: circle.x,
+                y: circle.y,
+                radius: circle.radius,
+            })
+            .collect(),
+    );
+    let mut placed = Vec::<SetupPoint>::new();
+    let mut reconciled = Vec::with_capacity(players.len());
+    for (player_index, player) in players.iter().enumerate() {
+        let mut soldiers = Vec::with_capacity(usize::from(player.soldiers));
+        if let Some(existing) = old.get(&player.id) {
+            for point in existing.iter().take(usize::from(player.soldiers)) {
+                if !terrain_model.collides_circle(point.x, point.y, SOLDIER_RADIUS)
+                    && placed.iter().all(|other| {
+                        (other.x - point.x).abs() >= 20.0 || (other.y - point.y).abs() >= 20.0
+                    })
+                {
+                    soldiers.push((*point).clone());
+                    placed.push((*point).clone());
+                }
+            }
+        }
+        while soldiers.len() < usize::from(player.soldiers) {
+            let point = default_practice_point(
+                &terrain_model,
+                player.team,
+                player_index,
+                soldiers.len(),
+                seed,
+                &placed,
+            )?;
+            placed.push(point.clone());
+            soldiers.push(point);
+        }
+        reconciled.push(PracticePlayerPlacement {
+            player_id: player.id,
+            soldiers,
+        });
+    }
+    let setup = PracticeSetup {
+        terrain,
+        players: reconciled,
+    };
+    validate_practice_setup(&setup, players)?;
+    Ok(setup)
+}
+
+fn default_practice_point(
+    terrain: &Terrain,
+    team: u8,
+    player_index: usize,
+    soldier_index: usize,
+    seed: Uuid,
+    placed: &[SetupPoint],
+) -> Result<SetupPoint, RoomError> {
+    let x_start = SOLDIER_RADIUS as i32;
+    let x_end = PLANE_LENGTH / 2 - SOLDIER_RADIUS as i32;
+    let y_start = SOLDIER_RADIUS as i32;
+    let y_end = PLANE_HEIGHT - SOLDIER_RADIUS as i32;
+    let x_span = (x_end - x_start) as u64;
+    let y_span = (y_end - y_start) as u64;
+    let seed = seed.as_u128() as u64
+        ^ (player_index as u64).wrapping_mul(MAX_SOLDIERS_PER_PLAYER as u64)
+        ^ soldier_index as u64;
+    for attempt in 0..10_000_u64 {
+        let x = x_start
+            + (seed.wrapping_mul(97).wrapping_add(attempt.wrapping_mul(52)) % x_span) as i32;
+        let y = y_start
+            + (seed
+                .wrapping_mul(193)
+                .wrapping_add(attempt.wrapping_mul(89))
+                % y_span) as i32;
+        let x = if team == 1 {
+            f64::from(x)
+        } else {
+            f64::from(PLANE_LENGTH - 1 - x)
+        };
+        let y = f64::from(y);
+        if !terrain.collides_circle(x, y, SOLDIER_RADIUS)
+            && placed
+                .iter()
+                .all(|point| (point.x - x).abs() >= 20.0 || (point.y - y).abs() >= 20.0)
+        {
+            return Ok(SetupPoint { x, y });
+        }
+    }
+    Err(RoomError::Invalid("could not place practice soldiers"))
+}
+
 fn alternating_players(players: &[PlayerSnapshot]) -> Vec<&PlayerSnapshot> {
     // Interleave the two teams evenly, spread from the front. advance_turn
     // enforces strict team alternation, so the initial roster order only
@@ -1247,9 +1659,7 @@ fn alternating_players(players: &[PlayerSnapshot]) -> Vec<&PlayerSnapshot> {
     while !team_one.is_empty() || !team_two.is_empty() {
         let take_one = if team_one.is_empty() {
             false
-        } else if team_two.is_empty() {
-            true
-        } else if team_one.len() > team_two.len() {
+        } else if team_two.is_empty() || team_one.len() > team_two.len() {
             true
         } else if team_two.len() > team_one.len() {
             false
@@ -1348,6 +1758,17 @@ fn remove_member(room: &mut Room, player: Uuid) -> bool {
     true
 }
 
+fn reconcile_room_practice_setup(room: &mut Room) -> Result<(), RoomError> {
+    if room.snapshot.kind == RoomKind::Practice {
+        room.practice_setup = Some(reconcile_practice_setup(
+            room.practice_setup.as_ref(),
+            &room.snapshot.players,
+            room.snapshot.id,
+        )?);
+    }
+    Ok(())
+}
+
 fn is_owner(room: &Room, player: Uuid) -> bool {
     room.snapshot
         .players
@@ -1413,31 +1834,39 @@ fn append_shot_history(game: &mut Match, entry: ShotHistoryEntry) {
     game.shot_history.drain(..excess);
 }
 
-fn apply_hits(game: &mut Match, hits: &[graphwar_game_core::Hit]) {
-    for hit in hits {
-        if let Some(soldier) = game
-            .state
-            .players
-            .get_mut(hit.player)
-            .and_then(|player| player.soldiers.get_mut(hit.soldier))
-        {
-            soldier.alive = false;
-        }
+fn downsample_path(points: Vec<(f64, f64)>, limit: usize) -> Vec<(f64, f64)> {
+    if points.len() <= limit {
+        return points;
     }
+    let last = points.len() - 1;
+    (0..limit)
+        .map(|index| points[index * last / (limit - 1)])
+        .collect()
 }
 
-fn apply_explosion(game: &mut Match, explosion: Circle) {
+fn apply_explosion(game: &mut Match, explosion: Circle) -> Vec<(usize, usize)> {
     let radius_squared = explosion.radius * explosion.radius;
-    for player in &mut game.state.players {
-        for soldier in &mut player.soldiers {
+    let mut casualties = Vec::new();
+    for (player_index, player) in game.state.players.iter_mut().enumerate() {
+        for (soldier_index, soldier) in player.soldiers.iter_mut().enumerate() {
             let distance_squared = (soldier.x - explosion.x).mul_add(
                 soldier.x - explosion.x,
                 (soldier.y - explosion.y) * (soldier.y - explosion.y),
             );
-            if distance_squared <= radius_squared {
+            if soldier.alive && distance_squared <= radius_squared {
                 soldier.alive = false;
+                casualties.push((player_index, soldier_index));
             }
         }
+    }
+    casualties
+}
+
+fn shot_miss_reason(reason: TrajectoryMissReason) -> ShotMissReason {
+    match reason {
+        TrajectoryMissReason::WorldExit => ShotMissReason::WorldExit,
+        TrajectoryMissReason::Numerical => ShotMissReason::Numerical,
+        TrajectoryMissReason::StepLimit => ShotMissReason::StepLimit,
     }
 }
 
@@ -1495,7 +1924,7 @@ fn advance_turn(game: &mut GameState) {
     for _ in 0..roster_len {
         let candidate = cursor % roster_len;
         let candidate_team = game.players[candidate].team;
-        let next_cursor = cursor + 1;
+        let next_cursor = cursor.wrapping_add(1);
         if candidate_team == target_team && game.players[candidate].living().next().is_some() {
             game.team_turn[target_team_idx] = next_cursor;
             let player = &mut game.players[candidate];
@@ -1522,6 +1951,9 @@ fn snapshot_for_game(room: &Room) -> GameSnapshot {
         room_id: room.snapshot.id,
         revision: room.snapshot.revision,
         mode: game.mode,
+        winner_team: (room.snapshot.phase == Phase::Finished)
+            .then(|| winner(&game.state))
+            .flatten(),
         turn_player_id,
         turn_deadline_at: (room.snapshot.phase == Phase::Planning).then_some(game.turn_deadline_at),
         soldiers: game
@@ -1694,6 +2126,37 @@ mod tests {
                 Team::Two
             ]
         );
+    }
+
+    #[test]
+    fn room_limit_rejects_creation_and_corrupt_persistence() {
+        let mut registry = Registry::default();
+        for index in 0..MAX_ROOMS {
+            registry
+                .create(
+                    Uuid::new_v4(),
+                    "Owner".into(),
+                    format!("room-{index}"),
+                    RoomVisibility::Public,
+                    None,
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            registry.create(
+                Uuid::new_v4(),
+                "Owner".into(),
+                "overflow".into(),
+                RoomVisibility::Public,
+                None,
+            ),
+            Err(RoomError::Invalid("room limit reached"))
+        ));
+        let mut json: serde_json::Value =
+            serde_json::from_str(&registry.persisted_json().unwrap()).unwrap();
+        let extra = json["rooms"][0].clone();
+        json["rooms"].as_array_mut().unwrap().push(extra);
+        assert!(Registry::from_persisted_json(&json.to_string()).is_err());
     }
 
     #[test]
@@ -1998,6 +2461,199 @@ mod tests {
         let mut json: serde_json::Value =
             serde_json::from_str(&registry.persisted_json().unwrap()).unwrap();
         json["rooms"][0]["invite"] = serde_json::Value::String("malformed".into());
+        assert!(Registry::from_persisted_json(&json.to_string()).is_err());
+    }
+
+    #[test]
+    fn practice_setup_is_authoritative_and_persists() {
+        let owner = Uuid::new_v4();
+        let guest = Uuid::new_v4();
+        let mut registry = Registry::default();
+        let room = registry
+            .create_with_kind(
+                owner,
+                "Owner".into(),
+                "practice".into(),
+                RoomVisibility::Public,
+                RoomKind::Practice,
+                None,
+            )
+            .unwrap()
+            .0;
+        assert!(registry.practice_setup(room.id).unwrap().terrain.is_empty());
+        registry.join(guest, "Guest".into(), room.id, None).unwrap();
+        let mut setup = registry.practice_setup(room.id).unwrap();
+        let terrain = (20..=750)
+            .step_by(20)
+            .flat_map(|x| {
+                (20..=430)
+                    .step_by(20)
+                    .map(move |y| (f64::from(x), f64::from(y)))
+            })
+            .find(|(x, y)| {
+                setup.players.iter().all(|placement| {
+                    placement
+                        .soldiers
+                        .iter()
+                        .all(|point| (point.x - x).hypot(point.y - y) > 20.0 + SOLDIER_RADIUS)
+                })
+            })
+            .expect("blank practice map has room for terrain");
+        setup.terrain.push(TerrainCircle {
+            x: terrain.0,
+            y: terrain.1,
+            radius: 20.0,
+        });
+        let revision = registry.member_snapshot(owner).unwrap().revision;
+
+        assert!(matches!(
+            registry.set_practice_setup(guest, revision, setup.clone()),
+            Err(RoomError::NotOwner)
+        ));
+        registry.set_ready(owner, true).unwrap();
+        registry.set_ready(guest, true).unwrap();
+        let snapshot = registry
+            .set_practice_setup(owner, revision + 2, setup.clone())
+            .unwrap();
+        assert!(snapshot.players.iter().all(|player| !player.ready));
+        assert!(matches!(
+            registry.set_practice_setup(owner, revision, setup.clone()),
+            Err(RoomError::Invalid("room setup is stale"))
+        ));
+
+        registry.set_ready(owner, true).unwrap();
+        registry.set_ready(guest, true).unwrap();
+        let started = registry.start_game(owner).unwrap();
+        assert_eq!(started.game.terrain, setup.terrain);
+        for placement in &setup.players {
+            for (index, point) in placement.soldiers.iter().enumerate() {
+                let soldier = started
+                    .game
+                    .soldiers
+                    .iter()
+                    .find(|soldier| {
+                        soldier.player_id == placement.player_id && soldier.index == index
+                    })
+                    .unwrap();
+                assert_eq!((soldier.x, soldier.y), (point.x, point.y));
+            }
+        }
+
+        let restored = Registry::from_persisted_json(&registry.persisted_json().unwrap()).unwrap();
+        assert_eq!(restored.practice_setup(room.id), Some(setup));
+    }
+
+    #[test]
+    fn practice_setup_validation_rejects_invalid_geometry() {
+        let owner = Uuid::new_v4();
+        let mut registry = Registry::default();
+        let room = registry
+            .create_with_kind(
+                owner,
+                "Owner".into(),
+                "practice".into(),
+                RoomVisibility::Public,
+                RoomKind::Practice,
+                None,
+            )
+            .unwrap()
+            .0;
+        let original = registry.practice_setup(room.id).unwrap();
+        let revision = room.revision;
+
+        for mutation in [
+            |setup: &mut PracticeSetup| {
+                setup.terrain.push(TerrainCircle {
+                    x: 10.0,
+                    y: 10.0,
+                    radius: 20.0,
+                })
+            },
+            |setup: &mut PracticeSetup| {
+                setup.terrain.push(TerrainCircle {
+                    x: 100.0,
+                    y: 100.0,
+                    radius: 21.0,
+                })
+            },
+            |setup: &mut PracticeSetup| setup.players[0].soldiers[0].x = f64::NAN,
+            |setup: &mut PracticeSetup| setup.players[0].soldiers[0].x = SOLDIER_RADIUS - 0.1,
+            |setup: &mut PracticeSetup| {
+                setup.players[0].soldiers[0].x = f64::from(PLANE_LENGTH) - SOLDIER_RADIUS
+            },
+            |setup: &mut PracticeSetup| setup.players[0].soldiers[0].y = SOLDIER_RADIUS - 0.1,
+            |setup: &mut PracticeSetup| {
+                setup.players[0].soldiers[0].y = f64::from(PLANE_HEIGHT) - SOLDIER_RADIUS
+            },
+            |setup: &mut PracticeSetup| {
+                setup.players[0].soldiers[1] = setup.players[0].soldiers[0].clone()
+            },
+        ] {
+            let mut invalid = original.clone();
+            mutation(&mut invalid);
+            assert!(matches!(
+                registry.set_practice_setup(owner, revision, invalid),
+                Err(RoomError::Invalid(_))
+            ));
+            assert_eq!(registry.practice_setup(room.id), Some(original.clone()));
+        }
+    }
+
+    #[test]
+    fn version_one_registry_defaults_to_standard_rooms() {
+        let owner = Uuid::new_v4();
+        let mut registry = Registry::default();
+        let room = registry
+            .create(
+                owner,
+                "Owner".into(),
+                "standard".into(),
+                RoomVisibility::Public,
+                None,
+            )
+            .unwrap()
+            .0;
+        let mut json: serde_json::Value =
+            serde_json::from_str(&registry.persisted_json().unwrap()).unwrap();
+        json["version"] = 1.into();
+        json["rooms"][0]["snapshot"]
+            .as_object_mut()
+            .unwrap()
+            .remove("kind");
+        json["rooms"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("practice_setup");
+
+        let restored = Registry::from_persisted_json(&json.to_string()).unwrap();
+        assert_eq!(
+            restored.member_snapshot(owner).unwrap().kind,
+            RoomKind::Standard
+        );
+        assert_eq!(restored.practice_setup(room.id), None);
+    }
+
+    #[test]
+    fn corrupt_persisted_practice_setup_is_rejected() {
+        let owner = Uuid::new_v4();
+        let mut registry = Registry::default();
+        registry
+            .create_with_kind(
+                owner,
+                "Owner".into(),
+                "practice".into(),
+                RoomVisibility::Public,
+                RoomKind::Practice,
+                None,
+            )
+            .unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&registry.persisted_json().unwrap()).unwrap();
+        json["rooms"][0]["practice_setup"]["terrain"] = serde_json::json!([{
+            "x": 10.0,
+            "y": 10.0,
+            "radius": 20.0
+        }]);
         assert!(Registry::from_persisted_json(&json.to_string()).is_err());
     }
 
@@ -2507,18 +3163,90 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_during_active_match_preserves_membership_and_soldiers() {
-        let (mut registry, room_id, _owner, guest) = started_registry();
-        let before = registry.member_state(guest).unwrap().1.unwrap();
+    fn finished_room_returns_to_lobby_only_by_owner() {
+        let (mut registry, room_id, owner, guest) = started_registry();
+        registry.leave(guest).unwrap();
+        let setup_before = registry.practice_setup(room_id);
 
         assert!(matches!(
-            registry.disconnect(guest),
-            Err(RoomError::WrongPhase)
+            registry.return_to_lobby(guest),
+            Err(RoomError::NotMember)
         ));
+        let snapshot = registry.return_to_lobby(owner).unwrap();
 
-        let after = registry.member_state(guest).unwrap().1.unwrap();
-        assert_eq!(after.soldiers, before.soldiers);
-        assert!(registry.is_member_of(guest, room_id));
+        assert_eq!(snapshot.phase, Phase::Lobby);
+        assert!(registry.rooms[&room_id].game.is_none());
+        assert_eq!(registry.practice_setup(room_id), setup_before);
+        assert!(snapshot.players.iter().all(|player| !player.ready));
+    }
+
+    #[test]
+    fn finished_member_leave_round_trips_final_result() {
+        for leaver_team in [1, 2] {
+            let (mut registry, room_id, owner, guest) = started_registry();
+            {
+                let room = registry.rooms.get_mut(&room_id).unwrap();
+                let game = room.game.as_mut().unwrap();
+                for player in &mut game.state.players {
+                    if player.team == Team::Two {
+                        for soldier in &mut player.soldiers {
+                            soldier.alive = false;
+                        }
+                    }
+                }
+                room.snapshot.phase = Phase::Finished;
+                room.snapshot.revision += 1;
+            }
+            let leaver = if leaver_team == 1 { owner } else { guest };
+            let remaining = if leaver == owner { guest } else { owner };
+            registry.leave(leaver).unwrap();
+
+            let mut restored =
+                Registry::from_persisted_json(&registry.persisted_json().unwrap()).unwrap();
+            let (snapshot, game, _) = restored.member_state(remaining).unwrap();
+            let game = game.unwrap();
+            assert_eq!(snapshot.phase, Phase::Finished);
+            assert_eq!(game.winner_team, Some(1));
+            assert!(snapshot.players.iter().all(|player| player.id != leaver));
+            assert!(game.soldiers.iter().any(|soldier| {
+                soldier.player_id == leaver && soldier.alive == (leaver_team == 1)
+            }));
+
+            let lobby = restored.return_to_lobby(remaining).unwrap();
+            assert_eq!(lobby.phase, Phase::Lobby);
+            assert!(restored.rooms[&room_id].game.is_none());
+            assert!(lobby.players.iter().all(|player| !player.ready));
+        }
+    }
+
+    #[test]
+    fn no_op_ready_keeps_revision() {
+        let owner = Uuid::new_v4();
+        let mut registry = Registry::default();
+        let room = registry
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
+            .unwrap()
+            .0;
+
+        let snapshot = registry.set_ready(owner, false).unwrap();
+
+        assert_eq!(snapshot.revision, room.revision);
+    }
+
+    #[test]
+    fn downsample_path_preserves_endpoints_and_bound() {
+        let points = (0..10).map(|index| (index as f64, 0.0)).collect();
+        let sampled = downsample_path(points, 4);
+        assert_eq!(
+            sampled,
+            vec![(0.0, 0.0), (3.0, 0.0), (6.0, 0.0), (9.0, 0.0)]
+        );
     }
 
     #[test]
@@ -2577,6 +3305,111 @@ mod tests {
         }
         assert_eq!(game.shot_history.len(), MAX_SHOT_HISTORY);
         assert_eq!(game.shot_history[0].function, "x+0");
+    }
+
+    #[test]
+    fn terrain_cut_limit_preserves_every_existing_hole() {
+        let (mut registry, room_id, owner, _) = started_registry();
+        {
+            let game = registry
+                .rooms
+                .get_mut(&room_id)
+                .unwrap()
+                .game
+                .as_mut()
+                .unwrap();
+            let turn = game.state.turn;
+            let shooter = game.state.players[turn].current_mut().unwrap();
+            shooter.x = 100.0;
+            shooter.y = 225.0;
+            game.terrain = Terrain::new(vec![
+                Circle {
+                    x: 150.0,
+                    y: 225.0,
+                    radius: 20.0,
+                },
+                Circle {
+                    x: 700.0,
+                    y: 400.0,
+                    radius: 20.0,
+                },
+            ]);
+            game.terrain.explosions = vec![
+                Circle {
+                    x: 700.0,
+                    y: 400.0,
+                    radius: 5.0,
+                };
+                MAX_TERRAIN_CUTS - 1
+            ];
+        }
+
+        let accepted = registry.fire(owner, "0".into(), 0.0).unwrap();
+        assert!(matches!(
+            accepted.shot.outcome,
+            ShotOutcome::TerrainImpact { .. }
+        ));
+        let room = registry.rooms.get_mut(&room_id).unwrap();
+        assert_eq!(
+            room.game.as_ref().unwrap().terrain.explosions.len(),
+            MAX_TERRAIN_CUTS
+        );
+        assert!(
+            !room
+                .game
+                .as_ref()
+                .unwrap()
+                .terrain
+                .collides_point(700.0, 400.0)
+        );
+        room.snapshot.phase = Phase::Planning;
+        room.game.as_mut().unwrap().turn_deadline_at = turn_deadline();
+        let revision = room.snapshot.revision;
+        let event_sequence = room.event_sequence;
+        let game_before = room.game.as_ref().unwrap();
+        let terrain_before = game_before.terrain.clone();
+        let state_before = game_before.state.clone();
+        let history_before = game_before.shot_history.clone();
+
+        assert!(matches!(
+            registry.fire(owner, "0".into(), 0.0),
+            Err(RoomError::Invalid("terrain cut limit reached"))
+        ));
+        let room = &registry.rooms[&room_id];
+        let game = room.game.as_ref().unwrap();
+        assert_eq!(room.snapshot.revision, revision);
+        assert_eq!(room.event_sequence, event_sequence);
+        assert_eq!(game.terrain, terrain_before);
+        assert_eq!(game.state, state_before);
+        assert_eq!(game.shot_history, history_before);
+        assert!(!game.terrain.collides_point(700.0, 400.0));
+
+        let persisted = registry.persisted_json().unwrap();
+        let restored = Registry::from_persisted_json(&persisted).unwrap();
+        assert_eq!(
+            restored.rooms[&room_id]
+                .game
+                .as_ref()
+                .unwrap()
+                .terrain
+                .explosions,
+            game.terrain.explosions
+        );
+        registry
+            .rooms
+            .get_mut(&room_id)
+            .unwrap()
+            .game
+            .as_mut()
+            .unwrap()
+            .terrain
+            .explosions
+            .push(Circle {
+                x: 650.0,
+                y: 400.0,
+                radius: 5.0,
+            });
+        assert!(Registry::from_persisted_json(&registry.persisted_json().unwrap()).is_err());
     }
 
     #[test]
@@ -3085,7 +3918,7 @@ mod tests {
     }
 
     #[test]
-    fn non_finite_shot_does_not_mutate_or_advance_turn() {
+    fn numerical_shot_is_a_miss_without_damage_or_terrain_mutation() {
         let owner = Uuid::new_v4();
         let guest = Uuid::new_v4();
         let mut registry = Registry::default();
@@ -3114,16 +3947,21 @@ mod tests {
             )
         };
 
+        let outcome = registry.fire(owner, "sqrt(-1)".into(), 0.0).unwrap();
         assert!(matches!(
-            registry.fire(owner, "sqrt(-1)".into(), 0.0),
-            Err(RoomError::Invalid("function produced no finite trajectory"))
+            outcome.shot.outcome,
+            ShotOutcome::Miss {
+                reason: ShotMissReason::Numerical
+            }
         ));
+        assert_eq!(outcome.snapshot.phase, Phase::Resolving);
 
         let room = registry.rooms.get(&room.id).unwrap();
         let game = room.game.as_ref().unwrap();
-        assert_eq!(room.snapshot.revision, revision);
+        assert_eq!(room.snapshot.revision, revision + 1);
         assert_eq!(game.state.turn, turn);
         assert_eq!(game.terrain, terrain);
         assert_eq!(game.state, state);
+        assert_eq!(game.shot_history.len(), 1);
     }
 }
