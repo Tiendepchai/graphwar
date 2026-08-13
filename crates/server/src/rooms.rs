@@ -1351,7 +1351,7 @@ fn validate_persisted_room(room: &PersistedRoom) -> Result<(), String> {
                                 .any(|soldier| soldier.alive)
                     }))
                 || game.terrain.circles.len() > MAX_GAME_TERRAIN_CIRCLES
-                || game.terrain.explosions.len() > MAX_TERRAIN_CUTS
+                || (!finished && game.terrain.explosions.len() > MAX_TERRAIN_CUTS)
                 || game.shot_history.len() > MAX_SHOT_HISTORY
                 || game.shot_history.iter().any(|shot| {
                     shot.sequence == 0
@@ -2180,6 +2180,39 @@ mod tests {
         let start = registry.start_game(owner).unwrap();
         assert_eq!(start.snapshot.phase, Phase::Planning);
         assert_eq!(start.game.soldiers.len(), 4);
+    }
+
+    #[test]
+    fn persisted_finished_match_allows_legacy_cut_overflow() {
+        let (mut registry, room_id, _owner, _guest) = started_registry();
+        let room = registry.rooms.get_mut(&room_id).unwrap();
+        room.snapshot.phase = Phase::Finished;
+        let game = room.game.as_mut().unwrap();
+        for soldier in &mut game.state.players[0].soldiers {
+            soldier.alive = false;
+        }
+        game.terrain.explosions = vec![
+            Circle {
+                x: 1.0,
+                y: 1.0,
+                radius: 1.0
+            };
+            MAX_TERRAIN_CUTS + 1
+        ];
+
+        let restored = Registry::from_persisted_json(&registry.persisted_json().unwrap()).unwrap();
+
+        assert_eq!(restored.rooms[&room_id].snapshot.phase, Phase::Finished);
+        assert_eq!(
+            restored.rooms[&room_id]
+                .game
+                .as_ref()
+                .unwrap()
+                .terrain
+                .explosions
+                .len(),
+            MAX_TERRAIN_CUTS + 1
+        );
     }
 
     #[test]
