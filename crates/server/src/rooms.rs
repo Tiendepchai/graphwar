@@ -1845,7 +1845,8 @@ fn downsample_path(points: Vec<(f64, f64)>, limit: usize) -> Vec<(f64, f64)> {
 }
 
 fn apply_explosion(game: &mut Match, explosion: Circle) -> Vec<(usize, usize)> {
-    let radius_squared = explosion.radius * explosion.radius;
+    let hit_radius = explosion.radius + SOLDIER_RADIUS;
+    let hit_radius_squared = hit_radius * hit_radius;
     let mut casualties = Vec::new();
     for (player_index, player) in game.state.players.iter_mut().enumerate() {
         for (soldier_index, soldier) in player.soldiers.iter_mut().enumerate() {
@@ -1853,7 +1854,7 @@ fn apply_explosion(game: &mut Match, explosion: Circle) -> Vec<(usize, usize)> {
                 soldier.x - explosion.x,
                 (soldier.y - explosion.y) * (soldier.y - explosion.y),
             );
-            if soldier.alive && distance_squared <= radius_squared {
+            if soldier.alive && distance_squared <= hit_radius_squared {
                 soldier.alive = false;
                 casualties.push((player_index, soldier_index));
             }
@@ -2044,6 +2045,38 @@ mod tests {
         assert_eq!(game.turn, 1);
         assert_eq!(game.players[1].current_soldier, 1);
         assert!(game.players[1].current().unwrap().alive);
+    }
+
+    #[test]
+    fn explosion_uses_soldier_radius_hitbox() {
+        let mut game = Match {
+            mode: GameMode::Function,
+            terrain: Terrain::default(),
+            state: GameState::new(vec![Player::new(
+                1,
+                Team::One,
+                vec![
+                    Soldier::new(100.0 + 12.0 + SOLDIER_RADIUS - 0.1, 100.0),
+                    Soldier::new(100.0, 100.0 + 12.0 + SOLDIER_RADIUS + 0.1),
+                ],
+            )]),
+            player_ids: vec![Uuid::new_v4()],
+            turn_deadline_at: 0,
+            shot_history: Vec::new(),
+        };
+
+        let hits = apply_explosion(
+            &mut game,
+            Circle {
+                x: 100.0,
+                y: 100.0,
+                radius: 12.0,
+            },
+        );
+
+        assert_eq!(hits, vec![(0, 0)]);
+        assert!(!game.state.players[0].soldiers[0].alive);
+        assert!(game.state.players[0].soldiers[1].alive);
     }
 
     #[test]
