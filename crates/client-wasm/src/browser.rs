@@ -3218,6 +3218,8 @@ fn start_shot_animation(app: &SharedApp, sequence: u64) {
         let mut app_ref = app.borrow_mut();
         app_ref.shot_animation = None;
         apply_pending_game(&mut app_ref.model);
+        drop(app_ref);
+        refresh_game(app);
         return;
     }
     let started_at = js_sys::Date::now();

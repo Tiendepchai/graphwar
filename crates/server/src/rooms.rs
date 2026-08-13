@@ -2129,6 +2129,64 @@ mod tests {
     }
 
     #[test]
+    fn terrain_impact_explosion_damages_overlapping_soldier() {
+        let owner = Uuid::new_v4();
+        let guest = Uuid::new_v4();
+        let mut registry = Registry::default();
+        let room = registry
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
+            .unwrap()
+            .0;
+        registry.join(guest, "Guest".into(), room.id, None).unwrap();
+        registry.set_soldiers(owner, owner, 1).unwrap();
+        registry.set_soldiers(guest, guest, 1).unwrap();
+        registry.set_ready(owner, true).unwrap();
+        registry.set_ready(guest, true).unwrap();
+        registry.start_game(owner).unwrap();
+        let game = registry
+            .rooms
+            .get_mut(&room.id)
+            .unwrap()
+            .game
+            .as_mut()
+            .unwrap();
+        game.terrain = Terrain {
+            circles: vec![Circle {
+                x: 158.0,
+                y: 225.0,
+                radius: 20.0,
+            }],
+            explosions: Vec::new(),
+        };
+        game.state.players[0].soldiers[0] = Soldier::new(100.0, 225.0);
+        game.state.players[1].soldiers[0] = Soldier::new(130.0, 225.0);
+
+        let shot = registry.fire(owner, "0".into(), 0.0).unwrap().shot;
+
+        let ShotOutcome::TerrainImpact { explosion, hits } = shot.outcome else {
+            panic!("expected terrain impact");
+        };
+        assert!((explosion.x - 130.0).hypot(explosion.y - 225.0) <= 12.0 + SOLDIER_RADIUS);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].player_id, guest);
+        assert!(!hits[0].alive);
+        assert_eq!(shot.winner_team, Some(1));
+        let guest_soldier = shot
+            .game
+            .soldiers
+            .iter()
+            .find(|soldier| soldier.player_id == guest)
+            .unwrap();
+        assert!(!guest_soldier.alive);
+    }
+
+    #[test]
     fn advance_turn_strictly_alternates_teams() {
         // Two players on team 1, one on team 2 (3-player roster). Turns must
         // never land on the same team twice in a row.
