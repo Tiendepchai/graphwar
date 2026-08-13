@@ -2080,6 +2080,55 @@ mod tests {
     }
 
     #[test]
+    fn projectile_passing_through_soldier_does_not_damage() {
+        let owner = Uuid::new_v4();
+        let guest = Uuid::new_v4();
+        let mut registry = Registry::default();
+        let room = registry
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
+            .unwrap()
+            .0;
+        registry.join(guest, "Guest".into(), room.id, None).unwrap();
+        registry.set_soldiers(owner, owner, 1).unwrap();
+        registry.set_soldiers(guest, guest, 1).unwrap();
+        registry.set_ready(owner, true).unwrap();
+        registry.set_ready(guest, true).unwrap();
+        registry.start_game(owner).unwrap();
+        let game = registry
+            .rooms
+            .get_mut(&room.id)
+            .unwrap()
+            .game
+            .as_mut()
+            .unwrap();
+        game.terrain = Terrain::default();
+        game.state.players[0].soldiers[0] = Soldier::new(100.0, 225.0);
+        game.state.players[1].soldiers[0] = Soldier::new(300.0, 225.0);
+
+        let shot = registry.fire(owner, "0".into(), 0.0).unwrap().shot;
+
+        assert!(matches!(
+            shot.outcome,
+            ShotOutcome::Miss {
+                reason: ShotMissReason::WorldExit
+            }
+        ));
+        let guest_soldier = shot
+            .game
+            .soldiers
+            .iter()
+            .find(|soldier| soldier.player_id == guest)
+            .unwrap();
+        assert!(guest_soldier.alive);
+    }
+
+    #[test]
     fn advance_turn_strictly_alternates_teams() {
         // Two players on team 1, one on team 2 (3-player roster). Turns must
         // never land on the same team twice in a row.
