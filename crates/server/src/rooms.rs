@@ -24,7 +24,7 @@ use password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-const REGISTRY_FORMAT_VERSION: u32 = 2;
+const REGISTRY_FORMAT_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 struct PersistedRegistry {
@@ -45,6 +45,8 @@ struct PersistedRoom {
     event_sequence: u64,
     #[serde(default)]
     chat_history: Vec<ChatEntry>,
+    #[serde(default)]
+    lobby_deadline_at: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -69,6 +71,7 @@ use uuid::Uuid;
 pub type RoomRegistry = std::sync::Arc<tokio::sync::RwLock<Registry>>;
 
 const TURN_DURATION: Duration = Duration::from_secs(60);
+const LOBBY_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_SHOT_HISTORY: usize = 40;
 const MAX_CHAT_HISTORY: usize = 100;
 const MAX_TERRAIN_CUTS: usize = 512;
@@ -79,6 +82,7 @@ const MAX_ROOMS: usize = 256;
 #[derive(Clone, Default)]
 pub struct Registry {
     rooms: HashMap<Uuid, Room>,
+    needs_save_after_load: bool,
 }
 
 #[derive(Clone)]
@@ -91,6 +95,7 @@ struct Room {
     practice_setup: Option<PracticeSetup>,
     event_sequence: u64,
     chat_history: Vec<ChatEntry>,
+    lobby_deadline_at: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -118,6 +123,11 @@ pub struct StartOutcome {
 pub struct FireOutcome {
     pub snapshot: RoomSnapshot,
     pub shot: ShotResolved,
+}
+
+pub struct LobbyExpired {
+    pub room_id: Uuid,
+    pub members: Vec<Uuid>,
 }
 
 pub struct LeaveOutcome {
@@ -198,7 +208,7 @@ impl Registry {
     pub(crate) fn from_persisted_json(input: &str) -> Result<Self, String> {
         let persisted: PersistedRegistry =
             serde_json::from_str(input).map_err(|error| error.to_string())?;
-        if !matches!(persisted.version, 1 | REGISTRY_FORMAT_VERSION) {
+        if !(1..=REGISTRY_FORMAT_VERSION).contains(&persisted.version) {
             return Err(format!(
                 "unsupported registry snapshot version {}",
                 persisted.version
@@ -207,6 +217,9 @@ impl Registry {
         if persisted.rooms.len() > MAX_ROOMS {
             return Err("too many rooms".into());
         }
+        let version = persisted.version;
+        let now = unix_timestamp();
+        let mut needs_save_after_load = false;
         let mut rooms = HashMap::with_capacity(persisted.rooms.len());
         for mut persisted in persisted.rooms {
             let id = persisted.snapshot.id;
@@ -214,6 +227,9 @@ impl Registry {
                 return Err("duplicate room ID".into());
             }
             normalize_feed_history(&mut persisted)?;
+            if normalize_lobby_deadline(&mut persisted, version, now) {
+                needs_save_after_load = true;
+            }
             validate_persisted_room(&persisted)?;
             let bots = persisted
                 .bots
@@ -248,10 +264,14 @@ impl Registry {
                     practice_setup: persisted.practice_setup,
                     event_sequence: persisted.event_sequence,
                     chat_history: persisted.chat_history,
+                    lobby_deadline_at: persisted.lobby_deadline_at,
                 },
             );
         }
-        Ok(Self { rooms })
+        Ok(Self {
+            rooms,
+            needs_save_after_load,
+        })
     }
 
     pub(crate) fn persisted_json(&self) -> Result<String, serde_json::Error> {
@@ -288,13 +308,14 @@ impl Registry {
                     practice_setup: room.practice_setup.clone(),
                     event_sequence: room.event_sequence,
                     chat_history: room.chat_history.clone(),
+                    lobby_deadline_at: room.lobby_deadline_at,
                 })
                 .collect(),
         })
     }
 
     pub fn resume_after_restart(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = std::mem::take(&mut self.needs_save_after_load);
         for room in self.rooms.values_mut() {
             let Some(game) = room.game.as_mut() else {
                 continue;
@@ -316,6 +337,58 @@ impl Registry {
             }
         }
         changed
+    }
+
+    pub fn expire_lobbies(&mut self) -> Vec<LobbyExpired> {
+        self.expire_lobbies_at(unix_timestamp())
+    }
+
+    pub fn expire_lobbies_at(&mut self, now: i64) -> Vec<LobbyExpired> {
+        let expired = self
+            .rooms
+            .iter()
+            .filter_map(|(id, room)| {
+                (room.snapshot.phase == Phase::Lobby
+                    && room
+                        .lobby_deadline_at
+                        .is_some_and(|deadline| deadline <= now))
+                .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        expired
+            .into_iter()
+            .filter_map(|room_id| {
+                let room = self.rooms.remove(&room_id)?;
+                Some(LobbyExpired {
+                    room_id,
+                    members: room
+                        .members
+                        .keys()
+                        .filter(|member| !room.bots.contains_key(member))
+                        .copied()
+                        .collect(),
+                })
+            })
+            .collect()
+    }
+
+    pub fn normalize_lobby_deadlines(&mut self) -> bool {
+        let now = unix_timestamp();
+        let mut changed = false;
+        for room in self.rooms.values_mut() {
+            if normalize_room_lobby_deadline(room, now) {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_lobby_deadline_at(&mut self, room_id: Uuid, deadline: i64) {
+        self.rooms
+            .get_mut(&room_id)
+            .expect("test room exists")
+            .lobby_deadline_at = Some(deadline);
     }
 
     pub fn create(
@@ -398,6 +471,7 @@ impl Registry {
                 practice_setup,
                 event_sequence: 0,
                 chat_history: Vec::new(),
+                lobby_deadline_at: Some(lobby_deadline()),
             },
         );
         Ok((snapshot, None))
@@ -451,6 +525,7 @@ impl Registry {
             });
             reconcile_room_practice_setup(&mut candidate)?;
             reset_readiness(&mut candidate);
+            reset_lobby_deadline(&mut candidate);
             candidate.snapshot.revision += 1;
             *room = candidate;
         }
@@ -466,6 +541,9 @@ impl Registry {
             if remove_member(&mut candidate, player) {
                 reconcile_room_practice_setup(&mut candidate)?;
                 reset_readiness(&mut candidate);
+                if phase == Phase::Lobby {
+                    reset_lobby_deadline(&mut candidate);
+                }
                 let broadcast = if phase == Phase::Finished {
                     LeaveBroadcast::StateSync {
                         snapshot: candidate.snapshot.clone(),
@@ -570,6 +648,7 @@ impl Registry {
         room.snapshot.phase = Phase::Lobby;
         room.game = None;
         reset_readiness(room);
+        reset_lobby_deadline(room);
         room.snapshot.revision += 1;
         Ok(room.snapshot.clone())
     }
@@ -587,6 +666,7 @@ impl Registry {
                 .find(|member| member.id == player)
                 .expect("member room")
                 .ready = ready;
+            reset_lobby_deadline(room);
             room.snapshot.revision += 1;
         }
         Ok(room.snapshot.clone())
@@ -603,6 +683,7 @@ impl Registry {
         if room.snapshot.mode != mode {
             room.snapshot.mode = mode;
             reset_readiness(room);
+            reset_lobby_deadline(room);
             room.snapshot.revision += 1;
         }
         Ok(room.snapshot.clone())
@@ -642,6 +723,7 @@ impl Registry {
                 .team = team;
             reconcile_room_practice_setup(&mut candidate)?;
             reset_readiness(&mut candidate);
+            reset_lobby_deadline(&mut candidate);
             candidate.snapshot.revision += 1;
             *room = candidate;
         }
@@ -682,6 +764,7 @@ impl Registry {
                 .soldiers = soldiers;
             reconcile_room_practice_setup(&mut candidate)?;
             reset_readiness(&mut candidate);
+            reset_lobby_deadline(&mut candidate);
             candidate.snapshot.revision += 1;
             *room = candidate;
         }
@@ -708,9 +791,12 @@ impl Registry {
             return Err(RoomError::Invalid("room setup is stale"));
         }
         validate_practice_setup(&setup, &room.snapshot.players)?;
-        room.practice_setup = Some(setup);
-        reset_readiness(room);
-        room.snapshot.revision += 1;
+        if room.practice_setup.as_ref() != Some(&setup) {
+            room.practice_setup = Some(setup);
+            reset_readiness(room);
+            reset_lobby_deadline(room);
+            room.snapshot.revision += 1;
+        }
         Ok(room.snapshot.clone())
     }
 
@@ -767,6 +853,7 @@ impl Registry {
         });
         reconcile_room_practice_setup(&mut candidate)?;
         reset_readiness(&mut candidate);
+        reset_lobby_deadline(&mut candidate);
         candidate.snapshot.revision += 1;
         *room = candidate;
         Ok(room.snapshot.clone())
@@ -792,6 +879,7 @@ impl Registry {
             .retain(|slot| slot.id != player_id);
         reconcile_room_practice_setup(&mut candidate)?;
         reset_readiness(&mut candidate);
+        reset_lobby_deadline(&mut candidate);
         candidate.snapshot.revision += 1;
         *room = candidate;
         Ok(room.snapshot.clone())
@@ -819,6 +907,7 @@ impl Registry {
         remove_member(&mut candidate, player_id);
         reconcile_room_practice_setup(&mut candidate)?;
         reset_readiness(&mut candidate);
+        reset_lobby_deadline(&mut candidate);
         *room = candidate;
         Ok(room.snapshot.clone())
     }
@@ -836,13 +925,11 @@ impl Registry {
         {
             return Err(RoomError::WrongPhase);
         }
+        let seed = match_seed(room.snapshot.id);
         let game_state = match room.snapshot.kind {
-            RoomKind::Standard => new_match(
-                match_seed(room.snapshot.id),
-                &room.snapshot.players,
-                room.snapshot.mode,
-            )?,
+            RoomKind::Standard => new_match(seed, &room.snapshot.players, room.snapshot.mode)?,
             RoomKind::Practice => new_practice_match(
+                seed,
                 room.practice_setup
                     .as_ref()
                     .ok_or(RoomError::Invalid("practice setup is missing"))?,
@@ -852,6 +939,7 @@ impl Registry {
         };
         room.snapshot.phase = Phase::Planning;
         room.snapshot.revision += 1;
+        room.lobby_deadline_at = None;
         room.game = Some(game_state);
         let game = snapshot_for_game(room);
         Ok(StartOutcome {
@@ -1003,6 +1091,9 @@ impl Registry {
         room.chat_history.push(entry.clone());
         let excess = room.chat_history.len().saturating_sub(MAX_CHAT_HISTORY);
         room.chat_history.drain(..excess);
+        if room.snapshot.phase == Phase::Lobby {
+            reset_lobby_deadline(room);
+        }
         Ok((room.snapshot.id, entry))
     }
 
@@ -1256,6 +1347,30 @@ fn valid_persisted_room_secret(secret: &str) -> bool {
         || (secret.starts_with("$argon2") && PasswordHash::new(secret).is_ok())
 }
 
+fn normalize_lobby_deadline(room: &mut PersistedRoom, version: u32, now: i64) -> bool {
+    let before = room.lobby_deadline_at;
+    room.lobby_deadline_at = match room.snapshot.phase {
+        Phase::Lobby if version < 3 && room.lobby_deadline_at.is_none() => {
+            Some(now.saturating_add(LOBBY_INACTIVITY_TIMEOUT.as_secs() as i64))
+        }
+        Phase::Lobby => room.lobby_deadline_at,
+        Phase::Planning | Phase::Resolving | Phase::Finished => None,
+    };
+    version != REGISTRY_FORMAT_VERSION || before != room.lobby_deadline_at
+}
+
+fn normalize_room_lobby_deadline(room: &mut Room, now: i64) -> bool {
+    let normalized = match room.snapshot.phase {
+        Phase::Lobby => room
+            .lobby_deadline_at
+            .or_else(|| Some(now.saturating_add(LOBBY_INACTIVITY_TIMEOUT.as_secs() as i64))),
+        Phase::Planning | Phase::Resolving | Phase::Finished => None,
+    };
+    let changed = room.lobby_deadline_at != normalized;
+    room.lobby_deadline_at = normalized;
+    changed
+}
+
 fn validate_persisted_room(room: &PersistedRoom) -> Result<(), String> {
     let snapshot = &room.snapshot;
     if snapshot.name.trim().is_empty()
@@ -1322,6 +1437,9 @@ fn validate_persisted_room(room: &PersistedRoom) -> Result<(), String> {
         })
     {
         return Err("invalid chat history".into());
+    }
+    if room.lobby_deadline_at.is_some() != (snapshot.phase == Phase::Lobby) {
+        return Err("invalid lobby deadline".into());
     }
     match (&snapshot.phase, &room.game) {
         (Phase::Lobby, None) => return Ok(()),
@@ -1405,7 +1523,7 @@ fn validate_persisted_room(room: &PersistedRoom) -> Result<(), String> {
 fn new_match(seed: u64, players: &[PlayerSnapshot], mode: GameMode) -> Result<Match, RoomError> {
     let mut generator = SeededGenerator::new(seed);
     let terrain = Terrain::new(generator.terrain());
-    let slots = alternating_players(players);
+    let slots = alternating_players(players, seed);
     let player_ids = slots.iter().map(|player| player.id).collect();
     let mut placed = Vec::new();
     let mut game_players = Vec::with_capacity(slots.len());
@@ -1426,6 +1544,7 @@ fn new_match(seed: u64, players: &[PlayerSnapshot], mode: GameMode) -> Result<Ma
 }
 
 fn new_practice_match(
+    seed: u64,
     setup: &PracticeSetup,
     players: &[PlayerSnapshot],
     mode: GameMode,
@@ -1447,7 +1566,7 @@ fn new_practice_match(
         .iter()
         .map(|placement| (placement.player_id, &placement.soldiers))
         .collect::<HashMap<_, _>>();
-    let slots = alternating_players(players);
+    let slots = alternating_players(players, seed);
     let player_ids = slots.iter().map(|player| player.id).collect();
     let game_players = slots
         .into_iter()
@@ -1648,32 +1767,37 @@ fn default_practice_point(
     Err(RoomError::Invalid("could not place practice soldiers"))
 }
 
-fn alternating_players(players: &[PlayerSnapshot]) -> Vec<&PlayerSnapshot> {
-    // Interleave the two teams evenly, spread from the front. advance_turn
-    // enforces strict team alternation, so the initial roster order only
-    // decides who fires first (turn 0) — keep it fair by alternating evenly
-    // rather than grouping by team.
+fn alternating_players(players: &[PlayerSnapshot], seed: u64) -> Vec<&PlayerSnapshot> {
+    // Interleave teams, pick the opener from the match seed.
+    // Equal teams no longer always give team 1 first shot.
     let mut team_one: Vec<&PlayerSnapshot> =
         players.iter().filter(|player| player.team == 1).collect();
     let mut team_two: Vec<&PlayerSnapshot> =
         players.iter().filter(|player| player.team == 2).collect();
-    let first_team = if players.len() % 2 == 0 { 1 } else { 2 };
-    let start_team_one = first_team == 1;
+    let mut last_team = None;
     let mut result = Vec::with_capacity(players.len());
     while !team_one.is_empty() || !team_two.is_empty() {
         let take_one = if team_one.is_empty() {
             false
-        } else if team_two.is_empty() || team_one.len() > team_two.len() {
+        } else if team_two.is_empty() {
             true
-        } else if team_two.len() > team_one.len() {
+        } else if last_team == Some(1) {
             false
+        } else if last_team == Some(2) {
+            true
+        } else if team_one.len() == team_two.len() {
+            seed % 2 == 0
+        } else if team_one.len() > team_two.len() {
+            seed % 3 != 0
         } else {
-            start_team_one
+            seed % 3 == 0
         };
         if take_one {
             result.push(team_one.remove(0));
+            last_team = Some(1);
         } else {
             result.push(team_two.remove(0));
+            last_team = Some(2);
         }
     }
     result
@@ -1727,6 +1851,7 @@ fn spawn_soldiers(
     Ok(result)
 }
 
+#[cfg(not(test))]
 fn match_seed(room_id: Uuid) -> u64 {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1737,6 +1862,11 @@ fn match_seed(room_id: Uuid) -> u64 {
         ^ ((timestamp >> 64) as u64).rotate_left(32)
         ^ (room as u64)
         ^ ((room >> 64) as u64).rotate_left(17)
+}
+
+#[cfg(test)]
+fn match_seed(room_id: Uuid) -> u64 {
+    room_id.as_u128() as u64 & !1
 }
 
 fn team(value: u8) -> Team {
@@ -1793,6 +1923,12 @@ fn reset_readiness(room: &mut Room) {
     }
 }
 
+fn reset_lobby_deadline(room: &mut Room) {
+    if room.snapshot.phase == Phase::Lobby {
+        room.lobby_deadline_at = Some(lobby_deadline());
+    }
+}
+
 fn next_event_sequence(room: &mut Room) -> Result<u64, RoomError> {
     room.event_sequence = room
         .event_sequence
@@ -1812,6 +1948,10 @@ fn unix_timestamp() -> i64 {
 
 fn turn_deadline() -> i64 {
     unix_timestamp().saturating_add(TURN_DURATION.as_secs() as i64)
+}
+
+fn lobby_deadline() -> i64 {
+    unix_timestamp().saturating_add(LOBBY_INACTIVITY_TIMEOUT.as_secs() as i64)
 }
 
 fn resolution_deadline() -> i64 {
@@ -2241,8 +2381,6 @@ mod tests {
             sequence.windows(2).all(|w| w[0] != w[1]),
             "turns must strictly alternate teams, got {sequence:?}"
         );
-        // Expected: T1, T2, T1, T2, T1, T2 (the single team-2 player turns every
-        // other shot).
         assert_eq!(
             sequence,
             vec![
@@ -2299,6 +2437,136 @@ mod tests {
                 Team::One,
                 Team::Two
             ]
+        );
+    }
+
+    #[test]
+    fn lobby_inactivity_expiry_removes_room_members_only_at_deadline() {
+        let owner = Uuid::new_v4();
+        let guest = Uuid::new_v4();
+        let mut registry = Registry::default();
+        let room = registry
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
+            .unwrap()
+            .0;
+        let bot = registry.add_bot(owner, 1).unwrap().players[1].id;
+        registry.join(guest, "Guest".into(), room.id, None).unwrap();
+        let deadline = registry.rooms[&room.id].lobby_deadline_at.unwrap();
+
+        assert!(registry.expire_lobbies_at(deadline - 1).is_empty());
+        let expired = registry.expire_lobbies_at(deadline);
+
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].room_id, room.id);
+        assert!(expired[0].members.contains(&owner));
+        assert!(expired[0].members.contains(&guest));
+        assert!(!expired[0].members.contains(&bot));
+        assert!(matches!(
+            registry.member_state(owner),
+            Err(RoomError::NotMember)
+        ));
+        assert!(matches!(
+            registry.member_state(guest),
+            Err(RoomError::NotMember)
+        ));
+        assert!(registry.public_snapshots().is_empty());
+    }
+
+    #[test]
+    fn lobby_activity_resets_deadline_and_game_phases_clear_it() {
+        let owner = Uuid::new_v4();
+        let guest = Uuid::new_v4();
+        let mut registry = Registry::default();
+        let room = registry
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
+            .unwrap()
+            .0;
+        registry.set_lobby_deadline_at(room.id, 1);
+        assert_eq!(
+            registry.set_ready(owner, false).unwrap().revision,
+            room.revision
+        );
+        assert_eq!(registry.rooms[&room.id].lobby_deadline_at, Some(1));
+
+        registry.join(guest, "Guest".into(), room.id, None).unwrap();
+        let joined_deadline = registry.rooms[&room.id].lobby_deadline_at.unwrap();
+        assert!(joined_deadline > 1);
+        registry.set_lobby_deadline_at(room.id, 1);
+        registry.set_ready(owner, true).unwrap();
+        assert!(registry.rooms[&room.id].lobby_deadline_at.unwrap() > 1);
+        registry.set_lobby_deadline_at(room.id, 1);
+        registry.set_soldiers(owner, owner, 1).unwrap();
+        assert!(registry.rooms[&room.id].lobby_deadline_at.unwrap() > 1);
+        registry.set_lobby_deadline_at(room.id, 1);
+        registry.chat(owner, "ready".into()).unwrap();
+        assert!(registry.rooms[&room.id].lobby_deadline_at.unwrap() > 1);
+        registry.set_lobby_deadline_at(room.id, 1);
+        assert!(matches!(
+            registry.chat(owner, "   ".into()),
+            Err(RoomError::Invalid(_))
+        ));
+        assert_eq!(registry.rooms[&room.id].lobby_deadline_at, Some(1));
+
+        registry.set_ready(owner, true).unwrap();
+        registry.set_ready(guest, true).unwrap();
+        registry.start_game(owner).unwrap();
+        assert_eq!(registry.rooms[&room.id].lobby_deadline_at, None);
+        assert!(registry.expire_lobbies_at(i64::MAX).is_empty());
+        registry.rooms.get_mut(&room.id).unwrap().snapshot.phase = Phase::Finished;
+        registry.return_to_lobby(owner).unwrap();
+        assert!(registry.rooms[&room.id].lobby_deadline_at.unwrap() > 1);
+    }
+
+    #[test]
+    fn persisted_lobby_deadlines_normalize_by_version() {
+        let owner = Uuid::new_v4();
+        let mut registry = Registry::default();
+        let room = registry
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
+            .unwrap()
+            .0;
+        registry.set_lobby_deadline_at(room.id, 42);
+        let restored = Registry::from_persisted_json(&registry.persisted_json().unwrap()).unwrap();
+        assert_eq!(restored.rooms[&room.id].lobby_deadline_at, Some(42));
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&registry.persisted_json().unwrap()).unwrap();
+        legacy["version"] = 2.into();
+        legacy["rooms"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("lobby_deadline_at");
+        let restored = Registry::from_persisted_json(&legacy.to_string()).unwrap();
+        assert!(restored.rooms[&room.id].lobby_deadline_at.unwrap() > unix_timestamp());
+
+        let (active, active_room, active_owner, _) = started_registry();
+        let active_restored =
+            Registry::from_persisted_json(&active.persisted_json().unwrap()).unwrap();
+        assert_eq!(active_restored.rooms[&active_room].lobby_deadline_at, None);
+        assert!(
+            active_restored
+                .member_state(active_owner)
+                .unwrap()
+                .1
+                .is_some()
         );
     }
 
@@ -2886,8 +3154,8 @@ mod tests {
                 is_bot: false,
             },
         ];
-        let first = new_match(123, &players, GameMode::Function).unwrap();
-        let second = new_match(123, &players, GameMode::Function).unwrap();
+        let first = new_match(124, &players, GameMode::Function).unwrap();
+        let second = new_match(124, &players, GameMode::Function).unwrap();
 
         assert_eq!(first.terrain, second.terrain);
         assert_eq!(first.state, second.state);
@@ -3876,10 +4144,75 @@ mod tests {
                 is_bot: false,
             },
         ];
-        let order = alternating_players(&shots);
+        let order = alternating_players(&shots, 124);
         let teams: Vec<u8> = order.iter().map(|p| p.team).collect();
         assert_eq!(teams, vec![1, 2, 1, 2], "turns must alternate across teams");
         assert!(order.iter().all(|p| shots.contains(p)));
+    }
+
+    #[test]
+    fn equal_teams_can_start_from_either_side() {
+        let players = [
+            PlayerSnapshot {
+                id: Uuid::new_v4(),
+                display_name: "A".into(),
+                owner: true,
+                ready: true,
+                team: 1,
+                soldiers: 1,
+                is_bot: false,
+            },
+            PlayerSnapshot {
+                id: Uuid::new_v4(),
+                display_name: "B".into(),
+                owner: false,
+                ready: true,
+                team: 2,
+                soldiers: 1,
+                is_bot: false,
+            },
+        ];
+
+        assert_eq!(alternating_players(&players, 2)[0].team, 1);
+        assert_eq!(alternating_players(&players, 1)[0].team, 2);
+    }
+
+    #[test]
+    fn odd_grouped_snapshot_does_not_start_with_same_team_twice() {
+        let players = vec![
+            PlayerSnapshot {
+                id: Uuid::new_v4(),
+                display_name: "A".into(),
+                owner: true,
+                ready: true,
+                team: 1,
+                soldiers: 2,
+                is_bot: false,
+            },
+            PlayerSnapshot {
+                id: Uuid::new_v4(),
+                display_name: "B".into(),
+                owner: false,
+                ready: true,
+                team: 1,
+                soldiers: 2,
+                is_bot: false,
+            },
+            PlayerSnapshot {
+                id: Uuid::new_v4(),
+                display_name: "C".into(),
+                owner: false,
+                ready: true,
+                team: 2,
+                soldiers: 2,
+                is_bot: false,
+            },
+        ];
+
+        let order = alternating_players(&players, 1);
+        let teams = order.iter().map(|player| player.team).collect::<Vec<_>>();
+
+        assert_eq!(teams, vec![1, 2, 1]);
     }
 
     #[test]

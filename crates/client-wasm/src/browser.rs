@@ -1235,25 +1235,12 @@ fn refresh_room_dom(app: &SharedApp) -> Result<(), JsValue> {
         room_element(document, "#players-title span")?
             .set_text_content(Some(&model.players.len().to_string()));
         room_element(document, ".team-rosters")?.set_inner_html(&room_team_rosters_html(model));
-        room_element(document, ".room-chat ul")?.set_inner_html(&chat_messages_html(model));
+        replace_feed_html(
+            &room_element(document, ".room-chat ul")?,
+            &chat_messages_html(model),
+        );
 
         let owner = model.local_owner();
-        set_boolean_attribute(&room_element(document, ".mode-picker")?, "disabled", !owner)?;
-        let mode = model.game_mode.unwrap_or(GameMode::Function);
-        let mode_inputs = document.query_selector_all("input[name=game-mode]")?;
-        for index in 0..mode_inputs.length() {
-            let Some(input) = mode_inputs.item(index) else {
-                continue;
-            };
-            let input = input.dyn_into::<HtmlInputElement>()?;
-            input.set_checked(
-                matches!(input.value().as_str(), "function") && mode == GameMode::Function
-                    || matches!(input.value().as_str(), "first_order")
-                        && mode == GameMode::FirstOrder
-                    || matches!(input.value().as_str(), "second_order")
-                        && mode == GameMode::SecondOrder,
-            );
-        }
         room_element(document, "#ready-button")?.set_text_content(Some(if model.local_ready() {
             "Not ready"
         } else {
@@ -1304,8 +1291,25 @@ fn refresh_chat_dom(app: &SharedApp) -> Result<(), JsValue> {
         .document
         .query_selector(selector)?
         .ok_or_else(|| JsValue::from_str(&format!("{selector} missing")))?;
-    list.set_inner_html(&chat_messages_html(&app_ref.model));
+    replace_feed_html(&list, &chat_messages_html(&app_ref.model));
     Ok(())
+}
+
+fn replace_feed_html(list: &web_sys::Element, html: &str) {
+    let scroll = list.dyn_ref::<web_sys::HtmlElement>().map(|list| {
+        let gap = list.scroll_height() - list.client_height() - list.scroll_top();
+        (gap <= 24, list.scroll_top())
+    });
+    list.set_inner_html(html);
+    if let (Some(list), Some((stick_to_bottom, scroll_top))) =
+        (list.dyn_ref::<web_sys::HtmlElement>(), scroll)
+    {
+        if stick_to_bottom {
+            list.set_scroll_top(list.scroll_height());
+        } else {
+            list.set_scroll_top(scroll_top);
+        }
+    }
 }
 
 fn room_element(document: &Document, selector: &str) -> Result<web_sys::Element, JsValue> {
@@ -1336,7 +1340,10 @@ fn refresh_game_dom(app: &SharedApp) -> Result<(), JsValue> {
         game_element(document, "#battlefield-summary")?
             .set_text_content(Some(&battlefield_summary(model)));
         game_element(document, "#shot-status")?.set_text_content(model.shot_status.as_deref());
-        game_element(document, ".game-chat ul")?.set_inner_html(&chat_messages_html(model));
+        replace_feed_html(
+            &game_element(document, ".game-chat ul")?,
+            &chat_messages_html(model),
+        );
         let finished = model.room_phase == Some(Phase::Finished);
         set_boolean_attribute(
             &game_element(document, ".finished-actions")?,
@@ -1564,7 +1571,7 @@ fn connection_view(connection: &Connection) -> (&'static str, String) {
 }
 
 fn login_html() -> String {
-    "<section class=\"login-shell reveal\" aria-labelledby=\"login-title\"><div class=\"hero-copy\"><p class=\"eyebrow\">Artillery for mathematicians</p><h1 id=\"login-title\">Draw the<br><em>winning line.</em></h1><p>Turn equations into trajectories. Outsmart the other side before the clock runs dry.</p></div><div class=\"auth-stack\"><form id=\"login-form\" class=\"paper-card auth-card auth-card-login\"><h2>Return to battle</h2><label for=\"login-email\">Email</label><input id=\"login-email\" type=\"email\" autocomplete=\"email\" maxlength=\"254\" required><label for=\"login-password\">Password</label><input id=\"login-password\" type=\"password\" autocomplete=\"current-password\" minlength=\"12\" required><button class=\"primary\" type=\"submit\">Enter the lobby <span aria-hidden=\"true\">↗</span></button></form><form id=\"register-form\" class=\"paper-card auth-card auth-card-register\"><h2>First deployment</h2><label for=\"register-name\">Display name</label><input id=\"register-name\" autocomplete=\"nickname\" minlength=\"2\" maxlength=\"32\" required placeholder=\"e.g. Gauss\"><label for=\"register-email\">Email</label><input id=\"register-email\" type=\"email\" autocomplete=\"email\" maxlength=\"254\" required><label for=\"register-password\">Password</label><input id=\"register-password\" type=\"password\" autocomplete=\"new-password\" minlength=\"12\" required><button class=\"secondary\" type=\"submit\">Create account</button><small>Passwords need at least 12 characters.</small></form></div></section>".into()
+    "<section class=\"login-shell reveal\" aria-labelledby=\"login-title\"><div class=\"hero-copy\"><p class=\"eyebrow\">Artillery for mathematicians</p><h1 id=\"login-title\">Draw the<br><em>winning line.</em></h1><p>Turn equations into trajectories. Fire first, read the wind, keep the battlefield readable.</p></div><div class=\"auth-stack\"><form id=\"login-form\" class=\"paper-card auth-card auth-card-login\"><p class=\"eyebrow\">Primary action</p><h2>Return to battle</h2><label for=\"login-email\">Email</label><input id=\"login-email\" type=\"email\" autocomplete=\"email\" maxlength=\"254\" required><label for=\"login-password\">Password</label><input id=\"login-password\" type=\"password\" autocomplete=\"current-password\" minlength=\"12\" required><button class=\"primary\" type=\"submit\">Enter the lobby <span aria-hidden=\"true\">↗</span></button></form><details class=\"paper-card auth-card auth-card-register\"><summary>First deployment</summary><form id=\"register-form\"><label for=\"register-name\">Display name</label><input id=\"register-name\" autocomplete=\"nickname\" minlength=\"2\" maxlength=\"32\" required placeholder=\"e.g. Gauss\"><label for=\"register-email\">Email</label><input id=\"register-email\" type=\"email\" autocomplete=\"email\" maxlength=\"254\" required><label for=\"register-password\">Password</label><input id=\"register-password\" type=\"password\" autocomplete=\"new-password\" minlength=\"12\" required><button class=\"secondary\" type=\"submit\">Create account</button><small>Passwords need at least 12 characters.</small></form></details></div></section>".into()
 }
 
 fn lobby_html(model: &Model) -> String {
@@ -1616,20 +1623,14 @@ fn room_html(model: &Model) -> String {
     };
     let start_disabled = (!model.can_start()).then_some(" disabled").unwrap_or("");
     let owner_controls = model.local_owner();
-    let mode = model.game_mode.unwrap_or(GameMode::Function);
-    let mode_checked = |candidate| (mode == candidate).then_some(" checked").unwrap_or("");
     let practice = (model.room_kind == Some(RoomKind::Practice))
         .then(|| practice_editor_html(model))
         .unwrap_or_default();
     format!(
-        "<section class=\"room-shell reveal\" aria-labelledby=\"room-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Staging area</p><h1 id=\"room-title\">{}</h1></div><button id=\"leave-room\" class=\"text-button\">Leave room</button></div><div class=\"room-grid\"><section class=\"paper-card roster\" aria-labelledby=\"players-title\"><h2 id=\"players-title\">Players <span>{}</span></h2><div class=\"team-rosters\">{}</div><p id=\"roster-move-status\" class=\"sr-only\" aria-live=\"polite\"></p></section><aside class=\"briefing paper-card command-brief\"><p>Configure your slot, then ready up. The owner starts after everyone commits.</p><fieldset class=\"mode-picker\"{}><legend>Rule set</legend><label><input type=\"radio\" name=\"game-mode\" value=\"function\"{}> Function</label><label><input type=\"radio\" name=\"game-mode\" value=\"first_order\"{}> First-order</label><label><input type=\"radio\" name=\"game-mode\" value=\"second_order\"{}> Second-order</label></fieldset><button id=\"ready-button\" class=\"primary wide\">{ready_label}</button><button id=\"add-bot\" class=\"text-button wide\"{}>Add computer</button><button id=\"start-game\" class=\"secondary wide\"{}>Start match</button></aside></div>{practice}</section>{}",
+        "<section class=\"room-shell reveal\" aria-labelledby=\"room-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Staging area</p><h1 id=\"room-title\">{}</h1></div><button id=\"leave-room\" class=\"text-button\">Leave room</button></div><div class=\"room-grid\"><div class=\"room-main\"><section class=\"paper-card roster\" aria-labelledby=\"players-title\"><h2 id=\"players-title\">Players <span>{}</span></h2><div class=\"team-rosters\">{}</div><p id=\"roster-move-status\" class=\"sr-only\" aria-live=\"polite\"></p></section>{practice}</div><aside class=\"room-command\" aria-label=\"Room controls\"><section class=\"briefing paper-card command-brief\"><p>Set teams, ready up, then start. Bots stay ready automatically.</p><p class=\"rule-summary\"><strong>Function trajectory</strong><span>New matches use y = f(x). Legacy derivative matches still resume correctly.</span></p><button id=\"ready-button\" class=\"primary wide\">{ready_label}</button><button id=\"add-bot\" class=\"text-button wide\"{}>Add computer</button><button id=\"start-game\" class=\"secondary wide\"{}>Start match</button></section>{}</aside></div></section>",
         escape(&model.room_name),
         model.players.len(),
         room_team_rosters_html(model),
-        if owner_controls { "" } else { " disabled" },
-        mode_checked(GameMode::Function),
-        mode_checked(GameMode::FirstOrder),
-        mode_checked(GameMode::SecondOrder),
         if owner_controls { "" } else { " disabled" },
         start_disabled,
         chat_html(model, "room-chat")
@@ -1741,6 +1742,7 @@ fn room_player_item_html(model: &Model, player: &crate::state::PlayerSummary) ->
     let local = model.player_id.as_deref() == Some(player.id.as_str());
     let movable = can_move_player(model, player);
     let draggable = movable.then_some(" draggable=\"true\"").unwrap_or("");
+    let ready = player.ready.then_some(" data-ready=\"true\"").unwrap_or("");
     let move_control = movable
         .then(|| {
             format!(
@@ -1765,7 +1767,7 @@ fn room_player_item_html(model: &Model, player: &crate::state::PlayerSummary) ->
         })
         .unwrap_or_default();
     format!(
-        "<li class=\"player-slot\" data-player-id=\"{}\" data-player-team=\"{}\"{draggable}><strong>{}</strong><div class=\"player-controls\">{move_control}<label><span class=\"sr-only\">{} soldiers</span><select class=\"player-soldiers\" data-player-id=\"{}\"{}>{}</select></label>{remove}</div></li>",
+        "<li class=\"player-slot\" data-player-id=\"{}\" data-player-team=\"{}\"{draggable}{ready}><strong>{}</strong><div class=\"player-controls\">{move_control}<label><span class=\"sr-only\">{} soldiers</span><select class=\"player-soldiers\" data-player-id=\"{}\"{}>{}</select></label>{remove}</div></li>",
         attr(&player.id),
         player.team,
         escape(&player.name),
@@ -2255,22 +2257,6 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
             let ready = !app.borrow().model.local_ready();
             send(&app, ClientMessage::SetReady { ready });
         });
-    }
-    let mode_inputs = document.query_selector_all("input[name=game-mode]")?;
-    for index in 0..mode_inputs.length() {
-        let Some(element) = mode_inputs.item(index) else {
-            continue;
-        };
-        let element = element.unchecked_into::<HtmlInputElement>();
-        let app = Rc::clone(app);
-        bind_change(&app.clone(), &element, move |input| {
-            let mode = match input.value().as_str() {
-                "first_order" => GameMode::FirstOrder,
-                "second_order" => GameMode::SecondOrder,
-                _ => GameMode::Function,
-            };
-            send(&app, ClientMessage::SetMode { mode });
-        })?;
     }
     if let Some(button) = document.get_element_by_id("add-bot") {
         let app = Rc::clone(app);
@@ -2947,7 +2933,7 @@ fn practice_soldier_hit(setup: &PracticeSetup, x: f64, y: f64) -> Option<(Uuid, 
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, point)| (point.x - x).hypot(point.y - y) <= 14.0)
+            .find(|(_, point)| (point.x - x).hypot(point.y - y) <= SOLDIER_RADIUS)
             .map(|(index, _)| (placement.player_id, index))
     })
 }
@@ -3747,21 +3733,27 @@ fn draw_soldier(
     palette: CanvasPalette,
 ) {
     if alive && let Some(sprite) = sprite {
-        if active {
-            draw_soldier_fallback(context, x, y, team, alive, active, palette);
-        }
         let drawn = if team == 2 {
             context.save();
             let result = context
                 .translate(x, y)
                 .and_then(|_| context.scale(-1.0, 1.0))
-                .and_then(|_| draw_soldier_layers(context, sprite, helmet, -10.0, -10.0));
+                .and_then(|_| {
+                    draw_soldier_layers(context, sprite, helmet, -SOLDIER_RADIUS, -SOLDIER_RADIUS)
+                });
             context.restore();
             result.is_ok()
         } else {
-            draw_soldier_layers(context, sprite, helmet, x - 10.0, y - 10.0).is_ok()
+            draw_soldier_layers(
+                context,
+                sprite,
+                helmet,
+                x - SOLDIER_RADIUS,
+                y - SOLDIER_RADIUS,
+            )
+            .is_ok()
         };
-        if drawn || active {
+        if drawn {
             return;
         }
     }
@@ -3775,9 +3767,10 @@ fn draw_soldier_layers(
     x: f64,
     y: f64,
 ) -> Result<(), JsValue> {
-    context.draw_image_with_html_image_element_and_dw_and_dh(sprite, x, y, 20.0, 20.0)?;
+    let size = SOLDIER_RADIUS * 2.0;
+    context.draw_image_with_html_image_element_and_dw_and_dh(sprite, x, y, size, size)?;
     if let Some(helmet) = helmet {
-        let _ = context.draw_image_with_html_image_element_and_dw_and_dh(helmet, x, y, 20.0, 20.0);
+        let _ = context.draw_image_with_html_image_element_and_dw_and_dh(helmet, x, y, size, size);
     }
     Ok(())
 }
@@ -3800,13 +3793,9 @@ fn draw_soldier_fallback(
     } else {
         palette.dead
     };
-    let radius = if active && alive { 7.0 } else { 5.0 };
+    let radius = if active && alive { SOLDIER_RADIUS } else { 5.0 };
     context.begin_path();
-    if team == 1 {
-        let _ = context.arc(x, y, radius, 0.0, std::f64::consts::TAU);
-    } else {
-        context.rect(x - radius, y - radius, radius * 2.0, radius * 2.0);
-    }
+    let _ = context.arc(x, y, radius, 0.0, std::f64::consts::TAU);
     context.set_fill_style_str(color);
     context.fill();
     context.set_stroke_style_str(palette.soldier_stroke);

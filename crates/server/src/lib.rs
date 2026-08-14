@@ -117,12 +117,26 @@ impl AppState {
         {
             let mut rooms = self.rooms.write().await;
             let previous = rooms.clone();
-            let outcomes = rooms.expire_turns();
-            if !outcomes.is_empty() && self.persist_rooms(&rooms).await.is_ok() {
-                for outcome in outcomes {
+            let turn_outcomes = rooms.expire_turns();
+            let lobby_outcomes = rooms.expire_lobbies();
+            let lobby_changed = !lobby_outcomes.is_empty();
+            let changed = !turn_outcomes.is_empty() || lobby_changed;
+            if changed && self.persist_rooms(&rooms).await.is_ok() {
+                let public_rooms = lobby_changed.then(|| rooms.public_snapshots());
+                drop(rooms);
+                for outcome in turn_outcomes {
                     self.broadcast_turn(outcome);
                 }
-            } else if !outcomes.is_empty() {
+                for outcome in lobby_outcomes {
+                    self.broadcast_lobby_expired(outcome);
+                }
+                if let Some(rooms) = public_rooms {
+                    self.publish(ScopedEvent {
+                        audience: Audience::Lobby,
+                        message: ServerMessage::RoomList { rooms },
+                    });
+                }
+            } else if changed {
                 *rooms = previous;
             }
         }
@@ -188,6 +202,14 @@ impl AppState {
                 snapshot: outcome.snapshot,
                 game: outcome.game,
             },
+        });
+    }
+
+    fn broadcast_lobby_expired(&self, outcome: rooms::LobbyExpired) {
+        let _ = outcome.room_id;
+        self.publish(ScopedEvent {
+            audience: Audience::Accounts(outcome.members),
+            message: ServerMessage::LeftRoom,
         });
     }
 
@@ -1381,6 +1403,80 @@ mod tests {
         assert!(matches!(
             state.rooms.read().await.member_snapshot(guest),
             Err(RoomError::NotMember)
+        ));
+    }
+
+    #[tokio::test]
+    async fn lobby_expiry_broadcasts_left_room_and_room_list() {
+        let state = test_state();
+        let owner = uuid::Uuid::new_v4();
+        let guest = uuid::Uuid::new_v4();
+        let observer = uuid::Uuid::new_v4();
+        let mut owner_events = state.subscribe(owner);
+        let mut guest_events = state.subscribe(guest);
+        let mut observer_events = state.subscribe(observer);
+        {
+            let mut rooms = state.rooms.write().await;
+            let room = rooms
+                .create(
+                    owner,
+                    "Owner".into(),
+                    "room".into(),
+                    graphwar_protocol::RoomVisibility::Public,
+                    None,
+                )
+                .unwrap()
+                .0;
+            rooms.join(guest, "Guest".into(), room.id, None).unwrap();
+            rooms.set_lobby_deadline_at(room.id, 0);
+        }
+
+        state.expire_turns().await;
+
+        assert!(matches!(
+            owner_events.recv().await.unwrap(),
+            ServerMessage::LeftRoom
+        ));
+        assert!(matches!(
+            guest_events.recv().await.unwrap(),
+            ServerMessage::LeftRoom
+        ));
+        let ServerMessage::RoomList { rooms } = observer_events.recv().await.unwrap() else {
+            panic!("observer should receive lobby list");
+        };
+        assert!(rooms.is_empty());
+        assert!(matches!(
+            state.rooms.read().await.member_state(owner),
+            Err(RoomError::NotMember)
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_lobby_expiry_persistence_rolls_back_without_broadcast() {
+        let state = failing_persistence_state();
+        let owner = uuid::Uuid::new_v4();
+        let mut events = state.subscribe(owner);
+        {
+            let mut rooms = state.rooms.write().await;
+            let room = rooms
+                .create(
+                    owner,
+                    "Owner".into(),
+                    "room".into(),
+                    graphwar_protocol::RoomVisibility::Public,
+                    None,
+                )
+                .unwrap()
+                .0;
+            rooms.set_lobby_deadline_at(room.id, 0);
+        }
+
+        state.expire_turns().await;
+
+        assert!(state.rooms.read().await.member_state(owner).is_ok());
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
         ));
     }
 

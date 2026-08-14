@@ -817,42 +817,52 @@ async function browserFlows() {
       return first && second && first.top < second.top && document.documentElement.scrollWidth <= innerWidth;
     })()`, "mobile team roster stack");
     await a.cdp.command("Emulation.setDeviceMetricsOverride", {width: 1280, height: 800, deviceScaleFactor: 1, mobile: false});
+    const roomModeUi = await a.cdp.evaluate(`(() => ({
+      modePicker: Boolean(document.querySelector('.mode-picker')),
+      radioCount: document.querySelectorAll('input[name="game-mode"]').length,
+      hasFirstOrder: document.body.textContent.includes('First-order') || document.body.innerHTML.includes('first_order'),
+      hasSecondOrder: document.body.textContent.includes('Second-order') || document.body.innerHTML.includes('second_order'),
+    }))()`);
+    ok(roomModeUi && !roomModeUi.modePicker && roomModeUi.radioCount === 0
+      && !roomModeUi.hasFirstOrder && !roomModeUi.hasSecondOrder,
+    `staging should hide derivative mode controls: ${JSON.stringify(roomModeUi)}`);
     const roomChatLayout = await a.cdp.evaluate(`(() => {
       const panel = document.querySelector('.room-chat');
       const list = panel?.querySelector('ul');
       const form = panel?.querySelector('#chat-form');
       const rect = panel?.getBoundingClientRect();
+      const command = document.querySelector('.room-command')?.getBoundingClientRect();
       const styles = panel ? getComputedStyle(panel) : null;
       return {
         className: panel?.className ?? null,
         position: styles?.position ?? null,
-        bottomGap: rect ? innerHeight - rect.bottom : null,
+        inCommandRail: Boolean(panel?.closest('.room-command')),
         left: rect?.left ?? null,
         right: rect?.right ?? null,
         width: rect?.width ?? null,
+        commandTop: command?.top ?? null,
+        commandBottom: command?.bottom ?? null,
+        top: rect?.top ?? null,
+        bottom: rect?.bottom ?? null,
         viewport: [innerWidth, innerHeight],
         transform: styles?.transform ?? null,
-        backdropFilter: styles?.backdropFilter ?? styles?.webkitBackdropFilter ?? null,
-        backgroundColor: styles?.backgroundColor ?? null,
         overflowY: list ? getComputedStyle(list).overflowY : null,
         hasForm: Boolean(form),
       };
     })()`);
     ok(roomChatLayout?.className?.includes('field-log')
       && !roomChatLayout?.className?.includes('game-chat')
-      && roomChatLayout.position === 'fixed'
-      && roomChatLayout.bottomGap >= 0
-      && roomChatLayout.bottomGap <= 32
+      && roomChatLayout.position !== 'fixed'
+      && roomChatLayout.inCommandRail
       && roomChatLayout.left >= 0
-      && roomChatLayout.left <= 24
       && roomChatLayout.right <= roomChatLayout.viewport[0]
       && roomChatLayout.width <= 440
+      && roomChatLayout.top >= roomChatLayout.commandTop - 1
+      && roomChatLayout.bottom <= roomChatLayout.commandBottom + 1
       && roomChatLayout.transform === 'none'
-      && roomChatLayout.backdropFilter !== 'none'
-      && /^rgba\([^,]+,[^,]+,[^,]+,\s*0\.[0-9]+\)$/.test(roomChatLayout.backgroundColor)
       && roomChatLayout.overflowY === 'auto'
       && roomChatLayout.hasForm,
-    `room chat should be fixed at the viewport bottom: ${JSON.stringify(roomChatLayout)}`);
+    `room chat should live in the command rail: ${JSON.stringify(roomChatLayout)}`);
     const roomChatOverflow = await a.cdp.evaluate(`(() => {
       const panel = document.querySelector('.room-chat');
       const list = panel?.querySelector('ul');
@@ -898,19 +908,15 @@ async function browserFlows() {
       && roomChatOverflow.second.scrollHeight > roomChatOverflow.second.clientHeight
       && roomChatOverflow.second.scrollTop > 0
       && roomChatOverflow.second.overflowY === 'auto'
-      && roomChatOverflow.second.maxHeight === 'none'
-      && roomChatOverflow.second.panelPosition === 'fixed'
-      && roomChatOverflow.second.panelBottomGap >= 0
-      && roomChatOverflow.second.panelBottomGap <= 32
+      && roomChatOverflow.second.panelPosition !== 'fixed'
       && roomChatOverflow.second.formInside
-      && Math.abs(roomChatOverflow.first.panelHeight - roomChatOverflow.empty.panelHeight) < 1
+      && roomChatOverflow.first.panelHeight >= roomChatOverflow.empty.panelHeight
       && Math.abs(roomChatOverflow.second.panelHeight - roomChatOverflow.first.panelHeight) < 1
       && Math.abs(roomChatOverflow.second.formTop - roomChatOverflow.first.formTop) < 1
-      && Math.abs(roomChatOverflow.second.shellHeight - roomChatOverflow.first.shellHeight) < 1
       && Math.abs(roomChatOverflow.second.gridHeight - roomChatOverflow.first.gridHeight) < 1
-      && Math.abs(roomChatOverflow.second.documentHeight - roomChatOverflow.first.documentHeight) < 1
+      && roomChatOverflow.second.documentHeight >= roomChatOverflow.first.documentHeight
       && !roomChatOverflow.second.horizontalOverflow,
-    `room chat should scroll without growing the room layout: ${JSON.stringify(roomChatOverflow)}`);
+    `room chat should scroll inside normal flow: ${JSON.stringify(roomChatOverflow)}`);
     await a.cdp.command("Emulation.setDeviceMetricsOverride", {width: 390, height: 844, deviceScaleFactor: 1, mobile: true});
     const mobileRoomChat = await a.cdp.evaluate(`(() => {
       const panel = document.querySelector('.room-chat');
@@ -943,20 +949,17 @@ async function browserFlows() {
       return result;
     })()`);
     ok(mobileRoomChat
-      && mobileRoomChat.position === 'fixed'
+      && mobileRoomChat.position !== 'fixed'
       && mobileRoomChat.overflowY === 'auto'
       && mobileRoomChat.scrollHeight > mobileRoomChat.clientHeight
       && mobileRoomChat.scrollTop > 0
-      && mobileRoomChat.bottomGap >= 0
-      && mobileRoomChat.bottomGap <= 32
       && mobileRoomChat.left >= 0
-      && mobileRoomChat.left <= 16
       && mobileRoomChat.right <= mobileRoomChat.viewportWidth
       && mobileRoomChat.width <= mobileRoomChat.viewportWidth
       && mobileRoomChat.transform === 'none'
       && mobileRoomChat.formInside
       && !mobileRoomChat.horizontalOverflow,
-    `mobile room chat should remain bounded and usable: ${JSON.stringify(mobileRoomChat)}`);
+    `mobile room chat should remain bounded in normal flow: ${JSON.stringify(mobileRoomChat)}`);
     await a.cdp.command("Emulation.setDeviceMetricsOverride", {width: 1280, height: 800, deviceScaleFactor: 1, mobile: false});
     ok(await a.cdp.evaluate(`(() => {
       const input = document.querySelector('#chat-input');
