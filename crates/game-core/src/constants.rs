@@ -20,3 +20,6 @@ pub const MAX_ANGLE_LOOPS: usize = 100;
 pub const MAX_PLAYERS: usize = 10;
 pub const MAX_SOLDIERS_PER_PLAYER: usize = 4;
 pub const INITIAL_NUM_SOLDIERS: usize = 2;
+pub const MAX_PRACTICE_TERRAIN_CIRCLES: usize = 64;
+pub const MAX_GAME_TERRAIN_CIRCLES: usize = 512;
+pub const PRACTICE_TERRAIN_RADII: [f64; 3] = [20.0, 40.0, 70.0];

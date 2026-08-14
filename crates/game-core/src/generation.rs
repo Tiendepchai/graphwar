@@ -28,8 +28,10 @@ impl SeededGenerator {
         (-2.0 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * self.unit()).cos()
     }
     pub fn terrain(&mut self) -> Vec<Circle> {
-        let count =
-            (NUM_CIRCLES_MEAN + NUM_CIRCLES_STANDARD_DEVIATION * self.gaussian()).max(0.0) as usize;
+        // ponytail: this cap bounds wire/persistence size; raise with the server payload cap if denser maps are added.
+        let count = ((NUM_CIRCLES_MEAN + NUM_CIRCLES_STANDARD_DEVIATION * self.gaussian()).max(0.0)
+            as usize)
+            .min(MAX_GAME_TERRAIN_CIRCLES);
         (0..count)
             .map(|_| Circle {
                 x: self.unit() * PLANE_LENGTH as f64,

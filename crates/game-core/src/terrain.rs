@@ -32,13 +32,13 @@ impl Terrain {
         }
     }
     pub fn collides_point(&self, x: f64, y: f64) -> bool {
-        !(0.0..PLANE_LENGTH as f64).contains(&x)
-            || !(0.0..PLANE_HEIGHT as f64).contains(&y)
-            || (self.circles.iter().any(|circle| circle.contains(x, y))
-                && !self
-                    .explosions
-                    .iter()
-                    .any(|explosion| explosion.contains(x, y)))
+        x.is_finite()
+            && y.is_finite()
+            && self.circles.iter().any(|circle| circle.contains(x, y))
+            && !self
+                .explosions
+                .iter()
+                .any(|explosion| explosion.contains(x, y))
     }
     pub fn collides_circle(&self, x: f64, y: f64, radius: f64) -> bool {
         let subject = Circle { x, y, radius };
@@ -59,7 +59,7 @@ impl Terrain {
     }
     pub fn segment_collision_point(&self, from: (f64, f64), to: (f64, f64)) -> Option<(f64, f64)> {
         if !from.0.is_finite() || !from.1.is_finite() || !to.0.is_finite() || !to.1.is_finite() {
-            return Some(from);
+            return None;
         }
         if self.collides_point(from.0, from.1) {
             return Some(from);
@@ -114,6 +114,15 @@ mod tests {
         }]);
         assert!(terrain.segment_collides((0.0, 20.0), (40.0, 20.0)));
     }
+    #[test]
+    fn world_boundary_is_not_terrain() {
+        let terrain = Terrain::default();
+        assert!(!terrain.collides_point(-1.0, 20.0));
+        assert!(!terrain.collides_point(PLANE_LENGTH as f64, 20.0));
+        assert!(!terrain.segment_collides((760.0, 20.0), (780.0, 20.0)));
+        assert!(terrain.collides_circle(-1.0, 20.0, 2.0));
+    }
+
     #[test]
     fn explosions_cut_existing_terrain() {
         let mut terrain = Terrain::new(vec![Circle {

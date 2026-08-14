@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 10;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RegisterRequest {
@@ -48,6 +48,14 @@ pub enum GameMode {
     SecondOrder,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomKind {
+    #[default]
+    Standard,
+    Practice,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PlayerSnapshot {
     pub id: Uuid,
@@ -68,6 +76,8 @@ pub struct RoomSnapshot {
     pub phase: Phase,
     pub revision: u64,
     pub mode: GameMode,
+    #[serde(default)]
+    pub kind: RoomKind,
     pub players: Vec<PlayerSnapshot>,
 }
 
@@ -76,6 +86,24 @@ pub struct TerrainCircle {
     pub x: f64,
     pub y: f64,
     pub radius: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SetupPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PracticePlayerPlacement {
+    pub player_id: Uuid,
+    pub soldiers: Vec<SetupPoint>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PracticeSetup {
+    pub terrain: Vec<TerrainCircle>,
+    pub players: Vec<PracticePlayerPlacement>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -122,6 +150,8 @@ pub struct GameSnapshot {
     pub room_id: Uuid,
     pub revision: u64,
     pub mode: GameMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winner_team: Option<u8>,
     pub turn_player_id: Option<Uuid>,
     pub turn_deadline_at: Option<i64>,
     pub soldiers: Vec<SoldierPosition>,
@@ -131,11 +161,33 @@ pub struct GameSnapshot {
     pub shot_history: Vec<ShotHistoryEntry>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShotMissReason {
+    WorldExit,
+    Numerical,
+    StepLimit,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum ShotOutcome {
+    TerrainImpact {
+        explosion: TerrainCircle,
+        hits: Vec<SoldierSnapshot>,
+    },
+    Miss {
+        reason: ShotMissReason,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        hits: Vec<SoldierSnapshot>,
+    },
+    Forfeit,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ShotResolved {
     pub path: Vec<(f64, f64)>,
-    pub hits: Vec<SoldierSnapshot>,
-    pub explosion: Option<TerrainCircle>,
+    pub outcome: ShotOutcome,
     pub winner_team: Option<u8>,
     pub game: GameSnapshot,
 }
@@ -150,6 +202,8 @@ pub enum ClientMessage {
     CreateRoom {
         name: String,
         visibility: RoomVisibility,
+        #[serde(default)]
+        kind: RoomKind,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         password: Option<String>,
     },
@@ -158,6 +212,7 @@ pub enum ClientMessage {
         invite: Option<String>,
     },
     LeaveRoom,
+    ReturnToLobby,
     SetReady {
         ready: bool,
     },
@@ -171,6 +226,10 @@ pub enum ClientMessage {
     SetSoldiers {
         player_id: Uuid,
         soldiers: u8,
+    },
+    SetPracticeSetup {
+        base_revision: u64,
+        setup: PracticeSetup,
     },
     AddBot {
         level: u8,
@@ -205,9 +264,13 @@ pub enum ServerMessage {
     RoomCreated {
         snapshot: RoomSnapshot,
         invite: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        practice_setup: Option<PracticeSetup>,
     },
     Room {
         snapshot: RoomSnapshot,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        practice_setup: Option<PracticeSetup>,
     },
     RoomList {
         rooms: Vec<RoomSnapshot>,
@@ -231,6 +294,8 @@ pub enum ServerMessage {
     StateSync {
         snapshot: RoomSnapshot,
         game: Option<GameSnapshot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        practice_setup: Option<PracticeSetup>,
         chat_history: Vec<ChatEntry>,
     },
     LeftRoom,
@@ -256,7 +321,7 @@ mod tests {
             version: PROTOCOL_VERSION,
         };
         let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(json, r#"{"type":"hello","payload":{"version":7}}"#);
+        assert_eq!(json, r#"{"type":"hello","payload":{"version":10}}"#);
         let snap = SnapshotEnvelope {
             version: PROTOCOL_VERSION,
             sequence: 3,
@@ -274,6 +339,7 @@ mod tests {
         let message = ClientMessage::CreateRoom {
             name: "Protected".into(),
             visibility: RoomVisibility::Private,
+            kind: RoomKind::Practice,
             password: Some("room secret".into()),
         };
         let json = serde_json::to_string(&message).unwrap();
@@ -289,8 +355,131 @@ mod tests {
             ClientMessage::CreateRoom {
                 name: "Public".into(),
                 visibility: RoomVisibility::Public,
+                kind: RoomKind::Standard,
                 password: None,
             }
+        );
+    }
+
+    #[test]
+    fn room_kind_and_practice_setup_round_trip() {
+        let player_id = Uuid::new_v4();
+        let setup = PracticeSetup {
+            terrain: vec![TerrainCircle {
+                x: 100.0,
+                y: 120.0,
+                radius: 40.0,
+            }],
+            players: vec![PracticePlayerPlacement {
+                player_id,
+                soldiers: vec![SetupPoint { x: 30.0, y: 40.0 }],
+            }],
+        };
+        let message = ClientMessage::SetPracticeSetup {
+            base_revision: 4,
+            setup: setup.clone(),
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&json).unwrap(),
+            message
+        );
+        assert!(!json.contains("alive"));
+        assert!(!json.contains("active"));
+        assert!(!json.contains("team"));
+        assert!(!json.contains("terrain_cuts"));
+
+        let room = ServerMessage::Room {
+            snapshot: RoomSnapshot {
+                id: Uuid::new_v4(),
+                name: "Practice".into(),
+                visibility: RoomVisibility::Public,
+                phase: Phase::Lobby,
+                revision: 4,
+                mode: GameMode::Function,
+                kind: RoomKind::Practice,
+                players: Vec::new(),
+            },
+            practice_setup: Some(setup),
+        };
+        let json = serde_json::to_string(&room).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), room);
+    }
+
+    #[test]
+    fn maximum_valid_practice_room_fits_inbound_and_outbound_limits() {
+        let room_id = Uuid::new_v4();
+        let players = (0..10)
+            .map(|index| PlayerSnapshot {
+                id: Uuid::new_v4(),
+                display_name: "x".repeat(32),
+                owner: index == 0,
+                ready: false,
+                team: if index % 2 == 0 { 1 } else { 2 },
+                soldiers: 4,
+                is_bot: index != 0,
+            })
+            .collect::<Vec<_>>();
+        let setup = PracticeSetup {
+            terrain: (0..64)
+                .map(|index| TerrainCircle {
+                    x: 70.0 + f64::from(index % 8) * 80.0,
+                    y: 70.0 + f64::from(index / 8) * 40.0,
+                    radius: 20.0,
+                })
+                .collect(),
+            players: players
+                .iter()
+                .enumerate()
+                .map(|(player_index, player)| PracticePlayerPlacement {
+                    player_id: player.id,
+                    soldiers: (0..4)
+                        .map(|soldier_index| SetupPoint {
+                            x: 10.0 + (player_index * 4 + soldier_index) as f64 * 20.0,
+                            y: 430.0,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        };
+        let snapshot = RoomSnapshot {
+            id: room_id,
+            name: "x".repeat(64),
+            visibility: RoomVisibility::Public,
+            phase: Phase::Lobby,
+            revision: u64::MAX - 1,
+            mode: GameMode::SecondOrder,
+            kind: RoomKind::Practice,
+            players,
+        };
+        let inbound = serde_json::to_vec(&ClientMessage::SetPracticeSetup {
+            base_revision: u64::MAX - 1,
+            setup: setup.clone(),
+        })
+        .unwrap();
+        let outbound = serde_json::to_vec(&ServerMessage::Room {
+            snapshot,
+            practice_setup: Some(setup),
+        })
+        .unwrap();
+        assert!(
+            inbound.len() <= 8 * 1024,
+            "{} byte practice input",
+            inbound.len()
+        );
+        assert!(
+            outbound.len() <= 1024 * 1024,
+            "{} byte practice room",
+            outbound.len()
+        );
+    }
+
+    #[test]
+    fn old_room_snapshot_defaults_to_standard() {
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000001","name":"Old","visibility":"public","phase":"lobby","revision":0,"mode":"function","players":[]}"#;
+        assert_eq!(
+            serde_json::from_str::<RoomSnapshot>(json).unwrap().kind,
+            RoomKind::Standard
         );
     }
 
@@ -325,6 +514,7 @@ mod tests {
             ClientMessage::AddBot { level: 4 },
             ClientMessage::RemoveBot { player_id: bot },
             ClientMessage::KickPlayer { player_id: bot },
+            ClientMessage::ReturnToLobby,
         ] {
             let json = serde_json::to_string(&message).unwrap();
             assert_eq!(
@@ -341,14 +531,43 @@ mod tests {
     }
 
     #[test]
-    fn old_game_snapshot_defaults_to_empty_shot_history() {
+    fn old_game_snapshot_defaults_optional_fields() {
         let json = r#"{"room_id":"00000000-0000-0000-0000-000000000001","revision":1,"mode":"function","turn_player_id":null,"turn_deadline_at":null,"soldiers":[],"terrain":[],"terrain_cuts":[]}"#;
-        assert!(
-            serde_json::from_str::<GameSnapshot>(json)
-                .unwrap()
-                .shot_history
-                .is_empty()
+        let snapshot = serde_json::from_str::<GameSnapshot>(json).unwrap();
+        assert_eq!(snapshot.winner_team, None);
+        assert!(snapshot.shot_history.is_empty());
+    }
+
+    #[test]
+    fn return_to_lobby_has_exact_json() {
+        let json = serde_json::to_string(&ClientMessage::ReturnToLobby).unwrap();
+        assert_eq!(json, r#"{"type":"return_to_lobby"}"#);
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&json).unwrap(),
+            ClientMessage::ReturnToLobby
         );
+    }
+
+    #[test]
+    fn finished_snapshot_winner_round_trips() {
+        let snapshot = GameSnapshot {
+            room_id: Uuid::new_v4(),
+            revision: 4,
+            mode: GameMode::Function,
+            winner_team: Some(2),
+            turn_player_id: None,
+            turn_deadline_at: None,
+            soldiers: Vec::new(),
+            terrain: Vec::new(),
+            terrain_cuts: Vec::new(),
+            shot_history: Vec::new(),
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert_eq!(
+            serde_json::from_str::<GameSnapshot>(&json).unwrap(),
+            snapshot
+        );
+        assert!(json.contains("\"winner_team\":2"));
     }
 
     #[test]
@@ -380,6 +599,46 @@ mod tests {
             message
         );
         assert!(json.contains("\"sequence\":7"));
+    }
+
+    #[test]
+    fn shot_outcomes_are_tagged_and_round_trip() {
+        let outcomes = [
+            ShotOutcome::TerrainImpact {
+                explosion: TerrainCircle {
+                    x: 1.0,
+                    y: 2.0,
+                    radius: 3.0,
+                },
+                hits: Vec::new(),
+            },
+            ShotOutcome::Miss {
+                reason: ShotMissReason::WorldExit,
+                hits: Vec::new(),
+            },
+            ShotOutcome::Miss {
+                reason: ShotMissReason::WorldExit,
+                hits: vec![SoldierSnapshot {
+                    player_id: Uuid::new_v4(),
+                    index: 0,
+                    team: 2,
+                    alive: false,
+                }],
+            },
+            ShotOutcome::Miss {
+                reason: ShotMissReason::Numerical,
+                hits: Vec::new(),
+            },
+            ShotOutcome::Miss {
+                reason: ShotMissReason::StepLimit,
+                hits: Vec::new(),
+            },
+            ShotOutcome::Forfeit,
+        ];
+        for outcome in outcomes {
+            let json = serde_json::to_string(&outcome).unwrap();
+            assert_eq!(serde_json::from_str::<ShotOutcome>(&json).unwrap(), outcome);
+        }
     }
 
     #[test]

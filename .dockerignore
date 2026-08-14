@@ -2,7 +2,4 @@
 .claude/
 .codegraph/
 target/
-bin/
-*.jar
-*.class
 .DS_Store

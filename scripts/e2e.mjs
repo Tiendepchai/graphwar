@@ -24,7 +24,7 @@ const CHROME_CANDIDATES = process.env.CHROME_BIN
           `${process.env["PROGRAMFILES(X86)"] ?? "C:\\Program Files (x86)"}\\Google\\Chrome\\Application\\chrome.exe`,
         ]
       : ["google-chrome", "chromium", "chromium-browser"];
-const PROTOCOL_VERSION = 7;
+const PROTOCOL_VERSION = 10;
 const CAPTURE_PATH = process.env.E2E_CAPTURE_PATH ? path.resolve(process.env.E2E_CAPTURE_PATH) : null;
 const timeoutMs = Number(process.env.E2E_TIMEOUT_MS ?? 15_000);
 if (BASE.protocol === "https:" && process.env.E2E_TLS_VERIFY === "false") {
@@ -275,6 +275,40 @@ async function openWs(cookie, origin = ORIGIN) {
   return socket;
 }
 
+async function nextWsMessage(socket, type, label) {
+  return nextWsMessageAny(socket, [type], label);
+}
+
+async function nextWsMessageAny(socket, types, label) {
+  for (;;) {
+    const message = JSON.parse((await socket.next(label)).text);
+    if (types.includes(message.type)) return message;
+  }
+}
+
+function browserWsMessage(cdp, type, label) {
+  return browserWsMessageAny(cdp, [type], label);
+}
+
+function browserWsMessageAny(cdp, types, label) {
+  return browserWsFrameAny(cdp, "Network.webSocketFrameReceived", types, label);
+}
+
+function browserWsSentMessageAny(cdp, types, label) {
+  return browserWsFrameAny(cdp, "Network.webSocketFrameSent", types, label);
+}
+
+function browserWsFrameAny(cdp, event, types, label) {
+  return withTimeout(new Promise(resolve => {
+    cdp.on(event, ({response}) => {
+      try {
+        const message = JSON.parse(response.payloadData);
+        if (types.includes(message.type)) resolve(message);
+      } catch {}
+    });
+  }), timeoutMs, label);
+}
+
 async function wsBoundaryChecks(session) {
   const missing = await socketConnect(wsUrl(), {Origin: ORIGIN});
   ok(missing.status !== 101, "unauthenticated websocket upgraded");
@@ -317,16 +351,13 @@ async function wsBoundaryChecks(session) {
   oversized.close();
 
   const rate = await openWs(session.cookie);
-  for (let index = 0; index < 121; index++) rate.sendText("not-json");
   let rateLimited = false;
-  for (let index = 0; index < 121; index++) {
+  for (let index = 0; index < 130 && !rateLimited; index++) {
+    rate.sendText("not-json");
     const frame = await rate.next("rate limit response");
     if (frame.opcode !== 0x1) continue;
     const message = JSON.parse(frame.text);
-    if (message.type === "error" && message.payload.code === "rate_limited") {
-      rateLimited = true;
-      break;
-    }
+    rateLimited = message.type === "error" && message.payload.code === "rate_limited";
   }
   ok(rateLimited, "websocket rate limit did not return rate_limited");
   rate.close();
@@ -439,17 +470,22 @@ async function browserWait(cdp, expression, label, ms = timeoutMs) {
   throw new Error(`browser wait failed: ${label}`);
 }
 
-async function browserExpireSession(browser) {
-  const cookie = (await browser.cdp.command("Network.getAllCookies")).cookies
+async function browserSessionCookie(cdp) {
+  const cookie = (await cdp.command("Network.getAllCookies")).cookies
     .find(cookie => cookie.name === "graphwar_session");
   ok(cookie, "browser session cookie unavailable");
+  return `${cookie.name}=${cookie.value}`;
+}
+
+async function browserExpireSession(browser) {
+  const cookie = await browserSessionCookie(browser.cdp);
   const session = await request("/auth/me", {
-    headers: {cookie: `${cookie.name}=${cookie.value}`},
+    headers: {cookie},
   });
   ok(session.ok, "browser session authentication unavailable");
   const logout = await request("/auth/logout", {
     method: "POST",
-    headers: {cookie: `${cookie.name}=${cookie.value}`},
+    headers: {cookie},
   });
   ok(logout.status === 204, "external session revocation failed");
 }
@@ -457,6 +493,10 @@ async function browserExpireSession(browser) {
 async function browserSet(cdp, selector, value) {
   const expression = `(() => { const e = document.querySelector(${JSON.stringify(selector)}); if (!e) return false; const setter = Object.getOwnPropertyDescriptor(e.constructor.prototype, "value")?.set; setter?.call(e, ${JSON.stringify(value)}); e.dispatchEvent(new Event("input", {bubbles:true})); e.dispatchEvent(new Event("change", {bubbles:true})); return true; })()`;
   ok(await cdp.evaluate(expression), `missing browser input ${selector}`);
+}
+async function browserSetPlayerSoldiers(cdp, name, value) {
+  const expression = `(() => { const row = [...document.querySelectorAll('.player-slot')].find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(name)}); const e = row?.querySelector('.player-soldiers:not(:disabled)'); if (!e) return false; const setter = Object.getOwnPropertyDescriptor(e.constructor.prototype, "value")?.set; setter?.call(e, ${JSON.stringify(value)}); e.dispatchEvent(new Event("input", {bubbles:true})); e.dispatchEvent(new Event("change", {bubbles:true})); return true; })()`;
+  ok(await cdp.evaluate(expression), `missing soldier count control for ${name}`);
 }
 async function browserSubmit(cdp, selector) { ok(await cdp.evaluate(`(() => { const e = document.querySelector(${JSON.stringify(selector)}); if (!e) return false; e.requestSubmit(); return true; })()`), `missing form ${selector}`); }
 async function browserClick(cdp, selector) { ok(await cdp.evaluate(`(() => { const e = document.querySelector(${JSON.stringify(selector)}); if (!e) return false; e.click(); return true; })()`), `missing control ${selector}`); }
@@ -541,9 +581,10 @@ async function browserOpenCreate(cdp) {
   await browserClick(cdp, "#create-room-open");
   await browserWait(cdp, "document.querySelector('#create-room-dialog')?.open === true && document.activeElement?.id === 'room-name'", "create room dialog");
 }
-async function browserCreate(cdp, name, visibility, password = "") {
+async function browserCreate(cdp, name, visibility, password = "", kind = "standard") {
   await browserOpenCreate(cdp);
   await browserSet(cdp, "#room-name", name);
+  await browserSet(cdp, "#room-kind", kind);
   await cdp.evaluate(`document.querySelector('#room-visibility').value = ${JSON.stringify(visibility)}; document.querySelector('#room-visibility').dispatchEvent(new Event('change',{bubbles:true}))`);
   if (visibility === "private") await browserSet(cdp, "#room-password", password);
   await browserSubmit(cdp, "#create-room-form");
@@ -776,42 +817,52 @@ async function browserFlows() {
       return first && second && first.top < second.top && document.documentElement.scrollWidth <= innerWidth;
     })()`, "mobile team roster stack");
     await a.cdp.command("Emulation.setDeviceMetricsOverride", {width: 1280, height: 800, deviceScaleFactor: 1, mobile: false});
+    const roomModeUi = await a.cdp.evaluate(`(() => ({
+      modePicker: Boolean(document.querySelector('.mode-picker')),
+      radioCount: document.querySelectorAll('input[name="game-mode"]').length,
+      hasFirstOrder: document.body.textContent.includes('First-order') || document.body.innerHTML.includes('first_order'),
+      hasSecondOrder: document.body.textContent.includes('Second-order') || document.body.innerHTML.includes('second_order'),
+    }))()`);
+    ok(roomModeUi && !roomModeUi.modePicker && roomModeUi.radioCount === 0
+      && !roomModeUi.hasFirstOrder && !roomModeUi.hasSecondOrder,
+    `staging should hide derivative mode controls: ${JSON.stringify(roomModeUi)}`);
     const roomChatLayout = await a.cdp.evaluate(`(() => {
       const panel = document.querySelector('.room-chat');
       const list = panel?.querySelector('ul');
       const form = panel?.querySelector('#chat-form');
       const rect = panel?.getBoundingClientRect();
+      const command = document.querySelector('.room-command')?.getBoundingClientRect();
       const styles = panel ? getComputedStyle(panel) : null;
       return {
         className: panel?.className ?? null,
         position: styles?.position ?? null,
-        bottomGap: rect ? innerHeight - rect.bottom : null,
+        inCommandRail: Boolean(panel?.closest('.room-command')),
         left: rect?.left ?? null,
         right: rect?.right ?? null,
         width: rect?.width ?? null,
+        commandTop: command?.top ?? null,
+        commandBottom: command?.bottom ?? null,
+        top: rect?.top ?? null,
+        bottom: rect?.bottom ?? null,
         viewport: [innerWidth, innerHeight],
         transform: styles?.transform ?? null,
-        backdropFilter: styles?.backdropFilter ?? styles?.webkitBackdropFilter ?? null,
-        backgroundColor: styles?.backgroundColor ?? null,
         overflowY: list ? getComputedStyle(list).overflowY : null,
         hasForm: Boolean(form),
       };
     })()`);
     ok(roomChatLayout?.className?.includes('field-log')
       && !roomChatLayout?.className?.includes('game-chat')
-      && roomChatLayout.position === 'fixed'
-      && roomChatLayout.bottomGap >= 0
-      && roomChatLayout.bottomGap <= 32
+      && roomChatLayout.position !== 'fixed'
+      && roomChatLayout.inCommandRail
       && roomChatLayout.left >= 0
-      && roomChatLayout.left <= 24
       && roomChatLayout.right <= roomChatLayout.viewport[0]
       && roomChatLayout.width <= 440
+      && roomChatLayout.top >= roomChatLayout.commandTop - 1
+      && roomChatLayout.bottom <= roomChatLayout.commandBottom + 1
       && roomChatLayout.transform === 'none'
-      && roomChatLayout.backdropFilter !== 'none'
-      && /^rgba\([^,]+,[^,]+,[^,]+,\s*0\.[0-9]+\)$/.test(roomChatLayout.backgroundColor)
       && roomChatLayout.overflowY === 'auto'
       && roomChatLayout.hasForm,
-    `room chat should be fixed at the viewport bottom: ${JSON.stringify(roomChatLayout)}`);
+    `room chat should live in the command rail: ${JSON.stringify(roomChatLayout)}`);
     const roomChatOverflow = await a.cdp.evaluate(`(() => {
       const panel = document.querySelector('.room-chat');
       const list = panel?.querySelector('ul');
@@ -857,19 +908,15 @@ async function browserFlows() {
       && roomChatOverflow.second.scrollHeight > roomChatOverflow.second.clientHeight
       && roomChatOverflow.second.scrollTop > 0
       && roomChatOverflow.second.overflowY === 'auto'
-      && roomChatOverflow.second.maxHeight === 'none'
-      && roomChatOverflow.second.panelPosition === 'fixed'
-      && roomChatOverflow.second.panelBottomGap >= 0
-      && roomChatOverflow.second.panelBottomGap <= 32
+      && roomChatOverflow.second.panelPosition !== 'fixed'
       && roomChatOverflow.second.formInside
-      && Math.abs(roomChatOverflow.first.panelHeight - roomChatOverflow.empty.panelHeight) < 1
+      && roomChatOverflow.first.panelHeight >= roomChatOverflow.empty.panelHeight
       && Math.abs(roomChatOverflow.second.panelHeight - roomChatOverflow.first.panelHeight) < 1
       && Math.abs(roomChatOverflow.second.formTop - roomChatOverflow.first.formTop) < 1
-      && Math.abs(roomChatOverflow.second.shellHeight - roomChatOverflow.first.shellHeight) < 1
       && Math.abs(roomChatOverflow.second.gridHeight - roomChatOverflow.first.gridHeight) < 1
-      && Math.abs(roomChatOverflow.second.documentHeight - roomChatOverflow.first.documentHeight) < 1
+      && roomChatOverflow.second.documentHeight >= roomChatOverflow.first.documentHeight
       && !roomChatOverflow.second.horizontalOverflow,
-    `room chat should scroll without growing the room layout: ${JSON.stringify(roomChatOverflow)}`);
+    `room chat should scroll inside normal flow: ${JSON.stringify(roomChatOverflow)}`);
     await a.cdp.command("Emulation.setDeviceMetricsOverride", {width: 390, height: 844, deviceScaleFactor: 1, mobile: true});
     const mobileRoomChat = await a.cdp.evaluate(`(() => {
       const panel = document.querySelector('.room-chat');
@@ -902,20 +949,17 @@ async function browserFlows() {
       return result;
     })()`);
     ok(mobileRoomChat
-      && mobileRoomChat.position === 'fixed'
+      && mobileRoomChat.position !== 'fixed'
       && mobileRoomChat.overflowY === 'auto'
       && mobileRoomChat.scrollHeight > mobileRoomChat.clientHeight
       && mobileRoomChat.scrollTop > 0
-      && mobileRoomChat.bottomGap >= 0
-      && mobileRoomChat.bottomGap <= 32
       && mobileRoomChat.left >= 0
-      && mobileRoomChat.left <= 16
       && mobileRoomChat.right <= mobileRoomChat.viewportWidth
       && mobileRoomChat.width <= mobileRoomChat.viewportWidth
       && mobileRoomChat.transform === 'none'
       && mobileRoomChat.formInside
       && !mobileRoomChat.horizontalOverflow,
-    `mobile room chat should remain bounded and usable: ${JSON.stringify(mobileRoomChat)}`);
+    `mobile room chat should remain bounded in normal flow: ${JSON.stringify(mobileRoomChat)}`);
     await a.cdp.command("Emulation.setDeviceMetricsOverride", {width: 1280, height: 800, deviceScaleFactor: 1, mobile: false});
     ok(await a.cdp.evaluate(`(() => {
       const input = document.querySelector('#chat-input');
@@ -981,12 +1025,15 @@ async function browserFlows() {
           const y = Number.parseFloat(label.style.getPropertyValue('--soldier-y'));
           const soldierX = fieldRect?.left + fieldRect?.width * x / 100;
           const soldierY = fieldRect?.top + fieldRect?.height * y / 100;
+          const horizontalGap = Math.max(0, labelRect.left - soldierX, soldierX - labelRect.right);
+          const verticalGap = Math.max(0, labelRect.top - soldierY, soldierY - labelRect.bottom);
           return label.dataset.playerId
             && /^\\d+$/.test(label.dataset.soldierIndex)
             && Number.isFinite(soldierX) && Number.isFinite(soldierY)
             && labelRect.left >= fieldRect.left && labelRect.right <= fieldRect.right
-            && labelRect.top >= fieldRect.top && labelRect.bottom < soldierY
-            && Math.abs(labelRect.left + labelRect.width / 2 - soldierX) <= labelRect.width / 2 + 4;
+            && labelRect.top >= fieldRect.top && labelRect.bottom <= fieldRect.bottom
+            && horizontalGap <= 80
+            && verticalGap <= 32;
         });
         const activeStyle = activeLabel && getComputedStyle(activeLabel);
         const passiveLabel = labels.find(label => !label.classList.contains('is-active'));
@@ -1111,10 +1158,12 @@ async function browserFlows() {
     for (const cdp of [a.cdp, b.cdp]) await browserInstallGameRenderProbe(cdp);
     const previewExceptions = [];
     active.on("Runtime.exceptionThrown", ({exceptionDetails}) => previewExceptions.push(exceptionDetails.text ?? "browser exception"));
-    await browserSet(active, "#function-input", "x+");
-    await browserWait(active, "document.querySelector('#function-error')?.textContent === 'Invalid function'", "invalid preview error");
+    await browserSet(active, "#function-input", String.raw`\unknown{x}`);
+    await browserWait(active, "document.querySelector('#function-error')?.textContent.includes('byte 0')", "malformed LaTeX preview error");
+    await browserSet(active, "#function-input", String.raw`\frac{\sin(x)}{\sqrt{2}}`);
+    await browserWait(active, "document.querySelector('#function-error')?.textContent === ''", "nested LaTeX preview recovery");
     await browserSet(active, "#function-input", "sin(x)");
-    await browserWait(active, "document.querySelector('#function-error')?.textContent === ''", "valid preview recovery");
+    await browserWait(active, "document.querySelector('#function-error')?.textContent === ''", "plain preview recovery");
     ok(await active.evaluate(`(() => {
       const input = document.querySelector('#function-input');
       input?.focus();
@@ -1153,6 +1202,14 @@ async function browserFlows() {
     await browserSubmit(active, "#fire-form");
     await browserWait(active, "document.querySelector('#turn-timer')?.textContent.includes('Resolving')", "authoritative shot", 20_000);
     await browserWait(inactive, "document.querySelector('#turn-timer')?.textContent.includes('Resolving')", "remote authoritative shot", 20_000);
+    for (const cdp of [active, inactive]) {
+      await browserWait(cdp, "document.querySelector('#shot-status')?.textContent.trim().length > 0", "visible shot outcome", 20_000);
+      ok(await cdp.evaluate(`(() => {
+        const status = document.querySelector('#shot-status');
+        return status?.getAttribute('role') === 'status'
+          && status?.getAttribute('aria-live') === 'polite';
+      })()`), "shot outcome status semantics missing");
+    }
     for (const cdp of [active, inactive]) {
       ok(await cdp.evaluate(`(() => {
         const button = document.querySelector('.fire-button');
@@ -1229,6 +1286,172 @@ async function browserFlows() {
     await b.cdp.command("Page.reload");
     await browserWait(b.cdp, "Boolean(document.querySelector('#login-form'))", "logout survives reload");
     log("two-browser public room, chat, setup, readiness, start, fire, refresh, logout: pass");
+
+    let e;
+    let f;
+    try {
+      e = await launchBrowser(BASE);
+      f = await launchBrowser(BASE);
+      const practiceOwner = browserUser("practice-owner");
+      const practiceGuest = browserUser("practice-guest");
+      await browserRegister(e, practiceOwner);
+      await browserRegister(f, practiceGuest);
+      await browserCreate(e.cdp, "Standard E2E", "public");
+      ok(!await e.cdp.evaluate("Boolean(document.querySelector('.practice-editor'))"), "standard room exposed practice editor");
+      await browserLeave(e.cdp);
+
+      const practiceName = `Practice E2E ${crypto.randomUUID().slice(0, 8)}`;
+      await browserCreate(e.cdp, practiceName, "public", "", "practice");
+      await browserWait(e.cdp, "Boolean(document.querySelector('.practice-editor') && document.querySelector('.practice-toolbar') && document.querySelector('#practice-soldier-form'))", "practice owner editor");
+      await browserWait(f.cdp, `Boolean([...document.querySelectorAll('.room-list li')].find(li => li.querySelector('strong')?.textContent === ${JSON.stringify(practiceName)}))`, "practice room listing");
+      const ownerPracticeJoin = browserWsMessage(e.cdp, "room", "practice owner join update");
+      const roomId = await f.cdp.evaluate(`(() => {
+        const row = [...document.querySelectorAll('.room-list li')]
+          .find(li => li.querySelector('strong')?.textContent === ${JSON.stringify(practiceName)});
+        const button = row?.querySelector('.join-room');
+        if (!button) return null;
+        const id = button.dataset.roomId;
+        button.click();
+        return id;
+      })()`);
+      ok(roomId, "practice join control missing");
+      await ownerPracticeJoin;
+      await browserWait(f.cdp, "Boolean(document.querySelector('.practice-editor'))", "practice guest editor");
+      ok(await f.cdp.evaluate("Boolean(document.querySelector('.practice-readonly')) && !document.querySelector('.practice-toolbar') && !document.querySelector('#practice-soldier-form')"), "practice guest editor is not read-only");
+
+      const practiceProtocol = await registerAndLogin("practice-protocol");
+      const practiceWs = await openWs(practiceProtocol.cookie);
+      try {
+        practiceWs.sendText(JSON.stringify({type: "join_room", payload: {room_id: roomId, invite: null}}));
+        const practiceJoined = await nextWsMessage(practiceWs, "room", "raw practice join");
+        ok(practiceJoined.payload.snapshot.kind === "practice", "raw practice guest joined wrong room kind");
+        practiceWs.sendText(JSON.stringify({
+          type: "set_practice_setup",
+          payload: {
+            base_revision: practiceJoined.payload.snapshot.revision,
+            setup: practiceJoined.payload.practice_setup,
+          },
+        }));
+        const rejected = await nextWsMessage(practiceWs, "error", "guest practice setup rejection");
+        ok(rejected.payload.code === "not_owner", "guest practice setup mutation was not rejected as not_owner");
+        practiceWs.sendText(JSON.stringify({type: "leave_room"}));
+        await nextWsMessage(practiceWs, "left_room", "raw practice guest leave");
+      } finally {
+        practiceWs.close();
+      }
+
+      await browserSetPlayerSoldiers(e.cdp, practiceOwner.display_name, "1");
+      await browserWait(e.cdp, `(() => {
+        const row = [...document.querySelectorAll('.player-slot')]
+          .find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(practiceOwner.display_name)});
+        return row?.querySelector('.player-soldiers')?.value === '1'
+          && document.querySelectorAll('#practice-soldier option').length === 3;
+      })()`, "practice owner one-soldier setup");
+      await browserSetPlayerSoldiers(f.cdp, practiceGuest.display_name, "1");
+      await browserWait(e.cdp, "document.querySelectorAll('#practice-soldier option').length === 2 && [...document.querySelectorAll('.player-soldiers')].every(select => select.value === '1')", "practice one-soldier setup");
+      await browserClick(e.cdp, "#ready-button");
+      await browserClick(f.cdp, "#ready-button");
+      await browserWait(e.cdp, "document.querySelector('#start-game')?.disabled === false", "practice ready before setup mutation");
+      const byPlayerName = name => `(() => [...document.querySelectorAll('#practice-soldier option')].find(option => option.textContent.startsWith(${JSON.stringify(name)} + ' ·'))?.value ?? null)()`;
+      const ownerSoldier = await e.cdp.evaluate(byPlayerName(practiceOwner.display_name));
+      const guestSoldier = await e.cdp.evaluate(byPlayerName(practiceGuest.display_name));
+      ok(ownerSoldier && guestSoldier, "practice soldier options missing");
+      await browserSet(e.cdp, "#practice-soldier", ownerSoldier);
+      await browserSet(e.cdp, "#practice-x", "100");
+      await browserSet(e.cdp, "#practice-y", "225");
+      await browserSubmit(e.cdp, "#practice-soldier-form");
+      await browserWait(e.cdp, "document.querySelector('#practice-status')?.textContent.startsWith('Blank terrain is valid')", "practice owner placement sync");
+      await browserSet(e.cdp, "#practice-soldier", guestSoldier);
+      await browserSet(e.cdp, "#practice-x", "130");
+      await browserSet(e.cdp, "#practice-y", "225");
+      await browserSubmit(e.cdp, "#practice-soldier-form");
+      await browserWait(e.cdp, "document.querySelector('#practice-status')?.textContent.startsWith('Blank terrain is valid')", "practice guest placement sync");
+      const terrainPoints = [{x: 72, y: 225}, {x: 158, y: 225}];
+      let mutatedSetup;
+      for (const point of terrainPoints) {
+        const practiceRoom = browserWsMessage(e.cdp, "room", "practice setup update");
+        await browserSet(e.cdp, "#practice-terrain-x", String(point.x));
+        await browserSet(e.cdp, "#practice-terrain-y", String(point.y));
+        await browserSet(e.cdp, "#practice-terrain-radius", "20");
+        await browserSubmit(e.cdp, "#practice-terrain-form");
+        mutatedSetup = (await practiceRoom).payload.practice_setup;
+      }
+      ok(mutatedSetup?.terrain?.length === terrainPoints.length
+        && terrainPoints.every((point, index) => mutatedSetup.terrain[index].x === point.x
+          && mutatedSetup.terrain[index].y === point.y
+          && mutatedSetup.terrain[index].radius === 20),
+      `practice setup mutation mismatch: ${JSON.stringify(mutatedSetup)}`);
+      await browserWait(e.cdp, "document.querySelectorAll('.practice-circle-list li').length === 2 && document.querySelector('#start-game')?.disabled === true", "practice mutation resets readiness");
+      await browserWait(f.cdp, "document.querySelector('#practice-status')?.textContent === 'Setup synchronized.'", "practice setup guest synchronization");
+      await f.cdp.command("Page.reload");
+      await browserWait(f.cdp, "Boolean(document.querySelector('.practice-readonly'))", "practice guest reconnect");
+      await browserWait(f.cdp, "document.querySelector('#practice-status')?.textContent === 'Setup synchronized.'", "practice setup reconnect persistence");
+      await browserClick(e.cdp, "#ready-button");
+      await browserClick(f.cdp, "#ready-button");
+      await browserWait(e.cdp, "document.querySelector('#start-game')?.disabled === false", "practice start enabled");
+      const practiceStart = browserWsMessage(e.cdp, "game_started", "practice game start");
+      await browserClick(e.cdp, "#start-game");
+      const started = (await practiceStart).payload.game;
+      ok(JSON.stringify(started.terrain) === JSON.stringify(mutatedSetup.terrain)
+        && mutatedSetup.players.every(placement => placement.soldiers.every((point, index) => {
+          const soldier = started.soldiers.find(candidate => candidate.player_id === placement.player_id && candidate.index === index);
+          return soldier?.x === point.x && soldier?.y === point.y;
+        })),
+      `practice game did not start from exact setup: ${JSON.stringify(started)}`);
+      for (const cdp of [e.cdp, f.cdp]) {
+        await browserWait(cdp, "Boolean(document.querySelector('#game-canvas'))", "practice game", 20_000);
+      }
+      log("practice owner/guest controls, rejection, setup readiness reset, reconnect, start: pass");
+
+      // Finished -> ReturnToLobby -> rematch keeps the practice setup.
+      const ownerShotWs = await openWs(await browserSessionCookie(e.cdp));
+      const finishShot = new Promise((resolve, reject) => {
+        ownerShotWs.sendText(JSON.stringify({type: "fire_function", payload: {function: "0", angle_deg: 0}}));
+        (async () => {
+          for (;;) {
+            const message = JSON.parse((await ownerShotWs.next("practice decisive shot")).text);
+            if (["game_finished", "shot_resolved", "error"].includes(message.type)) {
+              resolve(message);
+              return;
+            }
+          }
+        })().catch(reject);
+      }).finally(() => ownerShotWs.close());
+      const finishMessage = await finishShot;
+      ok(finishMessage.type === "game_finished", `practice decisive shot returned ${JSON.stringify(finishMessage)}`);
+      ok(finishMessage.payload.snapshot.phase === "finished"
+        && finishMessage.payload.shot.winner_team === 1
+        && finishMessage.payload.shot.outcome.type === "terrain_impact"
+        && finishMessage.payload.shot.outcome.payload.hits.length === 1,
+      `practice decisive shot did not finish the game: ${JSON.stringify(finishMessage.payload.shot)}`);
+      await browserWait(e.cdp, "document.querySelector('.finished-actions')?.hidden === false && document.querySelector('#return-to-lobby')?.disabled === false", "practice owner finished actions", 20_000);
+      await browserWait(f.cdp, "document.querySelector('.finished-actions')?.hidden === false && document.querySelector('#return-to-lobby')?.disabled === true", "practice guest finished actions", 20_000);
+      const ownerReturnWs = await openWs(await browserSessionCookie(e.cdp));
+      const returned = new Promise((resolve, reject) => {
+        ownerReturnWs.sendText(JSON.stringify({type: "return_to_lobby"}));
+        nextWsMessage(ownerReturnWs, "room", "practice return-to-lobby response")
+          .then(resolve)
+          .catch(reject);
+      }).finally(() => ownerReturnWs.close());
+      const returnMessage = await returned;
+      ok(returnMessage.payload.snapshot.phase === "lobby", `practice return-to-lobby returned ${JSON.stringify(returnMessage)}`);
+      for (const cdp of [e.cdp, f.cdp]) {
+        await browserWait(cdp, "Boolean(document.querySelector('#start-game'))", "practice return-to-lobby rematch screen", 20_000);
+      }
+      await browserWait(e.cdp, "document.querySelectorAll('.practice-circle-list li').length === 2", "practice setup survived return to lobby");
+      await browserWait(f.cdp, "document.querySelector('#practice-status')?.textContent === 'Setup synchronized.'", "guest setup survived return to lobby");
+      await browserClick(e.cdp, "#ready-button");
+      await browserClick(f.cdp, "#ready-button");
+      await browserWait(e.cdp, "document.querySelector('#start-game')?.disabled === false", "practice rematch start enabled");
+      const rematchStart = browserWsMessage(e.cdp, "game_started", "practice rematch start");
+      await browserClick(e.cdp, "#start-game");
+      const rematch = (await rematchStart).payload.game;
+      ok(JSON.stringify(rematch.terrain) === JSON.stringify(mutatedSetup.terrain),
+        `practice rematch lost the setup terrain: ${JSON.stringify(rematch.terrain)}`);
+      log("practice finished, return-to-lobby, rematch: pass");
+    } finally {
+      for (const browser of [e, f]) await closeBrowser(browser);
+    }
 
     let c;
     let d;
@@ -1378,7 +1601,7 @@ async function browserFlows() {
       log("protected room listing, password enforcement, prompt flow, and kick: pass");
       await browserLeave(c.cdp);
 
-      await browserCreate(c.cdp, "Bot E2E", "public");
+      await browserCreate(c.cdp, "Bot E2E", "public", "", "practice");
       await browserClick(c.cdp, "#add-bot");
       await browserWait(c.cdp, `(() => {
         const rows = document.querySelectorAll('.player-slot');
@@ -1431,9 +1654,20 @@ async function browserFlows() {
         return false;
       })()`), "battlefield should remain light under dark system scheme");
       await browserWait(c.cdp, "document.querySelector('#function-input')?.disabled === false", "human bot-game turn", 20_000);
-      await browserSet(c.cdp, "#function-input", "0");
-      await browserSubmit(c.cdp, "#fire-form");
-      await browserWait(c.cdp, "document.querySelector('#turn-timer')?.textContent.includes('Resolving')", "human shot before bot", 20_000);
+      const botShotWs = await openWs(await browserSessionCookie(c.cdp));
+      botShotWs.sendText(JSON.stringify({type: "fire_function", payload: {function: "0", angle_deg: 0}}));
+      const botShot = await nextWsMessageAny(botShotWs, ["shot_resolved", "game_finished", "error"], "human shot before bot");
+      botShotWs.close();
+      ok(botShot.type === "shot_resolved"
+        && botShot.payload.shot.outcome.type === "miss"
+        && botShot.payload.shot.outcome.payload.reason === "world_exit",
+      `human bot-game shot failed: ${JSON.stringify(botShot)}`);
+      await browserWait(c.cdp, "document.querySelector('#shot-status')?.textContent.includes('Shot missed: trajectory left the battlefield')", "world-exit miss status", 20_000);
+      ok(await c.cdp.evaluate(`(() => {
+        const canvas = document.querySelector('#game-canvas');
+        const status = document.querySelector('#shot-status');
+        return Boolean(canvas) && status?.textContent.includes('Shot missed');
+      })()`), "world-exit miss should render without an explosion status");
       await browserWait(
         c.cdp,
         "document.querySelector('#function-input')?.disabled === false",

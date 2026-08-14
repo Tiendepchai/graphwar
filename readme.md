@@ -104,7 +104,7 @@ Graphwar is a Rust workspace:
 - `scripts/e2e.mjs` — HTTP, WebSocket, browser, accessibility, responsive-layout, and gameplay checks.
 - `deploy` — Docker image and production Compose configuration.
 
-The browser client communicates over authenticated WebSockets. The server remains the authority for every state-changing gameplay result. The legacy Java implementation remains under `src/` and `rsc/` for reference; it is not interoperable with the browser release.
+The browser client communicates over authenticated WebSockets. The server remains the authority for every state-changing gameplay result. Rust/WASM is the sole supported implementation; [`docs/legacy-java.md`](docs/legacy-java.md) preserves a concise summary of the removed Java version.
 
 ## Development
 

@@ -19,7 +19,10 @@ async fn main() -> anyhow::Result<()> {
     sqlx::migrate!("../../migrations").run(&pool).await?;
 
     let mut registry = room_store::load(&pool).await?;
-    if registry.resume_after_restart() {
+    let resumed = registry.resume_after_restart();
+    let normalized = registry.normalize_lobby_deadlines();
+    let expired = !registry.expire_lobbies().is_empty();
+    if resumed || normalized || expired {
         room_store::save(&pool, &registry).await?;
     }
     let listener = TcpListener::bind(config.bind_addr).await?;

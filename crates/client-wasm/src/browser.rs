@@ -2,17 +2,21 @@ use std::{cell::RefCell, rc::Rc};
 
 use gloo_net::http::Request;
 use gloo_timers::callback::{Interval, Timeout};
+use graphwar_game_core::constants::{
+    MAX_PRACTICE_TERRAIN_CIRCLES, PRACTICE_TERRAIN_RADII, SOLDIER_RADIUS,
+};
 use graphwar_protocol::{
-    AccountResponse, ClientMessage, GameMode, LoginRequest, PROTOCOL_VERSION, Phase,
-    RegisterRequest, RoomVisibility, ServerMessage,
+    AccountResponse, ClientMessage, GameMode, LoginRequest, PROTOCOL_VERSION, Phase, PracticeSetup,
+    RegisterRequest, RoomKind, RoomVisibility, ServerMessage, SetupPoint, ShotMissReason,
+    ShotOutcome, TerrainCircle,
 };
 use uuid::Uuid;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
     AbortController, CanvasRenderingContext2d, CloseEvent, Document, DragEvent, ErrorEvent, Event,
-    HtmlCanvasElement, HtmlDialogElement, HtmlFormElement, HtmlInputElement, HtmlSelectElement,
-    MessageEvent, RequestCredentials, WebSocket, Window,
+    HtmlCanvasElement, HtmlDialogElement, HtmlFormElement, HtmlImageElement, HtmlInputElement,
+    HtmlSelectElement, MessageEvent, PointerEvent, RequestCredentials, WebSocket, Window,
 };
 
 const PRESERVED_INPUTS: &[&str] = &[
@@ -23,14 +27,25 @@ const PRESERVED_INPUTS: &[&str] = &[
     "register-password",
     "room-name",
     "room-password",
+    "practice-x",
+    "practice-y",
+    "practice-terrain-x",
+    "practice-terrain-y",
     "function-input",
     "chat-input",
+];
+const PRESERVED_SELECTS: &[&str] = &[
+    "room-visibility",
+    "room-kind",
+    "practice-radius",
+    "practice-soldier",
+    "practice-terrain-radius",
 ];
 
 #[derive(Default)]
 struct FormState {
     inputs: Vec<(String, String)>,
-    room_visibility: Option<String>,
+    selects: Vec<(String, String)>,
     focus: Option<(String, Option<u32>, Option<u32>, Option<String>)>,
 }
 
@@ -46,21 +61,45 @@ struct App {
     document: Document,
     model: Model,
     selected_team_player: Option<TeamMoveSelection>,
+    practice_tool: PracticeTool,
+    practice_radius: f64,
+    practice_draft: Option<PracticeSetup>,
+    practice_drag: Option<PracticeDrag>,
+    practice_save: Option<PracticeSave>,
     socket: Option<WebSocket>,
     socket_handlers: Option<SocketHandlers>,
     connection_epoch: u64,
     auth_epoch: u64,
     auth_pending: bool,
     auth_request: Option<AbortController>,
-    event_handlers: Vec<Closure<dyn FnMut(Event)>>,
-    dynamic_event_handlers: Vec<Closure<dyn FnMut(Event)>>,
+    event_handlers: Vec<EventHandler>,
+    dynamic_event_handlers: Vec<EventHandler>,
     reconnect_attempt: u32,
     reconnect_timer: Option<Timeout>,
     clock: Option<Interval>,
     viewport_handler: Option<Closure<dyn FnMut(Event)>>,
     expired_deadline: Option<i64>,
     shot_animation: Option<ShotAnimation>,
+    soldier_sprite: Option<HtmlImageElement>,
+    soldier_sprite_loaded: bool,
+    soldier_helmet_team_one: Option<HtmlImageElement>,
+    soldier_helmet_team_one_loaded: bool,
+    soldier_helmet_team_two: Option<HtmlImageElement>,
+    soldier_helmet_team_two_loaded: bool,
+    soldier_sprite_handlers: Vec<SoldierSpriteHandlers>,
     ws_url: String,
+}
+
+#[derive(Clone, Copy)]
+enum SoldierSpriteKind {
+    Body,
+    HelmetTeamOne,
+    HelmetTeamTwo,
+}
+
+struct SoldierSpriteHandlers {
+    _onload: Closure<dyn FnMut(Event)>,
+    _onerror: Closure<dyn FnMut(Event)>,
 }
 
 struct SocketHandlers {
@@ -68,6 +107,21 @@ struct SocketHandlers {
     _onmessage: Closure<dyn FnMut(MessageEvent)>,
     _onclose: Closure<dyn FnMut(CloseEvent)>,
     _onerror: Closure<dyn FnMut(ErrorEvent)>,
+}
+
+struct EventHandler {
+    target: web_sys::EventTarget,
+    event_name: &'static str,
+    closure: Closure<dyn FnMut(Event)>,
+}
+
+impl Drop for EventHandler {
+    fn drop(&mut self) {
+        let _ = self.target.remove_event_listener_with_callback(
+            self.event_name,
+            self.closure.as_ref().unchecked_ref(),
+        );
+    }
 }
 
 struct ShotAnimation {
@@ -79,6 +133,26 @@ struct ShotAnimation {
 struct TeamMoveSelection {
     player_id: Uuid,
     team: u8,
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum PracticeTool {
+    #[default]
+    Move,
+    Add,
+    Erase,
+}
+
+struct PracticeDrag {
+    pointer_id: i32,
+    player_id: Uuid,
+    soldier_index: usize,
+}
+
+struct PracticeSave {
+    room_id: String,
+    base_revision: u64,
+    submitted: PracticeSetup,
 }
 
 #[derive(Clone, Copy)]
@@ -134,6 +208,11 @@ pub fn start() -> Result<(), JsValue> {
         document,
         model: Model::default(),
         selected_team_player: None,
+        practice_tool: PracticeTool::Move,
+        practice_radius: 40.0,
+        practice_draft: None,
+        practice_drag: None,
+        practice_save: None,
         socket: None,
         socket_handlers: None,
         connection_epoch: 0,
@@ -148,9 +227,17 @@ pub fn start() -> Result<(), JsValue> {
         viewport_handler: None,
         expired_deadline: None,
         shot_animation: None,
+        soldier_sprite: None,
+        soldier_sprite_loaded: false,
+        soldier_helmet_team_one: None,
+        soldier_helmet_team_one_loaded: false,
+        soldier_helmet_team_two: None,
+        soldier_helmet_team_two_loaded: false,
+        soldier_sprite_handlers: Vec::new(),
         ws_url,
     }));
 
+    load_soldier_sprites(&app)?;
     render(&app)?;
     bind_events(&app)?;
     bind_viewport_events(&app)?;
@@ -158,6 +245,100 @@ pub fn start() -> Result<(), JsValue> {
     app.borrow_mut().clock = Some(Interval::new(1_000, move || update_timer(&clock_app)));
     restore_session(&app);
     Ok(())
+}
+
+fn load_soldier_sprites(app: &SharedApp) -> Result<(), JsValue> {
+    load_soldier_sprite(
+        app,
+        SoldierSpriteKind::Body,
+        "/rsc/soldiers/soldierNormal.png?v=20260731d",
+    )?;
+    load_soldier_sprite(
+        app,
+        SoldierSpriteKind::HelmetTeamOne,
+        "/rsc/soldiers/helmetTeamOne.png?v=20260731d",
+    )?;
+    load_soldier_sprite(
+        app,
+        SoldierSpriteKind::HelmetTeamTwo,
+        "/rsc/soldiers/helmetTeamTwo.png?v=20260731d",
+    )
+}
+
+fn load_soldier_sprite(
+    app: &SharedApp,
+    kind: SoldierSpriteKind,
+    source: &str,
+) -> Result<(), JsValue> {
+    let image = HtmlImageElement::new()?;
+    let load_app = Rc::clone(app);
+    let onload = Closure::<dyn FnMut(Event)>::new(move |_| {
+        let redraw = {
+            let mut app = load_app.borrow_mut();
+            set_soldier_sprite_loaded(&mut app, kind, true);
+            app.model.screen == Screen::Game
+        };
+        if redraw && let Err(error) = render_canvas(&load_app) {
+            log_error(&format!("soldier sprite render failed: {error:?}"));
+        } else if load_app.borrow().model.room_kind == Some(RoomKind::Practice)
+            && let Err(error) = render_practice_canvas(&load_app)
+        {
+            log_error(&format!("soldier sprite render failed: {error:?}"));
+        }
+    });
+    image.set_onload(Some(onload.as_ref().unchecked_ref()));
+
+    let error_app = Rc::clone(app);
+    let onerror = Closure::<dyn FnMut(Event)>::new(move |_| {
+        let redraw = {
+            let mut app = error_app.borrow_mut();
+            set_soldier_sprite_loaded(&mut app, kind, false);
+            app.model.screen == Screen::Game
+        };
+        if redraw && let Err(error) = render_canvas(&error_app) {
+            log_error(&format!("soldier sprite render failed: {error:?}"));
+        }
+    });
+    image.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+    image.set_src(source);
+    let loaded = image.complete() && image.natural_width() > 0;
+    let mut app = app.borrow_mut();
+    set_soldier_sprite(&mut app, kind, image, loaded);
+    app.soldier_sprite_handlers.push(SoldierSpriteHandlers {
+        _onload: onload,
+        _onerror: onerror,
+    });
+    Ok(())
+}
+
+fn set_soldier_sprite(
+    app: &mut App,
+    kind: SoldierSpriteKind,
+    image: HtmlImageElement,
+    loaded: bool,
+) {
+    match kind {
+        SoldierSpriteKind::Body => {
+            app.soldier_sprite = Some(image);
+            app.soldier_sprite_loaded = loaded;
+        }
+        SoldierSpriteKind::HelmetTeamOne => {
+            app.soldier_helmet_team_one = Some(image);
+            app.soldier_helmet_team_one_loaded = loaded;
+        }
+        SoldierSpriteKind::HelmetTeamTwo => {
+            app.soldier_helmet_team_two = Some(image);
+            app.soldier_helmet_team_two_loaded = loaded;
+        }
+    }
+}
+
+fn set_soldier_sprite_loaded(app: &mut App, kind: SoldierSpriteKind, loaded: bool) {
+    match kind {
+        SoldierSpriteKind::Body => app.soldier_sprite_loaded = loaded,
+        SoldierSpriteKind::HelmetTeamOne => app.soldier_helmet_team_one_loaded = loaded,
+        SoldierSpriteKind::HelmetTeamTwo => app.soldier_helmet_team_two_loaded = loaded,
+    }
 }
 
 fn restore_session(app: &SharedApp) {
@@ -225,6 +406,9 @@ fn begin_authentication(app: &SharedApp) -> Option<(u64, AbortController)> {
         app.auth_pending = true;
         app.auth_request = Some(controller.clone());
         app.connection_epoch = app.connection_epoch.saturating_add(1);
+        app.practice_draft = None;
+        app.practice_drag = None;
+        app.practice_save = None;
         app.reconnect_timer = None;
         (
             app.auth_epoch,
@@ -355,7 +539,7 @@ fn connect(app: &SharedApp) -> Result<(), JsValue> {
             }
             Ok(message) => {
                 announce_server_message(&message_app, &message);
-                let scope = render_scope(&message);
+                let mut scope = render_scope(&message);
                 let (previous_screen, prior_sequence, prior_notice) = {
                     let app_ref = message_app.borrow();
                     (
@@ -364,9 +548,49 @@ fn connect(app: &SharedApp) -> Result<(), JsValue> {
                         app_ref.model.notices.last().cloned(),
                     )
                 };
-                {
+                let authoritative_practice_update =
+                    practice_authoritative_update(&message_app, &message);
+                let queued = {
                     let mut app = message_app.borrow_mut();
+                    let practice_update = practice_server_update(&message, &app);
                     reduce(&mut app.model, Action::Message(Box::new(message)));
+                    match practice_update {
+                        PracticeServerUpdate::Accepted => {
+                            app.practice_save = None;
+                            app.practice_drag = None;
+                            let queued = app
+                                .practice_draft
+                                .as_ref()
+                                .filter(|draft| Some(*draft) != app.model.practice_setup.as_ref())
+                                .cloned();
+                            if queued.is_none() {
+                                app.practice_draft = None;
+                            }
+                            if app.model.screen == Screen::Room
+                                && app.model.room_kind == Some(RoomKind::Practice)
+                            {
+                                scope = RenderScope::Screen;
+                            }
+                            queued
+                        }
+                        PracticeServerUpdate::Rejected => {
+                            app.practice_save = None;
+                            scope = RenderScope::Screen;
+                            None
+                        }
+                        PracticeServerUpdate::Left => {
+                            app.practice_draft = None;
+                            app.practice_drag = None;
+                            app.practice_save = None;
+                            None
+                        }
+                        PracticeServerUpdate::None => None,
+                    }
+                };
+                if let Some(queued) = queued {
+                    submit_practice_setup(&message_app, queued);
+                } else if authoritative_practice_update {
+                    retry_practice_draft(&message_app);
                 }
                 let latest_notice = message_app.borrow().model.notices.last().cloned();
                 if latest_notice != prior_notice
@@ -437,6 +661,7 @@ fn schedule_reconnect(app: &SharedApp, connection_epoch: u64, auth_epoch: u64) {
         }
         app.socket = None;
         app.socket_handlers = None;
+        app.practice_save = None;
         app.connection_epoch = app.connection_epoch.saturating_add(1);
         let timer_epoch = app.connection_epoch;
         let attempt = app.reconnect_attempt.saturating_add(1);
@@ -469,7 +694,7 @@ fn schedule_reconnect(app: &SharedApp, connection_epoch: u64, auth_epoch: u64) {
     }
 }
 
-fn send(app: &SharedApp, message: ClientMessage) {
+fn send(app: &SharedApp, message: ClientMessage) -> bool {
     let (connection_epoch, auth_epoch, unavailable) = {
         let app = app.borrow();
         (
@@ -484,12 +709,17 @@ fn send(app: &SharedApp, message: ClientMessage) {
     };
     if unavailable {
         notice(app, "Connection unavailable; action not sent".into());
-        return;
+        return false;
     }
-    send_current(app, connection_epoch, auth_epoch, message);
+    send_current(app, connection_epoch, auth_epoch, message)
 }
 
-fn send_current(app: &SharedApp, connection_epoch: u64, auth_epoch: u64, message: ClientMessage) {
+fn send_current(
+    app: &SharedApp,
+    connection_epoch: u64,
+    auth_epoch: u64,
+    message: ClientMessage,
+) -> bool {
     let result = serde_json::to_string(&message)
         .map_err(|error| JsValue::from_str(&error.to_string()))
         .and_then(|json| {
@@ -505,6 +735,9 @@ fn send_current(app: &SharedApp, connection_epoch: u64, auth_epoch: u64, message
     if let Err(error) = result {
         log_error(&format!("send failed: {error:?}"));
         notice(app, "Connection failed; action not sent".into());
+        false
+    } else {
+        true
     }
 }
 
@@ -588,6 +821,9 @@ fn session_expired(app: &SharedApp) {
         let handlers = app_ref.socket_handlers.take();
         let previous_screen = app_ref.model.screen.clone();
         reduce(&mut app_ref.model, Action::SessionExpired);
+        app_ref.practice_draft = None;
+        app_ref.practice_drag = None;
+        app_ref.practice_save = None;
         (socket, handlers, previous_screen)
     };
     if let Some(socket) = socket {
@@ -609,6 +845,9 @@ fn logout(app: &SharedApp) {
         let handlers = app_ref.socket_handlers.take();
         let previous_screen = app_ref.model.screen.clone();
         reduce(&mut app_ref.model, Action::LoggedOut);
+        app_ref.practice_draft = None;
+        app_ref.practice_drag = None;
+        app_ref.practice_save = None;
         (
             app_ref.auth_epoch,
             request,
@@ -678,7 +917,7 @@ fn announce(app: &SharedApp, message: &str) {
 fn announce_server_message(app: &SharedApp, message: &ServerMessage) {
     let message = match message {
         ServerMessage::Chat { entry } => Some(format!("{}: {}", entry.display_name, entry.text)),
-        ServerMessage::Room { snapshot } => snapshot.players.iter().find_map(|player| {
+        ServerMessage::Room { snapshot, .. } => snapshot.players.iter().find_map(|player| {
             app.borrow()
                 .model
                 .players
@@ -706,11 +945,7 @@ fn announce_server_message(app: &SharedApp, message: &ServerMessage) {
                     .map(|player| player.name.clone())
             })
             .map(|name| format!("{name}'s turn")),
-        ServerMessage::ShotResolved { shot, .. } => Some(if shot.hits.is_empty() {
-            "Shot resolved; no soldiers hit".into()
-        } else {
-            format!("Shot resolved; {} soldier(s) hit", shot.hits.len())
-        }),
+        ServerMessage::ShotResolved { shot, .. } => Some(shot_outcome_message(&shot.outcome)),
         ServerMessage::GameFinished { shot, .. } => Some(match shot.winner_team {
             Some(1) => "Match finished; Team One wins".into(),
             Some(2) => "Match finished; Team Two wins".into(),
@@ -720,6 +955,33 @@ fn announce_server_message(app: &SharedApp, message: &ServerMessage) {
     };
     if let Some(message) = message {
         announce(app, &message);
+    }
+}
+
+fn shot_outcome_message(outcome: &ShotOutcome) -> String {
+    match outcome {
+        ShotOutcome::TerrainImpact { hits, .. } if hits.is_empty() => {
+            "Terrain hit; no soldiers caught in the blast".into()
+        }
+        ShotOutcome::TerrainImpact { hits, .. } => {
+            format!("Terrain hit; {} soldier(s) hit", hits.len())
+        }
+        ShotOutcome::Miss { hits, .. } if !hits.is_empty() => {
+            format!("Shot hit {} soldier(s)", hits.len())
+        }
+        ShotOutcome::Miss {
+            reason: ShotMissReason::WorldExit,
+            ..
+        } => "Shot missed: trajectory left the battlefield".into(),
+        ShotOutcome::Miss {
+            reason: ShotMissReason::Numerical,
+            ..
+        } => "Shot missed: function became undefined".into(),
+        ShotOutcome::Miss {
+            reason: ShotMissReason::StepLimit,
+            ..
+        } => "Shot missed: simulation limit reached".into(),
+        ShotOutcome::Forfeit => "Player forfeited".into(),
     }
 }
 
@@ -751,6 +1013,81 @@ fn render_scope(message: &ServerMessage) -> RenderScope {
         | ServerMessage::GameFinished { .. }
         | ServerMessage::StateSync { .. }
         | ServerMessage::LeftRoom => RenderScope::Screen,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PracticeServerUpdate {
+    None,
+    Accepted,
+    Rejected,
+    Left,
+}
+
+fn practice_server_update(message: &ServerMessage, app: &App) -> PracticeServerUpdate {
+    let Some(pending) = app.practice_save.as_ref() else {
+        return if matches!(message, ServerMessage::LeftRoom) {
+            PracticeServerUpdate::Left
+        } else {
+            PracticeServerUpdate::None
+        };
+    };
+    match message {
+        ServerMessage::RoomCreated {
+            snapshot,
+            practice_setup,
+            ..
+        }
+        | ServerMessage::Room {
+            snapshot,
+            practice_setup,
+        }
+        | ServerMessage::StateSync {
+            snapshot,
+            practice_setup,
+            ..
+        } if snapshot.id.to_string() == pending.room_id
+            && snapshot.revision > pending.base_revision
+            && practice_setup.as_ref() == Some(&pending.submitted) =>
+        {
+            PracticeServerUpdate::Accepted
+        }
+        ServerMessage::Error { .. } => PracticeServerUpdate::Rejected,
+        ServerMessage::LeftRoom => PracticeServerUpdate::Left,
+        _ => PracticeServerUpdate::None,
+    }
+}
+
+fn practice_authoritative_update(app: &SharedApp, message: &ServerMessage) -> bool {
+    let Some(room_id) = app.borrow().model.room_id.clone() else {
+        return false;
+    };
+    match message {
+        ServerMessage::RoomCreated { snapshot, .. }
+        | ServerMessage::Room { snapshot, .. }
+        | ServerMessage::StateSync { snapshot, .. } => snapshot.id.to_string() == room_id,
+        _ => false,
+    }
+}
+
+fn retry_practice_draft(app: &SharedApp) {
+    let draft = {
+        let app = app.borrow();
+        app.practice_draft
+            .as_ref()
+            .filter(|draft| Some(*draft) != app.model.practice_setup.as_ref())
+            .filter(|draft| validate_practice_setup_client(draft).is_ok())
+            .cloned()
+    };
+    if let Some(draft) = draft {
+        submit_practice_setup(app, draft);
+    } else if app.borrow().model.room_kind == Some(RoomKind::Practice) {
+        app.borrow_mut().practice_draft = None;
+        let status = {
+            let app = app.borrow();
+            practice_setup_status(app.model.practice_setup.as_ref())
+        };
+        practice_status(app, status);
     }
 }
 
@@ -872,36 +1209,38 @@ fn refresh_lobby_rooms_dom(app: &SharedApp) -> Result<(), JsValue> {
 
 fn refresh_room_dom(app: &SharedApp) -> Result<(), JsValue> {
     let form_state = capture_form_state(app);
-    let document = {
+    {
         let app_ref = app.borrow();
-        let document = &app_ref.document;
         let model = &app_ref.model;
         if model.screen != Screen::Room {
             return Err(JsValue::from_str("room screen unavailable"));
         }
+        if model.room_kind == Some(RoomKind::Practice) {
+            let has_toolbar = app_ref
+                .document
+                .query_selector(".practice-toolbar")?
+                .is_some();
+            if has_toolbar != model.local_owner() {
+                drop(app_ref);
+                rerender(app);
+                return Ok(());
+            }
+        }
+    }
+    let document = {
+        let app_ref = app.borrow();
+        let document = &app_ref.document;
+        let model = &app_ref.model;
         room_element(document, "#room-title")?.set_text_content(Some(&model.room_name));
         room_element(document, "#players-title span")?
             .set_text_content(Some(&model.players.len().to_string()));
         room_element(document, ".team-rosters")?.set_inner_html(&room_team_rosters_html(model));
-        room_element(document, ".room-chat ul")?.set_inner_html(&chat_messages_html(model));
+        replace_feed_html(
+            &room_element(document, ".room-chat ul")?,
+            &chat_messages_html(model),
+        );
 
         let owner = model.local_owner();
-        set_boolean_attribute(&room_element(document, ".mode-picker")?, "disabled", !owner)?;
-        let mode = model.game_mode.unwrap_or(GameMode::Function);
-        let mode_inputs = document.query_selector_all("input[name=game-mode]")?;
-        for index in 0..mode_inputs.length() {
-            let Some(input) = mode_inputs.item(index) else {
-                continue;
-            };
-            let input = input.dyn_into::<HtmlInputElement>()?;
-            input.set_checked(
-                matches!(input.value().as_str(), "function") && mode == GameMode::Function
-                    || matches!(input.value().as_str(), "first_order")
-                        && mode == GameMode::FirstOrder
-                    || matches!(input.value().as_str(), "second_order")
-                        && mode == GameMode::SecondOrder,
-            );
-        }
         room_element(document, "#ready-button")?.set_text_content(Some(if model.local_ready() {
             "Not ready"
         } else {
@@ -916,8 +1255,27 @@ fn refresh_room_dom(app: &SharedApp) -> Result<(), JsValue> {
         document.clone()
     };
     refresh_notices_dom(app)?;
+    if let Some(precise) = document.query_selector(".practice-precise")? {
+        let open = precise.has_attribute("open");
+        let precise_html = {
+            let app_ref = app.borrow();
+            app_ref
+                .model
+                .local_owner()
+                .then(|| precise_placement_html(&app_ref.model, open))
+        };
+        if let Some(precise_html) = precise_html {
+            precise.set_outer_html(&precise_html);
+        }
+    }
     app.borrow_mut().dynamic_event_handlers.clear();
     bind_room_roster_events(app, &document)?;
+    if app.borrow().model.screen == Screen::Room
+        && app.borrow().model.room_kind == Some(RoomKind::Practice)
+    {
+        bind_practice_events(app, &document)?;
+        render_practice_canvas(app)?;
+    }
     restore_form_state(app, form_state);
     Ok(())
 }
@@ -933,8 +1291,25 @@ fn refresh_chat_dom(app: &SharedApp) -> Result<(), JsValue> {
         .document
         .query_selector(selector)?
         .ok_or_else(|| JsValue::from_str(&format!("{selector} missing")))?;
-    list.set_inner_html(&chat_messages_html(&app_ref.model));
+    replace_feed_html(&list, &chat_messages_html(&app_ref.model));
     Ok(())
+}
+
+fn replace_feed_html(list: &web_sys::Element, html: &str) {
+    let scroll = list.dyn_ref::<web_sys::HtmlElement>().map(|list| {
+        let gap = list.scroll_height() - list.client_height() - list.scroll_top();
+        (gap <= 24, list.scroll_top())
+    });
+    list.set_inner_html(html);
+    if let (Some(list), Some((stick_to_bottom, scroll_top))) =
+        (list.dyn_ref::<web_sys::HtmlElement>(), scroll)
+    {
+        if stick_to_bottom {
+            list.set_scroll_top(list.scroll_height());
+        } else {
+            list.set_scroll_top(scroll_top);
+        }
+    }
 }
 
 fn room_element(document: &Document, selector: &str) -> Result<web_sys::Element, JsValue> {
@@ -964,7 +1339,22 @@ fn refresh_game_dom(app: &SharedApp) -> Result<(), JsValue> {
         refresh_soldier_name_labels(document, model)?;
         game_element(document, "#battlefield-summary")?
             .set_text_content(Some(&battlefield_summary(model)));
-        game_element(document, ".game-chat ul")?.set_inner_html(&chat_messages_html(model));
+        game_element(document, "#shot-status")?.set_text_content(model.shot_status.as_deref());
+        replace_feed_html(
+            &game_element(document, ".game-chat ul")?,
+            &chat_messages_html(model),
+        );
+        let finished = model.room_phase == Some(Phase::Finished);
+        set_boolean_attribute(
+            &game_element(document, ".finished-actions")?,
+            "hidden",
+            !finished,
+        )?;
+        set_boolean_attribute(
+            &game_element(document, "#return-to-lobby")?,
+            "disabled",
+            !model.local_owner(),
+        )?;
 
         let local_turn = local_turn(model);
         let function_input =
@@ -1029,11 +1419,16 @@ fn capture_form_state(app: &SharedApp) -> FormState {
                 .map(|input| ((*id).to_owned(), input.value()))
         })
         .collect();
-    let room_visibility = app
-        .document
-        .get_element_by_id("room-visibility")
-        .and_then(|element| element.dyn_into::<HtmlSelectElement>().ok())
-        .map(|select| select.value());
+    let selects = PRESERVED_SELECTS
+        .iter()
+        .filter_map(|id| {
+            app.document
+                .get_element_by_id(id)?
+                .dyn_into::<HtmlSelectElement>()
+                .ok()
+                .map(|select| ((*id).to_owned(), select.value()))
+        })
+        .collect();
     let focus = app.document.active_element().and_then(|element| {
         let selector = focus_selector(&element)?;
         let input = element.dyn_ref::<HtmlInputElement>();
@@ -1046,7 +1441,7 @@ fn capture_form_state(app: &SharedApp) -> FormState {
     });
     FormState {
         inputs,
-        room_visibility,
+        selects,
         focus,
     }
 }
@@ -1083,12 +1478,13 @@ fn restore_form_state(app: &SharedApp, state: FormState) {
             input.set_value(&value);
         }
     }
-    if let Some(value) = state.room_visibility
-        && let Some(select) = document
-            .get_element_by_id("room-visibility")
+    for (id, value) in state.selects {
+        if let Some(select) = document
+            .get_element_by_id(&id)
             .and_then(|element| element.dyn_into::<HtmlSelectElement>().ok())
-    {
-        select.set_value(&value);
+        {
+            select.set_value(&value);
+        }
     }
     let private = document
         .get_element_by_id("room-visibility")
@@ -1135,9 +1531,13 @@ fn render(app: &SharedApp) -> Result<(), JsValue> {
         notices
     ));
     drop(app_ref);
-    if app.borrow().model.screen == Screen::Game
-        && let Err(error) = render_canvas(app)
-    {
+    let model = &app.borrow().model;
+    let canvas_result = match (model.screen.clone(), model.room_kind) {
+        (Screen::Game, _) => render_canvas(app),
+        (Screen::Room, Some(RoomKind::Practice)) => render_practice_canvas(app),
+        _ => Ok(()),
+    };
+    if let Err(error) = canvas_result {
         log_error(&format!("canvas render failed: {error:?}"));
     }
     Ok(())
@@ -1171,12 +1571,12 @@ fn connection_view(connection: &Connection) -> (&'static str, String) {
 }
 
 fn login_html() -> String {
-    "<section class=\"login-shell reveal\" aria-labelledby=\"login-title\"><div class=\"hero-copy\"><p class=\"eyebrow\">Artillery for mathematicians</p><h1 id=\"login-title\">Draw the<br><em>winning line.</em></h1><p>Turn equations into trajectories. Outsmart the other side before the clock runs dry.</p></div><div class=\"auth-stack\"><form id=\"login-form\" class=\"paper-card auth-card auth-card-login\"><h2>Return to battle</h2><label for=\"login-email\">Email</label><input id=\"login-email\" type=\"email\" autocomplete=\"email\" maxlength=\"254\" required><label for=\"login-password\">Password</label><input id=\"login-password\" type=\"password\" autocomplete=\"current-password\" minlength=\"12\" required><button class=\"primary\" type=\"submit\">Enter the lobby <span aria-hidden=\"true\">↗</span></button></form><form id=\"register-form\" class=\"paper-card auth-card auth-card-register\"><h2>First deployment</h2><label for=\"register-name\">Display name</label><input id=\"register-name\" autocomplete=\"nickname\" minlength=\"2\" maxlength=\"32\" required placeholder=\"e.g. Gauss\"><label for=\"register-email\">Email</label><input id=\"register-email\" type=\"email\" autocomplete=\"email\" maxlength=\"254\" required><label for=\"register-password\">Password</label><input id=\"register-password\" type=\"password\" autocomplete=\"new-password\" minlength=\"12\" required><button class=\"secondary\" type=\"submit\">Create account</button><small>Passwords need at least 12 characters.</small></form></div></section>".into()
+    "<section class=\"login-shell reveal\" aria-labelledby=\"login-title\"><div class=\"hero-copy\"><p class=\"eyebrow\">Artillery for mathematicians</p><h1 id=\"login-title\">Draw the<br><em>winning line.</em></h1><p>Turn equations into trajectories. Fire first, read the wind, keep the battlefield readable.</p></div><div class=\"auth-stack\"><form id=\"login-form\" class=\"paper-card auth-card auth-card-login\"><p class=\"eyebrow\">Primary action</p><h2>Return to battle</h2><label for=\"login-email\">Email</label><input id=\"login-email\" type=\"email\" autocomplete=\"email\" maxlength=\"254\" required><label for=\"login-password\">Password</label><input id=\"login-password\" type=\"password\" autocomplete=\"current-password\" minlength=\"12\" required><button class=\"primary\" type=\"submit\">Enter the lobby <span aria-hidden=\"true\">↗</span></button></form><details class=\"paper-card auth-card auth-card-register\"><summary>First deployment</summary><form id=\"register-form\"><label for=\"register-name\">Display name</label><input id=\"register-name\" autocomplete=\"nickname\" minlength=\"2\" maxlength=\"32\" required placeholder=\"e.g. Gauss\"><label for=\"register-email\">Email</label><input id=\"register-email\" type=\"email\" autocomplete=\"email\" maxlength=\"254\" required><label for=\"register-password\">Password</label><input id=\"register-password\" type=\"password\" autocomplete=\"new-password\" minlength=\"12\" required><button class=\"secondary\" type=\"submit\">Create account</button><small>Passwords need at least 12 characters.</small></form></details></div></section>".into()
 }
 
 fn lobby_html(model: &Model) -> String {
     format!(
-        "<section class=\"lobby-shell reveal\" aria-labelledby=\"lobby-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Welcome, {}</p><h1 id=\"lobby-title\">Rooms</h1></div><div class=\"lobby-actions\"><button id=\"create-room-open\" class=\"primary\" type=\"button\" aria-haspopup=\"dialog\" aria-controls=\"create-room-dialog\">Create room</button></div></div><dialog id=\"create-room-dialog\" class=\"create-room-dialog\" aria-labelledby=\"create-room-title\"><form id=\"create-room-form\" class=\"command-slip\"><h2 id=\"create-room-title\">Create room</h2><label for=\"room-name\">Room name</label><input id=\"room-name\" maxlength=\"32\" required autocomplete=\"off\"><label for=\"room-visibility\">Room type</label><select id=\"room-visibility\"><option value=\"public\">Public</option><option value=\"private\">Private</option></select><div id=\"room-password-field\" hidden><label for=\"room-password\">Password</label><input id=\"room-password\" type=\"password\" autocomplete=\"new-password\" maxlength=\"1024\" disabled></div><div class=\"create-room-actions\"><button id=\"create-room-cancel\" class=\"secondary\" type=\"button\">Cancel</button><button class=\"primary\" type=\"submit\">Create room</button></div></form></dialog><ul class=\"room-list\">{}</ul></section>",
+        "<section class=\"lobby-shell reveal\" aria-labelledby=\"lobby-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Welcome, {}</p><h1 id=\"lobby-title\">Rooms</h1></div><div class=\"lobby-actions\"><button id=\"create-room-open\" class=\"primary\" type=\"button\" aria-haspopup=\"dialog\" aria-controls=\"create-room-dialog\">Create room</button></div></div><dialog id=\"create-room-dialog\" class=\"create-room-dialog\" aria-labelledby=\"create-room-title\"><form id=\"create-room-form\" class=\"command-slip\"><h2 id=\"create-room-title\">Create room</h2><label for=\"room-name\">Room name</label><input id=\"room-name\" maxlength=\"32\" required autocomplete=\"off\"><label for=\"room-visibility\">Visibility</label><select id=\"room-visibility\"><option value=\"public\">Public</option><option value=\"private\">Private</option></select><label for=\"room-kind\">Battle type</label><select id=\"room-kind\"><option value=\"standard\">Standard</option><option value=\"practice\">Practice</option></select><div id=\"room-password-field\" hidden><label for=\"room-password\">Password</label><input id=\"room-password\" type=\"password\" autocomplete=\"new-password\" maxlength=\"1024\" disabled></div><div class=\"create-room-actions\"><button id=\"create-room-cancel\" class=\"secondary\" type=\"button\">Cancel</button><button class=\"primary\" type=\"submit\">Create room</button></div></form></dialog><ul class=\"room-list\">{}</ul></section>",
         escape(&model.player_name),
         lobby_room_items_html(model)
     )
@@ -1195,13 +1595,16 @@ fn lobby_room_items_html(model: &Model) -> String {
                 .then_some("<span class=\"room-lock\"><svg aria-hidden=\"true\" viewBox=\"0 0 24 24\" width=\"18\" height=\"18\"><path d=\"M7 10V7a5 5 0 0 1 10 0v3m-11 0h12v10H6z\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg><span class=\"sr-only\">Protected room</span></span>")
                 .unwrap_or("");
             let protected = if room.protected { "true" } else { "false" };
+            let practice = (room.kind == RoomKind::Practice)
+                .then_some("<span class=\"room-kind\">Practice</span>")
+                .unwrap_or("");
             let join_label = if room.protected {
                 format!("Join protected room {}", room.name)
             } else {
                 format!("Join room {}", room.name)
             };
             format!(
-                "<li class=\"room-card\"><div><span class=\"room-card-title\"><strong>{}</strong>{lock}</span><span>{} / {} players</span></div><button class=\"join-room secondary\" data-room-id=\"{}\" data-room-protected=\"{protected}\" aria-label=\"{}\">Join <span aria-hidden=\"true\">→</span></button></li>",
+                "<li class=\"room-card\"><div><span class=\"room-card-title\"><strong>{}</strong>{lock}{practice}</span><span>{} / {} players</span></div><button class=\"join-room secondary\" data-room-id=\"{}\" data-room-protected=\"{protected}\" aria-label=\"{}\">Join <span aria-hidden=\"true\">→</span></button></li>",
                 escape(&room.name),
                 room.players,
                 room.capacity,
@@ -1220,20 +1623,90 @@ fn room_html(model: &Model) -> String {
     };
     let start_disabled = (!model.can_start()).then_some(" disabled").unwrap_or("");
     let owner_controls = model.local_owner();
-    let mode = model.game_mode.unwrap_or(GameMode::Function);
-    let mode_checked = |candidate| (mode == candidate).then_some(" checked").unwrap_or("");
+    let practice = (model.room_kind == Some(RoomKind::Practice))
+        .then(|| practice_editor_html(model))
+        .unwrap_or_default();
     format!(
-        "<section class=\"room-shell reveal\" aria-labelledby=\"room-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Staging area</p><h1 id=\"room-title\">{}</h1></div><button id=\"leave-room\" class=\"text-button\">Leave room</button></div><div class=\"room-grid\"><section class=\"paper-card roster\" aria-labelledby=\"players-title\"><h2 id=\"players-title\">Players <span>{}</span></h2><div class=\"team-rosters\">{}</div><p id=\"roster-move-status\" class=\"sr-only\" aria-live=\"polite\"></p></section><aside class=\"briefing paper-card command-brief\"><p>Configure your slot, then ready up. The owner starts after everyone commits.</p><fieldset class=\"mode-picker\"{}><legend>Rule set</legend><label><input type=\"radio\" name=\"game-mode\" value=\"function\"{}> Function</label><label><input type=\"radio\" name=\"game-mode\" value=\"first_order\"{}> First-order</label><label><input type=\"radio\" name=\"game-mode\" value=\"second_order\"{}> Second-order</label></fieldset><button id=\"ready-button\" class=\"primary wide\">{ready_label}</button><button id=\"add-bot\" class=\"text-button wide\"{}>Add computer</button><button id=\"start-game\" class=\"secondary wide\"{}>Start match</button></aside></div></section>{}",
+        "<section class=\"room-shell reveal\" aria-labelledby=\"room-title\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Staging area</p><h1 id=\"room-title\">{}</h1></div><button id=\"leave-room\" class=\"text-button\">Leave room</button></div><div class=\"room-grid\"><div class=\"room-main\"><section class=\"paper-card roster\" aria-labelledby=\"players-title\"><h2 id=\"players-title\">Players <span>{}</span></h2><div class=\"team-rosters\">{}</div><p id=\"roster-move-status\" class=\"sr-only\" aria-live=\"polite\"></p></section>{practice}</div><aside class=\"room-command\" aria-label=\"Room controls\"><section class=\"briefing paper-card command-brief\"><p>Set teams, ready up, then start. Bots stay ready automatically.</p><p class=\"rule-summary\"><strong>Function trajectory</strong><span>New matches use y = f(x). Legacy derivative matches still resume correctly.</span></p><button id=\"ready-button\" class=\"primary wide\">{ready_label}</button><button id=\"add-bot\" class=\"text-button wide\"{}>Add computer</button><button id=\"start-game\" class=\"secondary wide\"{}>Start match</button></section>{}</aside></div></section>",
         escape(&model.room_name),
         model.players.len(),
         room_team_rosters_html(model),
         if owner_controls { "" } else { " disabled" },
-        mode_checked(GameMode::Function),
-        mode_checked(GameMode::FirstOrder),
-        mode_checked(GameMode::SecondOrder),
-        if owner_controls { "" } else { " disabled" },
         start_disabled,
         chat_html(model, "room-chat")
+    )
+}
+
+fn practice_setup_status(setup: Option<&PracticeSetup>) -> &'static str {
+    if setup.is_some_and(|setup| setup.terrain.is_empty()) {
+        "Blank terrain is valid. Add circles or start as-is."
+    } else {
+        "Setup synchronized."
+    }
+}
+
+fn practice_editor_html(model: &Model) -> String {
+    let owner = model.local_owner();
+    let controls = if owner {
+        "<div class=\"practice-toolbar\" role=\"toolbar\" aria-label=\"Battlefield tools\"><button type=\"button\" class=\"practice-tool secondary\" data-tool=\"move\" aria-pressed=\"true\">Move soldiers</button><button type=\"button\" class=\"practice-tool secondary\" data-tool=\"add\" aria-pressed=\"false\">Place terrain</button><button type=\"button\" class=\"practice-tool secondary\" data-tool=\"erase\" aria-pressed=\"false\">Erase terrain</button><label for=\"practice-radius\">Terrain size</label><select id=\"practice-radius\"><option value=\"20\">Small</option><option value=\"40\" selected>Medium</option><option value=\"70\">Large</option></select></div>"
+    } else {
+        "<p class=\"practice-readonly\">Only the room owner can edit.</p>"
+    };
+    let precise = owner
+        .then(|| precise_placement_html(model, false))
+        .unwrap_or_default();
+    format!(
+        "<section class=\"paper-card practice-editor\" aria-labelledby=\"practice-title\"><div class=\"map-heading\"><div><p class=\"eyebrow\">Practice setup</p><h2 id=\"practice-title\">Battlefield editor</h2></div><span class=\"room-kind\">Practice</span></div>{controls}<div class=\"practice-field\"><canvas id=\"practice-canvas\" width=\"770\" height=\"450\" aria-label=\"Practice battlefield setup\"></canvas></div><p id=\"practice-status\" class=\"practice-status\" role=\"status\" aria-live=\"polite\">{}</p>{precise}</section>",
+        practice_setup_status(model.practice_setup.as_ref())
+    )
+}
+
+fn precise_placement_html(model: &Model, open: bool) -> String {
+    let soldier_options = model
+        .practice_setup
+        .as_ref()
+        .into_iter()
+        .flat_map(|setup| setup.players.iter())
+        .flat_map(|placement| {
+            let name = model
+                .players
+                .iter()
+                .find(|player| player.id == placement.player_id.to_string())
+                .map(|player| player.name.as_str())
+                .unwrap_or("Player");
+            placement
+                .soldiers
+                .iter()
+                .enumerate()
+                .map(move |(index, _)| {
+                    format!(
+                        "<option value=\"{}:{}\">{} · soldier {}</option>",
+                        placement.player_id,
+                        index,
+                        escape(name),
+                        index + 1
+                    )
+                })
+        })
+        .collect::<String>();
+    let circles = model
+        .practice_setup
+        .as_ref()
+        .into_iter()
+        .flat_map(|setup| setup.terrain.iter().enumerate())
+        .map(|(index, circle)| {
+            format!(
+                "<li>Circle {} · ({:.0}, {:.0}) · r{:.0}<button type=\"button\" class=\"practice-remove-circle text-button\" data-index=\"{index}\">Remove</button></li>",
+                index + 1,
+                circle.x,
+                circle.y,
+                circle.radius,
+            )
+        })
+        .collect::<String>();
+    let open = open.then_some(" open").unwrap_or("");
+    format!(
+        "<details class=\"practice-precise\"{open}><summary>Precise placement</summary><form id=\"practice-soldier-form\"><label for=\"practice-soldier\">Soldier</label><select id=\"practice-soldier\">{soldier_options}</select><label for=\"practice-x\">X</label><input id=\"practice-x\" type=\"number\" min=\"7\" max=\"762\" step=\"1\" required><label for=\"practice-y\">Y</label><input id=\"practice-y\" type=\"number\" min=\"7\" max=\"442\" step=\"1\" required><button class=\"secondary\" type=\"submit\">Apply soldier position</button></form><form id=\"practice-terrain-form\"><label for=\"practice-terrain-x\">Terrain X</label><input id=\"practice-terrain-x\" type=\"number\" min=\"20\" max=\"750\" step=\"1\" required><label for=\"practice-terrain-y\">Terrain Y</label><input id=\"practice-terrain-y\" type=\"number\" min=\"20\" max=\"430\" step=\"1\" required><label for=\"practice-terrain-radius\">Size</label><select id=\"practice-terrain-radius\"><option value=\"20\">Small</option><option value=\"40\">Medium</option><option value=\"70\">Large</option></select><button class=\"secondary\" type=\"submit\">Add terrain</button></form><ul class=\"practice-circle-list\">{circles}</ul></details>"
     )
 }
 
@@ -1269,6 +1742,7 @@ fn room_player_item_html(model: &Model, player: &crate::state::PlayerSummary) ->
     let local = model.player_id.as_deref() == Some(player.id.as_str());
     let movable = can_move_player(model, player);
     let draggable = movable.then_some(" draggable=\"true\"").unwrap_or("");
+    let ready = player.ready.then_some(" data-ready=\"true\"").unwrap_or("");
     let move_control = movable
         .then(|| {
             format!(
@@ -1293,7 +1767,7 @@ fn room_player_item_html(model: &Model, player: &crate::state::PlayerSummary) ->
         })
         .unwrap_or_default();
     format!(
-        "<li class=\"player-slot\" data-player-id=\"{}\" data-player-team=\"{}\"{draggable}><strong>{}</strong><div class=\"player-controls\">{move_control}<label><span class=\"sr-only\">{} soldiers</span><select class=\"player-soldiers\" data-player-id=\"{}\"{}>{}</select></label>{remove}</div></li>",
+        "<li class=\"player-slot\" data-player-id=\"{}\" data-player-team=\"{}\"{draggable}{ready}><strong>{}</strong><div class=\"player-controls\">{move_control}<label><span class=\"sr-only\">{} soldiers</span><select class=\"player-soldiers\" data-player-id=\"{}\"{}>{}</select></label>{remove}</div></li>",
         attr(&player.id),
         player.team,
         escape(&player.name),
@@ -1319,9 +1793,19 @@ fn game_html(model: &Model) -> String {
     let angle_disabled = (!second_order).then_some(" disabled").unwrap_or(disabled);
     let timer = timer_view(model);
     let fire_label = fire_label(model, local_turn);
+    let finished_hidden = (model.room_phase != Some(Phase::Finished))
+        .then_some(" hidden")
+        .unwrap_or("");
+    let return_disabled = (!model.local_owner()).then_some(" disabled").unwrap_or("");
+    let finished_hint = if model.local_owner() {
+        "Return everyone to the staging area."
+    } else {
+        "Waiting for the room owner to return to the staging area."
+    };
     format!(
-        "<section class=\"game-shell reveal\" aria-label=\"Active match\"><div class=\"war-room\"><section class=\"map-panel field-map\" aria-labelledby=\"battlefield-label\"><div class=\"map-heading\"><div><p class=\"eyebrow\">Coordinate field / 01</p><h2 id=\"battlefield-label\">Battlefield</h2></div><button id=\"leave-room\" class=\"text-button\">Retreat</button></div><div class=\"battlefield\"><canvas id=\"game-canvas\" width=\"770\" height=\"450\" aria-label=\"Graphwar battlefield\" aria-describedby=\"battlefield-summary\"></canvas>{}<div class=\"preview-key\"><i></i> Provisional</div><div class=\"axis-label x-label\">x</div><div class=\"axis-label y-label\">y</div></div><p id=\"battlefield-summary\" class=\"sr-only\">{}</p></section><aside class=\"command-stack\" aria-label=\"Command stack\"><section class=\"paper-card function-panel\" aria-labelledby=\"function-panel-title\"><h2 id=\"function-panel-title\">Function</h2><form id=\"fire-form\" class=\"fire-console\"><div class=\"equation-field\"><label for=\"function-input\">Function</label><div><span aria-hidden=\"true\">y =</span><input id=\"function-input\" spellcheck=\"false\" autocomplete=\"off\" maxlength=\"256\" required value=\"{}\" aria-describedby=\"function-hint function-error\"{disabled}></div><small id=\"function-hint\">Use x, sin, cos, tan, sqrt and standard operators.</small><p id=\"function-error\" class=\"function-error\" aria-live=\"polite\"></p></div><div class=\"angle-field\"{angle_hidden}><div class=\"angle-label\"><label for=\"angle-input\">Launch angle</label><output id=\"angle-output\" for=\"angle-input\">{:.1}°</output></div><input id=\"angle-input\" type=\"range\" min=\"-90\" max=\"90\" value=\"{:.1}\" step=\"0.1\" aria-describedby=\"angle-hint angle-output\"{angle_disabled}><small id=\"angle-hint\">Focus the slider, then use Arrow Up/Down.</small></div><button class=\"fire-button\" type=\"submit\" style=\"--turn-progress: {}%;\" aria-describedby=\"turn-timer\"{disabled}><span class=\"fire-button-label\">{}</span><span id=\"turn-timer\" class=\"fire-button-timer\" role=\"timer\">{}</span><small>Enter ↵</small></button></form></section>{}</aside></div></section>",
+        "<section class=\"game-shell reveal\" aria-label=\"Active match\"><div class=\"war-room\"><section class=\"map-panel field-map\" aria-labelledby=\"battlefield-label\"><div class=\"map-heading\"><div><p class=\"eyebrow\">Coordinate field / 01</p><h2 id=\"battlefield-label\">Battlefield</h2></div><button id=\"leave-room\" class=\"text-button\">Retreat</button></div><div class=\"battlefield\"><canvas id=\"game-canvas\" width=\"770\" height=\"450\" aria-label=\"Graphwar battlefield\" aria-describedby=\"battlefield-summary\"></canvas>{}<div class=\"preview-key\"><i></i> Provisional</div><div class=\"axis-label x-label\">x</div><div class=\"axis-label y-label\">y</div></div><p id=\"shot-status\" class=\"shot-status\" role=\"status\" aria-live=\"polite\">{}</p><p id=\"battlefield-summary\" class=\"sr-only\">{}</p></section><aside class=\"command-stack\" aria-label=\"Command stack\"><section class=\"paper-card function-panel\" aria-labelledby=\"function-panel-title\"><h2 id=\"function-panel-title\">Function</h2><form id=\"fire-form\" class=\"fire-console\"><div class=\"equation-field\"><label for=\"function-input\">Function</label><div><span aria-hidden=\"true\">y =</span><input id=\"function-input\" spellcheck=\"false\" autocomplete=\"off\" maxlength=\"256\" required value=\"{}\" aria-describedby=\"function-hint function-error\"{disabled}></div><small id=\"function-hint\">Plain: sin, atan2, min, log. LaTeX paste supported, e.g. \\frac{{\\sin(x)}}{{\\sqrt{{2}}}}.</small><p id=\"function-error\" class=\"function-error\" aria-live=\"polite\"></p></div><div class=\"angle-field\"{angle_hidden}><div class=\"angle-label\"><label for=\"angle-input\">Launch angle</label><output id=\"angle-output\" for=\"angle-input\">{:.1}°</output></div><input id=\"angle-input\" type=\"range\" min=\"-90\" max=\"90\" value=\"{:.1}\" step=\"0.1\" aria-describedby=\"angle-hint angle-output\"{angle_disabled}><small id=\"angle-hint\">Focus the slider, then use Arrow Up/Down.</small></div><button class=\"fire-button\" type=\"submit\" style=\"--turn-progress: {}%;\" aria-describedby=\"turn-timer\"{disabled}><span class=\"fire-button-label\">{}</span><span id=\"turn-timer\" class=\"fire-button-timer\" role=\"timer\">{}</span><small>Enter ↵</small></button></form><div class=\"finished-actions\"{finished_hidden}><button id=\"return-to-lobby\" class=\"primary wide\" type=\"button\"{return_disabled}>Return to lobby</button><p>{}</p></div></section>{}</aside></div></section>",
         soldier_name_labels_html(model),
+        escape(model.shot_status.as_deref().unwrap_or("")),
         escape(&battlefield_summary(model)),
         escape(if model.draft_function.is_empty() {
             "sin(x)"
@@ -1333,6 +1817,7 @@ fn game_html(model: &Model) -> String {
         timer.progress,
         escape(&fire_label),
         escape(&timer.text),
+        escape(finished_hint),
         chat_html(model, "game-chat")
     )
 }
@@ -1484,9 +1969,15 @@ fn bind_viewport_events(app: &SharedApp) -> Result<(), JsValue> {
     let window = app.borrow().window.clone();
     let redraw_app = Rc::clone(app);
     let handler = Closure::<dyn FnMut(Event)>::new(move |_| {
-        if redraw_app.borrow().model.screen == Screen::Game
-            && let Err(error) = render_canvas(&redraw_app)
-        {
+        let result = match (
+            redraw_app.borrow().model.screen.clone(),
+            redraw_app.borrow().model.room_kind,
+        ) {
+            (Screen::Game, _) => render_canvas(&redraw_app),
+            (Screen::Room, Some(RoomKind::Practice)) => render_practice_canvas(&redraw_app),
+            _ => Ok(()),
+        };
+        if let Err(error) = result {
             log_error(&format!("viewport render failed: {error:?}"));
         }
     });
@@ -1532,17 +2023,12 @@ fn battlefield_summary(model: &Model) -> String {
             )
         },
     );
-    let hits = (!model.shot_hits.is_empty())
-        .then(|| format!(" {} soldier(s) hit.", model.shot_hits.len()))
-        .unwrap_or_default();
-    let explosion = model
-        .shot_explosion
-        .as_ref()
-        .map_or_else(String::new, |explosion| {
-            format!(" Explosion at ({:.0}, {:.0}).", explosion.x, explosion.y)
-        });
+    let outcome = model
+        .shot_status
+        .as_deref()
+        .map_or_else(String::new, |status| format!(" {status}."));
     format!(
-        "Battlefield: Team One has {team_one} living soldier(s); Team Two has {team_two}. {active}{hits}{explosion}"
+        "Battlefield: Team One has {team_one} living soldier(s); Team Two has {team_two}. {active}{outcome}"
     )
 }
 
@@ -1672,16 +2158,14 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
             }
         });
         let document_for_close = document.clone();
-        let closure = Closure::<dyn FnMut(Event)>::new(move |_| {
+        bind_event(app, &dialog, "close", move |_| {
             if let Some(button) = document_for_close
                 .get_element_by_id("create-room-open")
                 .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
             {
                 let _ = button.focus();
             }
-        });
-        dialog.add_event_listener_with_callback("close", closure.as_ref().unchecked_ref())?;
-        retain_event_handler(app, closure);
+        })?;
     }
     if let Some(button) = document.get_element_by_id("create-room-cancel")
         && let Some(dialog) = document
@@ -1696,14 +2180,12 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
     {
         let bound_select = select.clone();
         let visibility_document = document.clone();
-        let closure = Closure::<dyn FnMut(Event)>::new(move |_| {
+        bind_event(app, &select, "change", move |_| {
             set_create_room_password_visibility(
                 &visibility_document,
                 bound_select.value() == "private",
             );
-        });
-        select.add_event_listener_with_callback("change", closure.as_ref().unchecked_ref())?;
-        retain_event_handler(app, closure);
+        })?;
     }
     if let Some(form) = document.get_element_by_id("create-room-form") {
         let app = Rc::clone(app);
@@ -1717,6 +2199,14 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
                     .is_some_and(|input| input.value() == "private")
                     .then_some(RoomVisibility::Private)
                     .unwrap_or(RoomVisibility::Public);
+                let kind = form
+                    .query_selector("#room-kind")
+                    .ok()
+                    .flatten()
+                    .and_then(|input| input.dyn_into::<HtmlSelectElement>().ok())
+                    .is_some_and(|input| input.value() == "practice")
+                    .then_some(RoomKind::Practice)
+                    .unwrap_or(RoomKind::Standard);
                 let password = if visibility == RoomVisibility::Private {
                     let Some(password) = password_value(&form, "room-password") else {
                         notice(&app, "Private room password is required".into());
@@ -1731,6 +2221,7 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
                     ClientMessage::CreateRoom {
                         name,
                         visibility,
+                        kind,
                         password,
                     },
                 );
@@ -1767,35 +2258,25 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
             send(&app, ClientMessage::SetReady { ready });
         });
     }
-    let mode_inputs = document.query_selector_all("input[name=game-mode]")?;
-    for index in 0..mode_inputs.length() {
-        let Some(element) = mode_inputs.item(index) else {
-            continue;
-        };
-        let element = element.unchecked_into::<HtmlInputElement>();
-        let app = Rc::clone(app);
-        bind_change(&app.clone(), &element, move |input| {
-            let mode = match input.value().as_str() {
-                "first_order" => GameMode::FirstOrder,
-                "second_order" => GameMode::SecondOrder,
-                _ => GameMode::Function,
-            };
-            send(&app, ClientMessage::SetMode { mode });
-        })?;
-    }
     if let Some(button) = document.get_element_by_id("add-bot") {
         let app = Rc::clone(app);
         bind_click(&app.clone(), &button, move || {
-            send(&app, ClientMessage::AddBot { level: 4 })
+            send(&app, ClientMessage::AddBot { level: 4 });
         });
     }
     if let Some(button) = document.get_element_by_id("start-game") {
         let app = Rc::clone(app);
         bind_click(&app.clone(), &button, move || {
-            send(&app, ClientMessage::StartGame)
+            send(&app, ClientMessage::StartGame);
         });
     }
     bind_room_roster_events(app, &document)?;
+    if app.borrow().model.screen == Screen::Room
+        && app.borrow().model.room_kind == Some(RoomKind::Practice)
+    {
+        bind_practice_events(app, &document)?;
+        render_practice_canvas(app)?;
+    }
     if let Some(input) = document.get_element_by_id("angle-input") {
         let input = input.unchecked_into::<HtmlInputElement>();
         let listener_input = input.clone();
@@ -1815,8 +2296,15 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
                 update_preview(&listener_app, &function);
             }
         });
-        input.add_event_listener_with_callback("input", closure.as_ref().unchecked_ref())?;
-        app.borrow_mut().event_handlers.push(closure);
+        let target = input.clone().unchecked_into::<web_sys::EventTarget>();
+        target.add_event_listener_with_callback("input", closure.as_ref().unchecked_ref())?;
+        retain_event_handler(&app, target, "input", closure);
+    }
+    if let Some(button) = document.get_element_by_id("return-to-lobby") {
+        let app = Rc::clone(app);
+        bind_click(&app.clone(), &button, move || {
+            send(&app, ClientMessage::ReturnToLobby);
+        });
     }
     if let Some(form) = document.get_element_by_id("fire-form") {
         let app = Rc::clone(app);
@@ -1849,8 +2337,9 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
         let closure = Closure::<dyn FnMut(Event)>::new(move |_| {
             update_preview(&preview_app, &listener_input);
         });
-        input.add_event_listener_with_callback("input", closure.as_ref().unchecked_ref())?;
-        app.borrow_mut().event_handlers.push(closure);
+        let target = input.clone().unchecked_into::<web_sys::EventTarget>();
+        target.add_event_listener_with_callback("input", closure.as_ref().unchecked_ref())?;
+        retain_event_handler(&app, target, "input", closure);
         if app.borrow().model.preview_path.is_empty() && !input.disabled() {
             update_preview(app, &input);
         }
@@ -2100,15 +2589,482 @@ fn bind_room_roster_events(app: &SharedApp, document: &Document) -> Result<(), J
     Ok(())
 }
 
+fn bind_practice_events(app: &SharedApp, document: &Document) -> Result<(), JsValue> {
+    if !app.borrow().model.local_owner() {
+        return Ok(());
+    }
+    let tools = document.query_selector_all(".practice-tool")?;
+    for index in 0..tools.length() {
+        let Some(element) = tools.item(index) else {
+            continue;
+        };
+        let element = element.unchecked_into::<web_sys::Element>();
+        let tool = element.get_attribute("data-tool").unwrap_or_default();
+        let tool_app = Rc::clone(app);
+        bind_dynamic_click(app, &element, move || {
+            tool_app.borrow_mut().practice_tool = match tool.as_str() {
+                "add" => PracticeTool::Add,
+                "erase" => PracticeTool::Erase,
+                _ => PracticeTool::Move,
+            };
+            update_practice_toolbar(&tool_app);
+        });
+    }
+    if let Some(select) = document
+        .get_element_by_id("practice-radius")
+        .and_then(|element| element.dyn_into::<HtmlSelectElement>().ok())
+    {
+        select.set_value(&app.borrow().practice_radius.to_string());
+        let radius_app = Rc::clone(app);
+        bind_dynamic_select_change(app, &select, move |select| {
+            radius_app.borrow_mut().practice_radius = select.value().parse().unwrap_or(40.0);
+        })?;
+    }
+    if let Some(form) = document
+        .get_element_by_id("practice-soldier-form")
+        .and_then(|element| element.dyn_into::<HtmlFormElement>().ok())
+    {
+        let form_app = Rc::clone(app);
+        bind_dynamic_submit(app, form, move |form| {
+            let selected = form
+                .query_selector("#practice-soldier")
+                .ok()
+                .flatten()
+                .and_then(|element| element.dyn_into::<HtmlSelectElement>().ok())
+                .map(|select| select.value());
+            let Some((player, index)) = selected.as_deref().and_then(parse_practice_soldier) else {
+                notice(&form_app, "Select a soldier".into());
+                return;
+            };
+            let Some(x) = numeric_input(&form, "practice-x") else {
+                notice(&form_app, "Enter a valid X coordinate".into());
+                return;
+            };
+            let Some(y) = numeric_input(&form, "practice-y") else {
+                notice(&form_app, "Enter a valid Y coordinate".into());
+                return;
+            };
+            mutate_practice_setup(&form_app, move |setup| {
+                let placement = setup
+                    .players
+                    .iter_mut()
+                    .find(|placement| placement.player_id == player)
+                    .ok_or("Soldier is no longer in the room")?;
+                let point = placement
+                    .soldiers
+                    .get_mut(index)
+                    .ok_or("Soldier is no longer in the room")?;
+                *point = SetupPoint { x, y };
+                Ok(())
+            });
+        });
+    }
+    if let Some(form) = document
+        .get_element_by_id("practice-terrain-form")
+        .and_then(|element| element.dyn_into::<HtmlFormElement>().ok())
+    {
+        let form_app = Rc::clone(app);
+        bind_dynamic_submit(app, form, move |form| {
+            let Some(x) = numeric_input(&form, "practice-terrain-x") else {
+                notice(&form_app, "Enter a valid terrain X coordinate".into());
+                return;
+            };
+            let Some(y) = numeric_input(&form, "practice-terrain-y") else {
+                notice(&form_app, "Enter a valid terrain Y coordinate".into());
+                return;
+            };
+            let radius = form
+                .query_selector("#practice-terrain-radius")
+                .ok()
+                .flatten()
+                .and_then(|element| element.dyn_into::<HtmlSelectElement>().ok())
+                .and_then(|select| select.value().parse::<f64>().ok())
+                .unwrap_or(40.0);
+            mutate_practice_setup(&form_app, move |setup| {
+                if setup.terrain.len() >= MAX_PRACTICE_TERRAIN_CIRCLES {
+                    return Err("Terrain limit reached");
+                }
+                setup.terrain.push(TerrainCircle { x, y, radius });
+                Ok(())
+            });
+        });
+    }
+    let removes = document.query_selector_all(".practice-remove-circle")?;
+    for index in 0..removes.length() {
+        let Some(element) = removes.item(index) else {
+            continue;
+        };
+        let element = element.unchecked_into::<web_sys::Element>();
+        let circle = element
+            .get_attribute("data-index")
+            .and_then(|index| index.parse::<usize>().ok());
+        let remove_app = Rc::clone(app);
+        bind_dynamic_click(app, &element, move || {
+            let Some(circle) = circle else { return };
+            mutate_practice_setup(&remove_app, move |setup| {
+                if circle >= setup.terrain.len() {
+                    return Err("Terrain circle is no longer present");
+                }
+                setup.terrain.remove(circle);
+                Ok(())
+            });
+        });
+    }
+    let Some(canvas) = document
+        .get_element_by_id("practice-canvas")
+        .and_then(|element| element.dyn_into::<HtmlCanvasElement>().ok())
+    else {
+        return Ok(());
+    };
+    bind_practice_pointer(app, &canvas, "pointerdown", practice_pointer_down)?;
+    bind_practice_pointer(app, &canvas, "pointermove", practice_pointer_move)?;
+    bind_practice_pointer(app, &canvas, "pointerup", practice_pointer_up)?;
+    bind_practice_pointer(app, &canvas, "pointercancel", practice_pointer_cancel)?;
+    update_practice_toolbar(app);
+    Ok(())
+}
+
+fn update_practice_toolbar(app: &SharedApp) {
+    let (document, tool) = {
+        let app = app.borrow();
+        (app.document.clone(), app.practice_tool)
+    };
+    if let Ok(buttons) = document.query_selector_all(".practice-tool") {
+        for index in 0..buttons.length() {
+            let Some(button) = buttons
+                .item(index)
+                .and_then(|button| button.dyn_into::<web_sys::Element>().ok())
+            else {
+                continue;
+            };
+            let selected = matches!(
+                (button.get_attribute("data-tool").as_deref(), tool),
+                (Some("move"), PracticeTool::Move)
+                    | (Some("add"), PracticeTool::Add)
+                    | (Some("erase"), PracticeTool::Erase)
+            );
+            let _ = button.set_attribute("aria-pressed", if selected { "true" } else { "false" });
+        }
+    }
+}
+
+fn bind_practice_pointer(
+    app: &SharedApp,
+    canvas: &HtmlCanvasElement,
+    event_name: &'static str,
+    handler: fn(&SharedApp, HtmlCanvasElement, PointerEvent),
+) -> Result<(), JsValue> {
+    let event_app = Rc::clone(app);
+    let bound_canvas = canvas.clone();
+    bind_dynamic_event_target(app, canvas, event_name, move |event| {
+        let Ok(event) = event.dyn_into::<PointerEvent>() else {
+            return;
+        };
+        handler(&event_app, bound_canvas.clone(), event);
+    })
+}
+
+fn practice_pointer_down(app: &SharedApp, canvas: HtmlCanvasElement, event: PointerEvent) {
+    event.prevent_default();
+    let Some((x, y)) = practice_pointer_point(app, &canvas, &event) else {
+        return;
+    };
+    let tool = app.borrow().practice_tool;
+    match tool {
+        PracticeTool::Move => {
+            let hit = practice_setup(app).and_then(|setup| practice_soldier_hit(&setup, x, y));
+            if let Some((player_id, soldier_index)) = hit {
+                let _ = canvas.set_pointer_capture(event.pointer_id());
+                app.borrow_mut().practice_drag = Some(PracticeDrag {
+                    pointer_id: event.pointer_id(),
+                    player_id,
+                    soldier_index,
+                });
+            } else {
+                practice_status(app, "Select a soldier, then drag it.");
+            }
+        }
+        PracticeTool::Add => {
+            let radius = app.borrow().practice_radius;
+            mutate_practice_setup(app, move |setup| {
+                if setup.terrain.len() >= MAX_PRACTICE_TERRAIN_CIRCLES {
+                    return Err("Terrain limit reached");
+                }
+                setup.terrain.push(TerrainCircle { x, y, radius });
+                Ok(())
+            });
+        }
+        PracticeTool::Erase => {
+            mutate_practice_setup(app, move |setup| {
+                let Some(index) = setup
+                    .terrain
+                    .iter()
+                    .rposition(|circle| (circle.x - x).hypot(circle.y - y) <= circle.radius)
+                else {
+                    return Err("No terrain circle at that point");
+                };
+                setup.terrain.remove(index);
+                Ok(())
+            });
+        }
+    }
+}
+
+fn practice_pointer_move(shared: &SharedApp, canvas: HtmlCanvasElement, event: PointerEvent) {
+    let drag = {
+        let app = shared.borrow();
+        app.practice_drag
+            .as_ref()
+            .filter(|drag| drag.pointer_id == event.pointer_id())
+            .map(|drag| (drag.player_id, drag.soldier_index))
+    };
+    let Some((player_id, soldier_index)) = drag else {
+        return;
+    };
+    let Some((x, y)) = practice_pointer_point(shared, &canvas, &event) else {
+        return;
+    };
+    let mut app = shared.borrow_mut();
+    if app.practice_draft.is_none() {
+        app.practice_draft = Some(app.model.practice_setup.clone().unwrap_or_default());
+    }
+    let setup = app
+        .practice_draft
+        .as_mut()
+        .expect("practice draft initialized");
+    if let Some(point) = setup
+        .players
+        .iter_mut()
+        .find(|placement| placement.player_id == player_id)
+        .and_then(|placement| placement.soldiers.get_mut(soldier_index))
+    {
+        *point = SetupPoint { x, y };
+    }
+    drop(app);
+    if let Err(error) = render_practice_canvas(shared) {
+        log_error(&format!("practice canvas render failed: {error:?}"));
+    }
+}
+
+fn practice_pointer_up(app: &SharedApp, canvas: HtmlCanvasElement, event: PointerEvent) {
+    let drag = {
+        let mut app = app.borrow_mut();
+        app.practice_drag
+            .take()
+            .filter(|drag| drag.pointer_id == event.pointer_id())
+    };
+    let Some(drag) = drag else {
+        return;
+    };
+    let _ = canvas.release_pointer_capture(event.pointer_id());
+    if let Some((x, y)) = practice_pointer_point(app, &canvas, &event) {
+        let player_id = drag.player_id;
+        let soldier_index = drag.soldier_index;
+        mutate_practice_setup(app, move |setup| {
+            let point = setup
+                .players
+                .iter_mut()
+                .find(|placement| placement.player_id == player_id)
+                .and_then(|placement| placement.soldiers.get_mut(soldier_index))
+                .ok_or("Soldier is no longer in the room")?;
+            *point = SetupPoint { x, y };
+            Ok(())
+        });
+    } else {
+        app.borrow_mut().practice_draft = None;
+        let _ = render_practice_canvas(app);
+        practice_status(app, "Move cancelled.");
+    }
+}
+
+fn practice_pointer_cancel(app: &SharedApp, canvas: HtmlCanvasElement, event: PointerEvent) {
+    cancel_practice_drag(app, &canvas, event.pointer_id());
+}
+
+fn cancel_practice_drag(app: &SharedApp, canvas: &HtmlCanvasElement, pointer_id: i32) {
+    let cancelled = {
+        let mut app = app.borrow_mut();
+        let cancelled = app
+            .practice_drag
+            .as_ref()
+            .is_some_and(|drag| drag.pointer_id == pointer_id);
+        if cancelled {
+            app.practice_drag = None;
+            app.practice_draft = None;
+        }
+        cancelled
+    };
+    if cancelled {
+        let _ = canvas.release_pointer_capture(pointer_id);
+        let _ = render_practice_canvas(app);
+        practice_status(app, "Move cancelled.");
+    }
+}
+
+fn practice_pointer_point(
+    app: &SharedApp,
+    canvas: &HtmlCanvasElement,
+    event: &PointerEvent,
+) -> Option<(f64, f64)> {
+    let rect = canvas.get_bounding_client_rect();
+    let viewport = Viewport::new(
+        rect.width(),
+        rect.height(),
+        app.borrow().window.device_pixel_ratio(),
+    );
+    let (x, y) = viewport.css_to_logical(
+        f64::from(event.client_x()) - rect.left(),
+        f64::from(event.client_y()) - rect.top(),
+    );
+    (x.is_finite() && y.is_finite()).then_some((x, y))
+}
+
+fn practice_setup(app: &SharedApp) -> Option<PracticeSetup> {
+    let app = app.borrow();
+    app.practice_draft
+        .clone()
+        .or_else(|| app.model.practice_setup.clone())
+}
+
+fn practice_soldier_hit(setup: &PracticeSetup, x: f64, y: f64) -> Option<(Uuid, usize)> {
+    setup.players.iter().find_map(|placement| {
+        placement
+            .soldiers
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, point)| (point.x - x).hypot(point.y - y) <= SOLDIER_RADIUS)
+            .map(|(index, _)| (placement.player_id, index))
+    })
+}
+
+fn mutate_practice_setup(
+    app: &SharedApp,
+    mutation: impl FnOnce(&mut PracticeSetup) -> Result<(), &'static str>,
+) {
+    let Some(mut setup) = practice_setup(app) else {
+        practice_status(app, "Setup is not available yet.");
+        return;
+    };
+    if let Err(message) = mutation(&mut setup).and_then(|_| validate_practice_setup_client(&setup))
+    {
+        app.borrow_mut().practice_draft = None;
+        practice_status(app, message);
+        let _ = render_practice_canvas(app);
+        return;
+    }
+    app.borrow_mut().practice_draft = Some(setup.clone());
+    if let Err(error) = render_practice_canvas(app) {
+        log_error(&format!("practice canvas render failed: {error:?}"));
+    }
+    submit_practice_setup(app, setup);
+}
+
+fn submit_practice_setup(app: &SharedApp, setup: PracticeSetup) {
+    let (room_id, base_revision, pending) = {
+        let app_ref = app.borrow();
+        (
+            app_ref.model.room_id.clone(),
+            app_ref.model.room_revision,
+            app_ref.practice_save.is_some(),
+        )
+    };
+    let (Some(room_id), Some(base_revision)) = (room_id, base_revision) else {
+        practice_status(app, "Setup revision is unavailable.");
+        return;
+    };
+    if pending {
+        practice_status(app, "Setup queued…");
+        return;
+    }
+    if send(
+        app,
+        ClientMessage::SetPracticeSetup {
+            base_revision,
+            setup: setup.clone(),
+        },
+    ) {
+        app.borrow_mut().practice_save = Some(PracticeSave {
+            room_id,
+            base_revision,
+            submitted: setup,
+        });
+        practice_status(app, "Saving setup…");
+    } else {
+        practice_status(app, "Setup kept locally; reconnect to retry.");
+    }
+}
+
+fn validate_practice_setup_client(setup: &PracticeSetup) -> Result<(), &'static str> {
+    if setup.terrain.len() > MAX_PRACTICE_TERRAIN_CIRCLES {
+        return Err("Terrain limit reached");
+    }
+    if setup.terrain.iter().any(|circle| {
+        !circle.x.is_finite()
+            || !circle.y.is_finite()
+            || !PRACTICE_TERRAIN_RADII.contains(&circle.radius)
+            || circle.x - circle.radius < 0.0
+            || circle.x + circle.radius > LOGICAL_WIDTH
+            || circle.y - circle.radius < 0.0
+            || circle.y + circle.radius > LOGICAL_HEIGHT
+    }) {
+        return Err("Keep each terrain circle fully inside the battlefield.");
+    }
+    let mut soldiers = Vec::new();
+    for point in setup
+        .players
+        .iter()
+        .flat_map(|placement| &placement.soldiers)
+    {
+        if !point.x.is_finite()
+            || !point.y.is_finite()
+            || point.x - SOLDIER_RADIUS < 0.0
+            || point.x + SOLDIER_RADIUS >= LOGICAL_WIDTH
+            || point.y - SOLDIER_RADIUS < 0.0
+            || point.y + SOLDIER_RADIUS >= LOGICAL_HEIGHT
+            || setup.terrain.iter().any(|circle| {
+                (circle.x - point.x).hypot(circle.y - point.y) <= circle.radius + SOLDIER_RADIUS
+            })
+            || soldiers.iter().any(|other: &SetupPoint| {
+                (other.x - point.x).abs() < 20.0 && (other.y - point.y).abs() < 20.0
+            })
+        {
+            return Err("Move soldiers inside the field, away from terrain and each other.");
+        }
+        soldiers.push(point.clone());
+    }
+    Ok(())
+}
+
+fn practice_status(app: &SharedApp, message: &str) {
+    if let Some(status) = app.borrow().document.get_element_by_id("practice-status") {
+        status.set_text_content(Some(message));
+    }
+    announce(app, message);
+}
+
+fn parse_practice_soldier(value: &str) -> Option<(Uuid, usize)> {
+    let (player, index) = value.split_once(':')?;
+    Some((Uuid::parse_str(player).ok()?, index.parse().ok()?))
+}
+
+fn numeric_input(form: &HtmlFormElement, id: &str) -> Option<f64> {
+    let value = form
+        .query_selector(&format!("#{id}"))
+        .ok()??
+        .dyn_into::<HtmlInputElement>()
+        .ok()?
+        .value_as_number();
+    value.is_finite().then_some(value)
+}
+
 fn bind_dynamic_event(
     app: &SharedApp,
     element: &web_sys::Element,
-    event_name: &str,
-    mut handler: impl FnMut(Event) + 'static,
+    event_name: &'static str,
+    handler: impl FnMut(Event) + 'static,
 ) {
-    let closure = Closure::<dyn FnMut(Event)>::new(move |event| handler(event));
-    let _ = element.add_event_listener_with_callback(event_name, closure.as_ref().unchecked_ref());
-    retain_dynamic_event_handler(app, closure);
+    let _ = bind_dynamic_event_target(app, element, event_name, handler);
 }
 
 fn select_team_player(app: &SharedApp, player_id: Uuid, team: u8, name: &str) {
@@ -2233,9 +3189,9 @@ fn update_preview(app: &SharedApp, function: &HtmlInputElement) {
     };
 
     let error = preview.err();
-    function.set_custom_validity(error.unwrap_or(""));
+    function.set_custom_validity(error.as_deref().unwrap_or(""));
     if let Some(message) = document.get_element_by_id("function-error") {
-        message.set_text_content(error);
+        message.set_text_content(error.as_deref());
     }
     if let Err(error) = render_canvas(app) {
         log_error(&format!("preview render failed: {error:?}"));
@@ -2254,6 +3210,8 @@ fn start_shot_animation(app: &SharedApp, sequence: u64) {
         let mut app_ref = app.borrow_mut();
         app_ref.shot_animation = None;
         apply_pending_game(&mut app_ref.model);
+        drop(app_ref);
+        refresh_game(app);
         return;
     }
     let started_at = js_sys::Date::now();
@@ -2305,12 +3263,62 @@ fn schedule_shot_frame(app: &SharedApp, sequence: u64) {
     }
 }
 
-fn retain_event_handler(app: &SharedApp, closure: Closure<dyn FnMut(Event)>) {
-    app.borrow_mut().event_handlers.push(closure);
+fn retain_event_handler(
+    app: &SharedApp,
+    target: web_sys::EventTarget,
+    event_name: &'static str,
+    closure: Closure<dyn FnMut(Event)>,
+) {
+    app.borrow_mut().event_handlers.push(EventHandler {
+        target,
+        event_name,
+        closure,
+    });
 }
 
-fn retain_dynamic_event_handler(app: &SharedApp, closure: Closure<dyn FnMut(Event)>) {
-    app.borrow_mut().dynamic_event_handlers.push(closure);
+fn retain_dynamic_event_handler(
+    app: &SharedApp,
+    target: web_sys::EventTarget,
+    event_name: &'static str,
+    closure: Closure<dyn FnMut(Event)>,
+) {
+    app.borrow_mut().dynamic_event_handlers.push(EventHandler {
+        target,
+        event_name,
+        closure,
+    });
+}
+
+fn bind_event<T>(
+    app: &SharedApp,
+    target: &T,
+    event_name: &'static str,
+    handler: impl FnMut(Event) + 'static,
+) -> Result<(), JsValue>
+where
+    T: Clone + JsCast,
+{
+    let target = target.clone().unchecked_into::<web_sys::EventTarget>();
+    let closure = Closure::<dyn FnMut(Event)>::new(handler);
+    target.add_event_listener_with_callback(event_name, closure.as_ref().unchecked_ref())?;
+    retain_event_handler(app, target, event_name, closure);
+    Ok(())
+}
+
+fn bind_dynamic_event_target<T>(
+    app: &SharedApp,
+    target: &T,
+    event_name: &'static str,
+    handler: impl FnMut(Event) + 'static,
+) -> Result<(), JsValue>
+where
+    T: Clone + JsCast,
+{
+    let target = target.clone().unchecked_into::<web_sys::EventTarget>();
+    let closure = Closure::<dyn FnMut(Event)>::new(handler);
+    target.add_event_listener_with_callback(event_name, closure.as_ref().unchecked_ref())?;
+    retain_dynamic_event_handler(app, target, event_name, closure);
+    Ok(())
 }
 
 fn bind_dynamic_click(
@@ -2318,9 +3326,7 @@ fn bind_dynamic_click(
     element: &web_sys::Element,
     mut handler: impl FnMut() + 'static,
 ) {
-    let closure = Closure::<dyn FnMut(Event)>::new(move |_| handler());
-    let _ = element.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref());
-    retain_dynamic_event_handler(app, closure);
+    let _ = bind_dynamic_event_target(app, element, "click", move |_| handler());
 }
 
 fn bind_dynamic_select_change(
@@ -2329,10 +3335,19 @@ fn bind_dynamic_select_change(
     mut handler: impl FnMut(HtmlSelectElement) + 'static,
 ) -> Result<(), JsValue> {
     let bound_input = input.clone();
-    let closure = Closure::<dyn FnMut(Event)>::new(move |_| handler(bound_input.clone()));
-    input.add_event_listener_with_callback("change", closure.as_ref().unchecked_ref())?;
-    retain_dynamic_event_handler(app, closure);
-    Ok(())
+    bind_dynamic_event_target(app, input, "change", move |_| handler(bound_input.clone()))
+}
+
+fn bind_dynamic_submit(
+    app: &SharedApp,
+    form: HtmlFormElement,
+    mut handler: impl FnMut(HtmlFormElement) + 'static,
+) {
+    let bound_form = form.clone();
+    let _ = bind_dynamic_event_target(app, &form, "submit", move |event| {
+        event.prevent_default();
+        handler(bound_form.clone());
+    });
 }
 
 fn bind_submit(
@@ -2341,18 +3356,14 @@ fn bind_submit(
     mut handler: impl FnMut(HtmlFormElement) + 'static,
 ) {
     let bound_form = form.clone();
-    let closure = Closure::<dyn FnMut(Event)>::new(move |event: Event| {
+    let _ = bind_event(app, &form, "submit", move |event| {
         event.prevent_default();
         handler(bound_form.clone());
     });
-    let _ = form.add_event_listener_with_callback("submit", closure.as_ref().unchecked_ref());
-    retain_event_handler(app, closure);
 }
 
 fn bind_click(app: &SharedApp, element: &web_sys::Element, mut handler: impl FnMut() + 'static) {
-    let closure = Closure::<dyn FnMut(Event)>::new(move |_| handler());
-    let _ = element.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref());
-    retain_event_handler(app, closure);
+    let _ = bind_event(app, element, "click", move |_| handler());
 }
 
 fn bind_change(
@@ -2361,10 +3372,7 @@ fn bind_change(
     mut handler: impl FnMut(HtmlInputElement) + 'static,
 ) -> Result<(), JsValue> {
     let bound_input = input.clone();
-    let closure = Closure::<dyn FnMut(Event)>::new(move |_| handler(bound_input.clone()));
-    input.add_event_listener_with_callback("change", closure.as_ref().unchecked_ref())?;
-    retain_event_handler(app, closure);
-    Ok(())
+    bind_event(app, input, "change", move |_| handler(bound_input.clone()))
 }
 
 fn set_create_room_password_visibility(document: &Document, private: bool) {
@@ -2415,6 +3423,99 @@ fn canvas_palette() -> CanvasPalette {
     }
 }
 
+fn render_practice_canvas(app: &SharedApp) -> Result<(), JsValue> {
+    let app = app.borrow();
+    let canvas = app
+        .document
+        .get_element_by_id("practice-canvas")
+        .ok_or("#practice-canvas missing")?
+        .dyn_into::<HtmlCanvasElement>()?;
+    let rect = canvas.get_bounding_client_rect();
+    let viewport = Viewport::new(rect.width(), rect.height(), app.window.device_pixel_ratio());
+    let (bitmap_width, bitmap_height) = viewport.bitmap_size();
+    canvas.set_width(bitmap_width);
+    canvas.set_height(bitmap_height);
+    let context = canvas
+        .get_context("2d")?
+        .ok_or("2d context unavailable")?
+        .dyn_into::<CanvasRenderingContext2d>()?;
+    context.set_transform(
+        bitmap_width as f64 / LOGICAL_WIDTH,
+        0.0,
+        0.0,
+        bitmap_height as f64 / LOGICAL_HEIGHT,
+        0.0,
+        0.0,
+    )?;
+    let palette = canvas_palette();
+    context.set_image_smoothing_enabled(false);
+    context.set_fill_style_str(palette.background);
+    context.fill_rect(0.0, 0.0, LOGICAL_WIDTH, LOGICAL_HEIGHT);
+    draw_grid(&context, palette);
+    let setup = app
+        .practice_draft
+        .as_ref()
+        .or(app.model.practice_setup.as_ref());
+    if let Some(setup) = setup {
+        draw_practice_terrain(&context, &setup.terrain, palette);
+        for placement in &setup.players {
+            let team = app
+                .model
+                .players
+                .iter()
+                .find(|player| player.id == placement.player_id.to_string())
+                .map(|player| player.team)
+                .unwrap_or(1);
+            for point in &placement.soldiers {
+                draw_soldier(
+                    &context,
+                    point.x,
+                    point.y,
+                    team,
+                    true,
+                    false,
+                    app.soldier_sprite_loaded
+                        .then_some(app.soldier_sprite.as_ref())
+                        .flatten(),
+                    if team == 1 {
+                        app.soldier_helmet_team_one_loaded
+                            .then_some(app.soldier_helmet_team_one.as_ref())
+                            .flatten()
+                    } else {
+                        app.soldier_helmet_team_two_loaded
+                            .then_some(app.soldier_helmet_team_two.as_ref())
+                            .flatten()
+                    },
+                    palette,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn draw_practice_terrain(
+    context: &CanvasRenderingContext2d,
+    circles: &[TerrainCircle],
+    palette: CanvasPalette,
+) {
+    context.set_fill_style_str(palette.terrain);
+    context.set_stroke_style_str(palette.terrain_stroke);
+    context.set_line_width(2.0);
+    for circle in circles {
+        context.begin_path();
+        let _ = context.arc(
+            circle.x,
+            circle.y,
+            circle.radius,
+            0.0,
+            std::f64::consts::TAU,
+        );
+        context.fill();
+        context.stroke();
+    }
+}
+
 fn render_canvas(app: &SharedApp) -> Result<(), JsValue> {
     let app = app.borrow();
     let canvas = app
@@ -2440,6 +3541,19 @@ fn render_canvas(app: &SharedApp) -> Result<(), JsValue> {
         0.0,
     )?;
     let palette = canvas_palette();
+    context.set_image_smoothing_enabled(false);
+    let soldier_sprite = app
+        .soldier_sprite_loaded
+        .then(|| app.soldier_sprite.as_ref())
+        .flatten();
+    let soldier_helmet_team_one = app
+        .soldier_helmet_team_one_loaded
+        .then(|| app.soldier_helmet_team_one.as_ref())
+        .flatten();
+    let soldier_helmet_team_two = app
+        .soldier_helmet_team_two_loaded
+        .then(|| app.soldier_helmet_team_two.as_ref())
+        .flatten();
     context.set_fill_style_str(palette.background);
     context.fill_rect(0.0, 0.0, LOGICAL_WIDTH, LOGICAL_HEIGHT);
     draw_grid(&context, palette);
@@ -2470,6 +3584,12 @@ fn render_canvas(app: &SharedApp) -> Result<(), JsValue> {
             soldier.team,
             soldier.alive,
             soldier.active,
+            soldier_sprite,
+            if soldier.team == 1 {
+                soldier_helmet_team_one
+            } else {
+                soldier_helmet_team_two
+            },
             palette,
         );
     }
@@ -2608,6 +3728,60 @@ fn draw_soldier(
     team: u8,
     alive: bool,
     active: bool,
+    sprite: Option<&HtmlImageElement>,
+    helmet: Option<&HtmlImageElement>,
+    palette: CanvasPalette,
+) {
+    if alive && let Some(sprite) = sprite {
+        let drawn = if team == 2 {
+            context.save();
+            let result = context
+                .translate(x, y)
+                .and_then(|_| context.scale(-1.0, 1.0))
+                .and_then(|_| {
+                    draw_soldier_layers(context, sprite, helmet, -SOLDIER_RADIUS, -SOLDIER_RADIUS)
+                });
+            context.restore();
+            result.is_ok()
+        } else {
+            draw_soldier_layers(
+                context,
+                sprite,
+                helmet,
+                x - SOLDIER_RADIUS,
+                y - SOLDIER_RADIUS,
+            )
+            .is_ok()
+        };
+        if drawn {
+            return;
+        }
+    }
+    draw_soldier_fallback(context, x, y, team, alive, active, palette);
+}
+
+fn draw_soldier_layers(
+    context: &CanvasRenderingContext2d,
+    sprite: &HtmlImageElement,
+    helmet: Option<&HtmlImageElement>,
+    x: f64,
+    y: f64,
+) -> Result<(), JsValue> {
+    let size = SOLDIER_RADIUS * 2.0;
+    context.draw_image_with_html_image_element_and_dw_and_dh(sprite, x, y, size, size)?;
+    if let Some(helmet) = helmet {
+        let _ = context.draw_image_with_html_image_element_and_dw_and_dh(helmet, x, y, size, size);
+    }
+    Ok(())
+}
+
+fn draw_soldier_fallback(
+    context: &CanvasRenderingContext2d,
+    x: f64,
+    y: f64,
+    team: u8,
+    alive: bool,
+    active: bool,
     palette: CanvasPalette,
 ) {
     let color = if alive {
@@ -2619,13 +3793,9 @@ fn draw_soldier(
     } else {
         palette.dead
     };
-    let radius = if active && alive { 7.0 } else { 5.0 };
+    let radius = if active && alive { SOLDIER_RADIUS } else { 5.0 };
     context.begin_path();
-    if team == 1 {
-        let _ = context.arc(x, y, radius, 0.0, std::f64::consts::TAU);
-    } else {
-        context.rect(x - radius, y - radius, radius * 2.0, radius * 2.0);
-    }
+    let _ = context.arc(x, y, radius, 0.0, std::f64::consts::TAU);
     context.set_fill_style_str(color);
     context.fill();
     context.set_stroke_style_str(palette.soldier_stroke);

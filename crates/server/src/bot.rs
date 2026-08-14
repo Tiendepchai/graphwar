@@ -1,4 +1,7 @@
-use graphwar_game_core::{Expr, GameState, Team, Terrain, TrajectoryMode, parse, trace};
+use graphwar_game_core::{
+    Expr, GameState, Team, Terrain, TrajectoryEnd, TrajectoryMode, UnaryFunction, parse,
+    projectile_hits, trace,
+};
 use graphwar_protocol::GameMode;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::time::{Duration, Instant};
@@ -292,14 +295,17 @@ fn select_parent<'a>(population: &'a [Candidate], rng: &mut StdRng) -> &'a Candi
 }
 
 fn score(trajectory: &graphwar_game_core::Trajectory, state: &GameState, team: Team) -> f64 {
-    let explosion = trajectory.points.last().copied();
+    let explosion = match trajectory.end {
+        TrajectoryEnd::TerrainImpact { point } => Some(point),
+        TrajectoryEnd::Miss(_) => None,
+    };
+    let projectile_hits = projectile_hits(&trajectory.points, state);
     let will_hit = |player: usize, soldier: usize, x: f64, y: f64| {
-        trajectory
-            .hits
-            .iter()
-            .any(|hit| hit.player == player && hit.soldier == soldier)
+        projectile_hits.contains(&(player, soldier))
             || explosion.is_some_and(|point| {
-                (point.0 - x).hypot(point.1 - y) <= graphwar_game_core::constants::EXPLOSION_RADIUS
+                (point.0 - x).hypot(point.1 - y)
+                    <= graphwar_game_core::constants::EXPLOSION_RADIUS
+                        + graphwar_game_core::constants::SOLDIER_RADIUS
             })
     };
     let mut total = 0.0;
@@ -519,13 +525,34 @@ fn expression_from_gene(gene: &[GeneToken], position: &mut usize) -> Option<Expr
             Box::new(expression_from_gene(gene, position)?),
             Box::new(expression_from_gene(gene, position)?),
         ),
-        GeneToken::Sqrt => Expr::Sqrt(Box::new(expression_from_gene(gene, position)?)),
-        GeneToken::Log10 => Expr::Log10(Box::new(expression_from_gene(gene, position)?)),
-        GeneToken::Abs => Expr::Abs(Box::new(expression_from_gene(gene, position)?)),
-        GeneToken::Sin => Expr::Sin(Box::new(expression_from_gene(gene, position)?)),
-        GeneToken::Cos => Expr::Cos(Box::new(expression_from_gene(gene, position)?)),
-        GeneToken::Tan => Expr::Tan(Box::new(expression_from_gene(gene, position)?)),
-        GeneToken::Ln => Expr::Ln(Box::new(expression_from_gene(gene, position)?)),
+        GeneToken::Sqrt => Expr::Unary(
+            UnaryFunction::Sqrt,
+            Box::new(expression_from_gene(gene, position)?),
+        ),
+        GeneToken::Log10 => Expr::Unary(
+            UnaryFunction::Log10,
+            Box::new(expression_from_gene(gene, position)?),
+        ),
+        GeneToken::Abs => Expr::Unary(
+            UnaryFunction::Abs,
+            Box::new(expression_from_gene(gene, position)?),
+        ),
+        GeneToken::Sin => Expr::Unary(
+            UnaryFunction::Sin,
+            Box::new(expression_from_gene(gene, position)?),
+        ),
+        GeneToken::Cos => Expr::Unary(
+            UnaryFunction::Cos,
+            Box::new(expression_from_gene(gene, position)?),
+        ),
+        GeneToken::Tan => Expr::Unary(
+            UnaryFunction::Tan,
+            Box::new(expression_from_gene(gene, position)?),
+        ),
+        GeneToken::Ln => Expr::Unary(
+            UnaryFunction::Ln,
+            Box::new(expression_from_gene(gene, position)?),
+        ),
     })
 }
 
@@ -555,36 +582,24 @@ fn random_angle(mode: GameMode, rng: &mut StdRng) -> f64 {
 fn expression_nodes(expression: &Expr) -> usize {
     match expression {
         Expr::Number(_) | Expr::X | Expr::Y | Expr::Dy => 1,
-        Expr::Neg(value)
-        | Expr::Sqrt(value)
-        | Expr::Log10(value)
-        | Expr::Ln(value)
-        | Expr::Abs(value)
-        | Expr::Sin(value)
-        | Expr::Cos(value)
-        | Expr::Tan(value) => 1 + expression_nodes(value),
+        Expr::Neg(value) | Expr::Unary(_, value) => 1 + expression_nodes(value),
         Expr::Add(left, right)
         | Expr::Mul(left, right)
         | Expr::Div(left, right)
-        | Expr::Pow(left, right) => 1 + expression_nodes(left) + expression_nodes(right),
+        | Expr::Pow(left, right)
+        | Expr::Binary(_, left, right) => 1 + expression_nodes(left) + expression_nodes(right),
     }
 }
 
 fn expression_depth(expression: &Expr) -> usize {
     match expression {
         Expr::Number(_) | Expr::X | Expr::Y | Expr::Dy => 1,
-        Expr::Neg(value)
-        | Expr::Sqrt(value)
-        | Expr::Log10(value)
-        | Expr::Ln(value)
-        | Expr::Abs(value)
-        | Expr::Sin(value)
-        | Expr::Cos(value)
-        | Expr::Tan(value) => 1 + expression_depth(value),
+        Expr::Neg(value) | Expr::Unary(_, value) => 1 + expression_depth(value),
         Expr::Add(left, right)
         | Expr::Mul(left, right)
         | Expr::Div(left, right)
-        | Expr::Pow(left, right) => 1 + expression_depth(left).max(expression_depth(right)),
+        | Expr::Pow(left, right)
+        | Expr::Binary(_, left, right) => 1 + expression_depth(left).max(expression_depth(right)),
     }
 }
 
@@ -602,13 +617,10 @@ fn render(expression: &Expr) -> String {
         Expr::Mul(left, right) => format!("({}*{})", render(left), render(right)),
         Expr::Div(left, right) => format!("({}/{})", render(left), render(right)),
         Expr::Pow(left, right) => format!("({}^{})", render(left), render(right)),
-        Expr::Sqrt(value) => format!("sqrt({})", render(value)),
-        Expr::Log10(value) => format!("log({})", render(value)),
-        Expr::Ln(value) => format!("ln({})", render(value)),
-        Expr::Abs(value) => format!("abs({})", render(value)),
-        Expr::Sin(value) => format!("sin({})", render(value)),
-        Expr::Cos(value) => format!("cos({})", render(value)),
-        Expr::Tan(value) => format!("tan({})", render(value)),
+        Expr::Unary(function, value) => format!("{}({})", function.name(), render(value)),
+        Expr::Binary(function, left, right) => {
+            format!("{}({},{})", function.name(), render(left), render(right))
+        }
     }
 }
 
@@ -637,16 +649,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(candidate.function, "(1.00/0.00)");
-        assert!(
-            trace(
-                &candidate.expression,
-                TrajectoryMode::Function,
-                &Terrain::default(),
-                &state(),
-                false,
-            )
-            .is_err()
-        );
+        let trajectory = trace(
+            &candidate.expression,
+            TrajectoryMode::Function,
+            &Terrain::default(),
+            &state(),
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            trajectory.end,
+            TrajectoryEnd::Miss(graphwar_game_core::TrajectoryMissReason::Numerical)
+        ));
     }
 
     #[test]
@@ -833,13 +847,20 @@ mod tests {
     }
 
     #[test]
-    fn explosion_endpoint_scores_enemy_damage() {
+    fn projectile_and_terrain_impact_score_damage() {
         let state = state();
-        let trajectory = graphwar_game_core::Trajectory {
-            points: vec![(638.0, 225.0)],
-            hits: Vec::new(),
+        let miss = graphwar_game_core::Trajectory {
+            points: vec![(100.0, 225.0), (650.0, 225.0)],
+            end: TrajectoryEnd::Miss(graphwar_game_core::TrajectoryMissReason::WorldExit),
         };
-        assert!(score(&trajectory, &state, Team::One) >= ENEMY_HIT_SCORE);
+        let impact = graphwar_game_core::Trajectory {
+            points: vec![(638.0, 225.0)],
+            end: TrajectoryEnd::TerrainImpact {
+                point: (638.0, 225.0),
+            },
+        };
+        assert!(score(&miss, &state, Team::One) >= ENEMY_HIT_SCORE);
+        assert!(score(&impact, &state, Team::One) >= ENEMY_HIT_SCORE);
     }
 
     #[test]

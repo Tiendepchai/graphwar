@@ -1,5 +1,6 @@
 use graphwar_protocol::{
-    GameMode, GameSnapshot, Phase, PlayerSnapshot, RoomSnapshot, RoomVisibility, ServerMessage,
+    GameMode, GameSnapshot, Phase, PlayerSnapshot, PracticeSetup, RoomKind, RoomSnapshot,
+    RoomVisibility, ServerMessage, ShotMissReason, ShotOutcome,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -29,6 +30,7 @@ pub struct RoomSummary {
     pub players: u16,
     pub capacity: u16,
     pub protected: bool,
+    pub kind: RoomKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,6 +104,8 @@ pub struct Model {
     pub room_revision: Option<u64>,
     pub room_name: String,
     pub room_phase: Option<Phase>,
+    pub room_kind: Option<RoomKind>,
+    pub practice_setup: Option<PracticeSetup>,
     pub game_mode: Option<GameMode>,
     pub rooms: Vec<RoomSummary>,
     pub players: Vec<PlayerSummary>,
@@ -111,7 +115,10 @@ pub struct Model {
     pub preview_path: Vec<(f64, f64)>,
     pub shot_hits: Vec<HitView>,
     pub shot_explosion: Option<ExplosionView>,
+    pub shot_status: Option<String>,
+    pub winner_team: Option<u8>,
     pub shot_sequence: u64,
+    pub(crate) last_shot_revision: Option<u64>,
     pub pending_game: Option<GameSnapshot>,
     pub draft_function: String,
     pub aim_angle_deg: f64,
@@ -186,11 +193,18 @@ pub fn reduce(model: &mut Model, action: Action) {
         Action::LeftRoom => leave_room(model),
         Action::Message(message) => match *message {
             ServerMessage::Hello { .. } => {}
-            ServerMessage::RoomCreated { snapshot, .. } => {
-                apply_room(model, snapshot);
+            ServerMessage::RoomCreated {
+                snapshot,
+                practice_setup,
+                ..
             }
-            ServerMessage::Room { snapshot } => {
-                apply_room(model, snapshot);
+            | ServerMessage::Room {
+                snapshot,
+                practice_setup,
+            } => {
+                if apply_room(model, snapshot) {
+                    model.practice_setup = practice_setup;
+                }
             }
             ServerMessage::RoomList { rooms } => {
                 model.rooms = rooms.iter().map(room_summary).collect();
@@ -202,6 +216,7 @@ pub fn reduce(model: &mut Model, action: Action) {
                     model.preview_path.clear();
                     model.shot_hits.clear();
                     model.shot_explosion = None;
+                    model.shot_status = None;
                     model.notices.clear();
                 }
             }
@@ -212,6 +227,7 @@ pub fn reduce(model: &mut Model, action: Action) {
                     model.preview_path.clear();
                     model.shot_hits.clear();
                     model.shot_explosion = None;
+                    model.shot_status = None;
                 }
             }
             ServerMessage::ShotResolved { snapshot, shot } => {
@@ -227,15 +243,21 @@ pub fn reduce(model: &mut Model, action: Action) {
             ServerMessage::StateSync {
                 snapshot,
                 game,
+                practice_setup,
                 chat_history,
             } => {
                 let room_id = snapshot.id.to_string();
-                let newer_room = model.room_id.as_deref() != Some(room_id.as_str())
+                let switched_room = model.room_id.as_deref() != Some(room_id.as_str());
+                let newer_state = switched_room
                     || model
                         .room_revision
                         .is_none_or(|revision| snapshot.revision > revision);
+                if switched_room {
+                    leave_room(model);
+                }
                 if apply_room(model, snapshot) {
-                    replace_chat_history(model, chat_history, newer_room);
+                    model.practice_setup = practice_setup;
+                    replace_chat_history(model, chat_history, newer_state);
                     if let Some(game) = game {
                         if model.pending_game.is_some() && !model.authoritative_path.is_empty() {
                             if game_matches_model(model, &game) {
@@ -247,6 +269,9 @@ pub fn reduce(model: &mut Model, action: Action) {
                             model.authoritative_path.clear();
                             model.shot_hits.clear();
                             model.shot_explosion = None;
+                            if model.room_phase != Some(Phase::Finished) {
+                                model.shot_status = None;
+                            }
                         }
                     } else {
                         model.shot_history.clear();
@@ -270,10 +295,14 @@ pub fn reduce(model: &mut Model, action: Action) {
 
 fn apply_room(model: &mut Model, snapshot: RoomSnapshot) -> bool {
     let room_id = snapshot.id.to_string();
-    if model.room_id.as_deref() == Some(room_id.as_str())
-        && model
-            .room_revision
-            .is_some_and(|revision| snapshot.revision < revision)
+    if model
+        .room_id
+        .as_deref()
+        .is_some_and(|current| current != room_id)
+        || model.room_id.as_deref() == Some(room_id.as_str())
+            && model
+                .room_revision
+                .is_some_and(|revision| snapshot.revision < revision)
     {
         return false;
     }
@@ -281,6 +310,7 @@ fn apply_room(model: &mut Model, snapshot: RoomSnapshot) -> bool {
     model.room_revision = Some(snapshot.revision);
     model.room_name = snapshot.name;
     model.room_phase = Some(snapshot.phase);
+    model.room_kind = Some(snapshot.kind);
     model.game_mode = Some(snapshot.mode);
     model.players = snapshot.players.iter().map(player_summary).collect();
     model.screen = match snapshot.phase {
@@ -298,54 +328,85 @@ fn apply_shot(model: &mut Model, shot: graphwar_protocol::ShotResolved) {
     {
         return;
     }
-    let newest_sequence = shot
-        .game
-        .shot_history
-        .iter()
-        .map(|entry| entry.sequence)
-        .max();
-    if newest_sequence.is_some_and(|sequence| {
-        model
-            .shot_history
-            .iter()
-            .any(|entry| entry.sequence == sequence)
-    }) {
+    if model.last_shot_revision == Some(shot.game.revision) {
         model.shot_history = shot_history_views(&shot.game);
         model.pending_game = Some(shot.game);
         return;
     }
-    let hit_count = shot.hits.len();
-
     let winner_team = shot.winner_team;
+    model.last_shot_revision = Some(shot.game.revision);
     model.shot_history = shot_history_views(&shot.game);
     model.authoritative_path = shot.path;
     model.preview_path.clear();
-    model.shot_hits = shot
-        .hits
-        .into_iter()
-        .map(|hit| HitView {
-            player_id: hit.player_id.to_string(),
-            index: hit.index,
-        })
-        .collect();
-    model.shot_explosion = shot.explosion.map(|explosion| ExplosionView {
-        x: explosion.x,
-        y: explosion.y,
-        radius: explosion.radius,
-    });
+    let status = match shot.outcome {
+        ShotOutcome::TerrainImpact { explosion, hits } => {
+            let hit_count = hits.len();
+            model.shot_hits = hits
+                .into_iter()
+                .map(|hit| HitView {
+                    player_id: hit.player_id.to_string(),
+                    index: hit.index,
+                })
+                .collect();
+            model.shot_explosion = Some(ExplosionView {
+                x: explosion.x,
+                y: explosion.y,
+                radius: explosion.radius,
+            });
+            if hit_count == 0 {
+                "Terrain hit; no soldiers caught in the blast".into()
+            } else {
+                model.notices.push(format!("{hit_count} soldier(s) hit"));
+                format!("Terrain hit; {hit_count} soldier(s) hit")
+            }
+        }
+        ShotOutcome::Miss { reason, hits } => {
+            let hit_count = hits.len();
+            model.shot_hits = hits
+                .into_iter()
+                .map(|hit| HitView {
+                    player_id: hit.player_id.to_string(),
+                    index: hit.index,
+                })
+                .collect();
+            model.shot_explosion = None;
+            let miss = match reason {
+                ShotMissReason::WorldExit => "trajectory left the battlefield",
+                ShotMissReason::Numerical => "function became undefined",
+                ShotMissReason::StepLimit => "simulation limit reached",
+            };
+            if hit_count == 0 {
+                format!("Shot missed: {miss}")
+            } else {
+                model.notices.push(format!("{hit_count} soldier(s) hit"));
+                format!("Shot hit {hit_count} soldier(s); {miss}")
+            }
+        }
+        ShotOutcome::Forfeit => {
+            model.shot_hits.clear();
+            model.shot_explosion = None;
+            "Player forfeited".into()
+        }
+    };
+    model.shot_status = Some(status);
     model.shot_sequence = model.shot_sequence.wrapping_add(1);
     model.pending_game = Some(shot.game);
-    if hit_count > 0 {
-        model.notices.push(format!("{hit_count} soldier(s) hit"));
-    }
     if let Some(winner_team) = winner_team {
-        model.notices.push(match winner_team {
-            1 => "Team 1 wins".into(),
-            2 => "Team 2 wins".into(),
-            _ => "Draw".into(),
-        });
+        model.winner_team = Some(winner_team);
+        let notice = winner_status(Some(winner_team));
+        if !model.notices.contains(&notice) {
+            model.notices.push(notice);
+        }
     }
     trim_notices(&mut model.notices);
+}
+
+fn winner_status(winner_team: Option<u8>) -> String {
+    match winner_team {
+        Some(1) => "Team 1 wins".into(),
+        Some(2) => "Team 2 wins".into(),
+        _ => "Draw".into(),
+    }
 }
 
 pub fn apply_pending_game(model: &mut Model) {
@@ -365,11 +426,16 @@ fn apply_game(model: &mut Model, game: GameSnapshot) -> bool {
     if !game_matches_model(model, &game) {
         return false;
     }
+    let winner_team = game.winner_team;
     model.room_revision = Some(game.revision);
     model.screen = Screen::Game;
     model.turn_player_id = game.turn_player_id.map(|id| id.to_string());
     model.turn_deadline_at = game.turn_deadline_at;
     model.shot_history = shot_history_views(&game);
+    model.winner_team = winner_team;
+    if model.room_phase == Some(Phase::Finished) {
+        model.shot_status = Some(winner_status(winner_team));
+    }
     model.soldiers = game
         .soldiers
         .into_iter()
@@ -462,6 +528,7 @@ fn room_summary(room: &RoomSnapshot) -> RoomSummary {
         players: room.players.len().try_into().unwrap_or(u16::MAX),
         capacity: 10,
         protected: room.visibility == RoomVisibility::Private,
+        kind: room.kind,
     }
 }
 
@@ -483,6 +550,8 @@ fn leave_room(model: &mut Model) {
     model.room_revision = None;
     model.room_name.clear();
     model.room_phase = None;
+    model.room_kind = None;
+    model.practice_setup = None;
     model.game_mode = None;
     model.players.clear();
     model.soldiers.clear();
@@ -491,7 +560,10 @@ fn leave_room(model: &mut Model) {
     model.preview_path.clear();
     model.shot_hits.clear();
     model.shot_explosion = None;
+    model.shot_status = None;
+    model.winner_team = None;
     model.shot_sequence = 0;
+    model.last_shot_revision = None;
     model.pending_game = None;
     model.turn_player_id = None;
     model.turn_deadline_at = None;
@@ -560,6 +632,7 @@ mod tests {
         reduce(
             &mut model,
             Action::Message(Box::new(ServerMessage::Room {
+                practice_setup: None,
                 snapshot: RoomSnapshot {
                     id: room_id,
                     name: "Calculus club".into(),
@@ -567,6 +640,7 @@ mod tests {
                     phase: Phase::Lobby,
                     revision: 0,
                     mode: GameMode::Function,
+                    kind: RoomKind::Standard,
                     players: vec![PlayerSnapshot {
                         id: player_id,
                         display_name: "Ada".into(),
@@ -585,6 +659,103 @@ mod tests {
     }
 
     #[test]
+    fn queued_room_snapshot_cannot_restore_or_replace_membership() {
+        let current_room = Uuid::new_v4();
+        let queued_room = Uuid::new_v4();
+        let snapshot = |id| RoomSnapshot {
+            id,
+            name: "Queued".into(),
+            visibility: RoomVisibility::Public,
+            phase: Phase::Lobby,
+            revision: 1,
+            mode: GameMode::Function,
+            kind: RoomKind::Standard,
+            players: Vec::new(),
+        };
+        let mut model = Model::default();
+        reduce(
+            &mut model,
+            Action::Message(Box::new(ServerMessage::Room {
+                snapshot: snapshot(current_room),
+                practice_setup: None,
+            })),
+        );
+        reduce(
+            &mut model,
+            Action::Message(Box::new(ServerMessage::Room {
+                snapshot: snapshot(queued_room),
+                practice_setup: None,
+            })),
+        );
+        assert_eq!(
+            model.room_id.as_deref(),
+            Some(current_room.to_string().as_str())
+        );
+
+        reduce(&mut model, Action::LeftRoom);
+        reduce(
+            &mut model,
+            Action::Message(Box::new(ServerMessage::Room {
+                snapshot: snapshot(queued_room),
+                practice_setup: None,
+            })),
+        );
+        assert_eq!(model.screen, Screen::Room);
+        assert_eq!(
+            model.room_id.as_deref(),
+            Some(queued_room.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn practice_room_applies_setup_and_stale_snapshot_cannot_regress_it() {
+        let room_id = Uuid::new_v4();
+        let player_id = Uuid::new_v4();
+        let newer = PracticeSetup {
+            terrain: vec![graphwar_protocol::TerrainCircle {
+                x: 100.0,
+                y: 120.0,
+                radius: 40.0,
+            }],
+            players: vec![graphwar_protocol::PracticePlayerPlacement {
+                player_id,
+                soldiers: vec![graphwar_protocol::SetupPoint { x: 30.0, y: 40.0 }],
+            }],
+        };
+        let mut model = Model::default();
+        for (revision, setup) in [(2, newer.clone()), (1, PracticeSetup::default())] {
+            reduce(
+                &mut model,
+                Action::Message(Box::new(ServerMessage::Room {
+                    snapshot: RoomSnapshot {
+                        id: room_id,
+                        name: "Practice".into(),
+                        visibility: RoomVisibility::Public,
+                        phase: Phase::Lobby,
+                        revision,
+                        mode: GameMode::Function,
+                        kind: RoomKind::Practice,
+                        players: vec![PlayerSnapshot {
+                            id: player_id,
+                            display_name: "Ada".into(),
+                            owner: true,
+                            ready: false,
+                            team: 1,
+                            soldiers: 1,
+                            is_bot: false,
+                        }],
+                    },
+                    practice_setup: Some(setup),
+                })),
+            );
+        }
+        assert_eq!(model.room_kind, Some(RoomKind::Practice));
+        assert_eq!(model.practice_setup, Some(newer));
+        reduce(&mut model, Action::LeftRoom);
+        assert!(model.practice_setup.is_none());
+    }
+
+    #[test]
     fn room_list_marks_private_rooms_as_protected() {
         let room_id = Uuid::new_v4();
         let mut model = Model::default();
@@ -598,6 +769,7 @@ mod tests {
                     phase: Phase::Lobby,
                     revision: 0,
                     mode: GameMode::Function,
+                    kind: RoomKind::Standard,
                     players: Vec::new(),
                 }],
             })),
@@ -610,6 +782,7 @@ mod tests {
                 players: 0,
                 capacity: 10,
                 protected: true,
+                kind: RoomKind::Standard,
             }]
         );
     }
@@ -622,6 +795,7 @@ mod tests {
         reduce(
             &mut model,
             Action::Message(Box::new(ServerMessage::StateSync {
+                practice_setup: None,
                 snapshot: RoomSnapshot {
                     id: room_id,
                     name: "Calculus club".into(),
@@ -629,6 +803,7 @@ mod tests {
                     phase: Phase::Planning,
                     revision: 4,
                     mode: GameMode::Function,
+                    kind: RoomKind::Standard,
                     players: vec![PlayerSnapshot {
                         id: player_id,
                         display_name: "Ada".into(),
@@ -644,6 +819,7 @@ mod tests {
                     room_id,
                     revision: 4,
                     mode: graphwar_protocol::GameMode::Function,
+                    winner_team: None,
                     turn_player_id: Some(player_id),
                     turn_deadline_at: Some(1_800_000_000),
                     soldiers: vec![graphwar_protocol::SoldierPosition {
@@ -671,23 +847,65 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_state_sync_switches_rooms() {
+        let stale_room = Uuid::new_v4();
+        let current_room = Uuid::new_v4();
+        let mut model = Model {
+            screen: Screen::Room,
+            room_id: Some(stale_room.to_string()),
+            room_revision: Some(99),
+            room_name: "Stale".into(),
+            notices: vec!["keep account notice".into()],
+            ..Model::default()
+        };
+        reduce(
+            &mut model,
+            Action::Message(Box::new(ServerMessage::StateSync {
+                snapshot: RoomSnapshot {
+                    id: current_room,
+                    name: "Current".into(),
+                    visibility: RoomVisibility::Public,
+                    phase: Phase::Lobby,
+                    revision: 1,
+                    mode: GameMode::Function,
+                    kind: RoomKind::Standard,
+                    players: Vec::new(),
+                },
+                game: None,
+                practice_setup: None,
+                chat_history: Vec::new(),
+            })),
+        );
+        assert_eq!(
+            model.room_id.as_deref(),
+            Some(current_room.to_string().as_str())
+        );
+        assert_eq!(model.room_name, "Current");
+        assert_eq!(model.screen, Screen::Room);
+        assert_eq!(model.notices, ["keep account notice"]);
+    }
+
+    #[test]
     fn readiness_tracks_current_player_transitions() {
         let player_id = Uuid::new_v4();
         let mut model = Model {
             player_id: Some(player_id.to_string()),
             ..Model::default()
         };
-        for ready in [true, false] {
+        let room_id = Uuid::new_v4();
+        for (revision, ready) in [(0, true), (1, false)] {
             reduce(
                 &mut model,
                 Action::Message(Box::new(ServerMessage::Room {
+                    practice_setup: None,
                     snapshot: RoomSnapshot {
-                        id: Uuid::new_v4(),
+                        id: room_id,
                         name: "Calculus club".into(),
                         visibility: RoomVisibility::Public,
                         phase: Phase::Lobby,
-                        revision: 0,
+                        revision,
                         mode: GameMode::Function,
+                        kind: RoomKind::Standard,
                         players: vec![PlayerSnapshot {
                             id: player_id,
                             display_name: "Ada".into(),
@@ -716,6 +934,7 @@ mod tests {
             reduce(
                 &mut model,
                 Action::Message(Box::new(ServerMessage::Room {
+                    practice_setup: None,
                     snapshot: RoomSnapshot {
                         id: room_id,
                         name: "Calculus club".into(),
@@ -723,6 +942,7 @@ mod tests {
                         phase: Phase::Lobby,
                         revision,
                         mode: GameMode::Function,
+                        kind: RoomKind::Standard,
                         players: vec![PlayerSnapshot {
                             id: player_id,
                             display_name: "Ada".into(),
@@ -751,6 +971,7 @@ mod tests {
                 room_id,
                 revision: 1,
                 mode: graphwar_protocol::GameMode::Function,
+                winner_team: None,
                 turn_player_id: None,
                 turn_deadline_at: None,
                 soldiers: Vec::new(),
@@ -854,12 +1075,14 @@ mod tests {
             phase: Phase::Planning,
             revision,
             mode: GameMode::Function,
+            kind: RoomKind::Standard,
             players: Vec::new(),
         };
         let game = GameSnapshot {
             room_id,
             revision,
             mode: GameMode::Function,
+            winner_team: None,
             turn_player_id: None,
             turn_deadline_at: None,
             soldiers: Vec::new(),
@@ -880,6 +1103,7 @@ mod tests {
         let mut model = Model {
             room_id: Some(room_id.to_string()),
             notices: vec!["Team 1 wins".into()],
+            shot_status: Some("old outcome".into()),
             ..Model::default()
         };
         reduce(
@@ -887,6 +1111,7 @@ mod tests {
             Action::Message(Box::new(active_game_message(room_id, 1, true))),
         );
         assert!(model.notices.is_empty());
+        assert!(model.shot_status.is_none());
     }
 
     #[test]
@@ -895,6 +1120,7 @@ mod tests {
         let mut model = Model {
             room_id: Some(room_id.to_string()),
             notices: vec!["1 soldier(s) hit".into()],
+            shot_status: Some("old outcome".into()),
             ..Model::default()
         };
         reduce(
@@ -902,6 +1128,7 @@ mod tests {
             Action::Message(Box::new(active_game_message(room_id, 1, false))),
         );
         assert_eq!(model.notices, ["1 soldier(s) hit"]);
+        assert!(model.shot_status.is_none());
     }
 
     #[test]
@@ -964,6 +1191,7 @@ mod tests {
         reduce(
             &mut model,
             Action::Message(Box::new(ServerMessage::StateSync {
+                practice_setup: None,
                 snapshot: RoomSnapshot {
                     id: room_id,
                     name: "Room".into(),
@@ -971,6 +1199,7 @@ mod tests {
                     phase: Phase::Lobby,
                     revision: 1,
                     mode: GameMode::Function,
+                    kind: RoomKind::Standard,
                     players: Vec::new(),
                 },
                 game: None,
@@ -1003,6 +1232,7 @@ mod tests {
         reduce(
             &mut model,
             Action::Message(Box::new(ServerMessage::StateSync {
+                practice_setup: None,
                 snapshot: RoomSnapshot {
                     id: room_id,
                     name: "Room".into(),
@@ -1010,6 +1240,7 @@ mod tests {
                     phase: Phase::Lobby,
                     revision: 1,
                     mode: GameMode::Function,
+                    kind: RoomKind::Standard,
                     players: Vec::new(),
                 },
                 game: None,
@@ -1039,6 +1270,7 @@ mod tests {
                 room_id,
                 revision: 1,
                 mode: GameMode::Function,
+                winner_team: None,
                 turn_player_id: None,
                 turn_deadline_at: None,
                 soldiers: Vec::new(),
@@ -1051,6 +1283,7 @@ mod tests {
         reduce(
             &mut model,
             Action::Message(Box::new(ServerMessage::StateSync {
+                practice_setup: None,
                 snapshot: RoomSnapshot {
                     id: room_id,
                     name: "Calculus club".into(),
@@ -1058,6 +1291,7 @@ mod tests {
                     phase: Phase::Resolving,
                     revision: 1,
                     mode: GameMode::Function,
+                    kind: RoomKind::Standard,
                     players: Vec::new(),
                 },
                 chat_history: Vec::new(),
@@ -1065,6 +1299,7 @@ mod tests {
                     room_id,
                     revision: 1,
                     mode: GameMode::Function,
+                    winner_team: None,
                     turn_player_id: Some(player_id),
                     turn_deadline_at: None,
                     soldiers: vec![graphwar_protocol::SoldierPosition {
@@ -1108,6 +1343,7 @@ mod tests {
                 room_id,
                 revision: 2,
                 mode: GameMode::Function,
+                winner_team: None,
                 turn_player_id: None,
                 turn_deadline_at: None,
                 soldiers: Vec::new(),
@@ -1127,12 +1363,14 @@ mod tests {
                     phase: Phase::Planning,
                     revision: 1,
                     mode: GameMode::Function,
+                    kind: RoomKind::Standard,
                     players: Vec::new(),
                 },
                 game: GameSnapshot {
                     room_id,
                     revision: 1,
                     mode: GameMode::Function,
+                    winner_team: None,
                     turn_player_id: None,
                     turn_deadline_at: None,
                     soldiers: Vec::new(),
@@ -1166,6 +1404,7 @@ mod tests {
             phase: Phase::Resolving,
             revision: 1,
             mode: GameMode::Function,
+            kind: RoomKind::Standard,
             players: Vec::new(),
         };
         reduce(
@@ -1174,13 +1413,16 @@ mod tests {
                 snapshot,
                 shot: graphwar_protocol::ShotResolved {
                     path: vec![(100.0, 225.0), (120.0, 225.0)],
-                    hits: Vec::new(),
-                    explosion: None,
+                    outcome: ShotOutcome::Miss {
+                        reason: ShotMissReason::WorldExit,
+                        hits: Vec::new(),
+                    },
                     winner_team: None,
                     game: GameSnapshot {
                         room_id,
                         revision: 1,
                         mode: GameMode::Function,
+                        winner_team: None,
                         turn_player_id: None,
                         turn_deadline_at: None,
                         soldiers: Vec::new(),
@@ -1200,6 +1442,106 @@ mod tests {
         );
         assert!(model.pending_game.is_some());
         assert_eq!(model.shot_history[0].function, "sin(x)");
+        assert_eq!(
+            model.shot_status.as_deref(),
+            Some("Shot missed: trajectory left the battlefield")
+        );
+        assert!(model.shot_hits.is_empty());
+        assert!(model.shot_explosion.is_none());
+    }
+
+    #[test]
+    fn miss_populates_projectile_hits_without_explosion() {
+        let room_id = Uuid::new_v4();
+        let player_id = Uuid::new_v4();
+        let mut model = Model {
+            room_id: Some(room_id.to_string()),
+            room_revision: Some(0),
+            ..Model::default()
+        };
+        apply_shot(
+            &mut model,
+            graphwar_protocol::ShotResolved {
+                path: vec![(100.0, 225.0), (120.0, 225.0)],
+                outcome: ShotOutcome::Miss {
+                    reason: ShotMissReason::WorldExit,
+                    hits: vec![graphwar_protocol::SoldierSnapshot {
+                        player_id,
+                        index: 0,
+                        team: 2,
+                        alive: false,
+                    }],
+                },
+                winner_team: None,
+                game: GameSnapshot {
+                    room_id,
+                    revision: 1,
+                    mode: GameMode::Function,
+                    winner_team: None,
+                    turn_player_id: None,
+                    turn_deadline_at: None,
+                    soldiers: Vec::new(),
+                    terrain: Vec::new(),
+                    terrain_cuts: Vec::new(),
+                    shot_history: Vec::new(),
+                },
+            },
+        );
+        assert_eq!(model.shot_hits.len(), 1);
+        assert!(model.shot_explosion.is_none());
+        assert_eq!(
+            model.shot_status.as_deref(),
+            Some("Shot hit 1 soldier(s); trajectory left the battlefield")
+        );
+    }
+
+    #[test]
+    fn terrain_impact_populates_terminal_effects() {
+        let room_id = Uuid::new_v4();
+        let player_id = Uuid::new_v4();
+        let mut model = Model {
+            room_id: Some(room_id.to_string()),
+            room_revision: Some(0),
+            ..Model::default()
+        };
+        apply_shot(
+            &mut model,
+            graphwar_protocol::ShotResolved {
+                path: vec![(100.0, 225.0), (120.0, 225.0)],
+                outcome: ShotOutcome::TerrainImpact {
+                    explosion: graphwar_protocol::TerrainCircle {
+                        x: 120.0,
+                        y: 225.0,
+                        radius: 12.0,
+                    },
+                    hits: vec![graphwar_protocol::SoldierSnapshot {
+                        player_id,
+                        index: 0,
+                        team: 2,
+                        alive: false,
+                    }],
+                },
+                winner_team: None,
+                game: GameSnapshot {
+                    room_id,
+                    revision: 1,
+                    mode: GameMode::Function,
+                    winner_team: None,
+                    turn_player_id: None,
+                    turn_deadline_at: None,
+                    soldiers: Vec::new(),
+                    terrain: Vec::new(),
+                    terrain_cuts: Vec::new(),
+                    shot_history: Vec::new(),
+                },
+            },
+        );
+        assert_eq!(model.shot_hits.len(), 1);
+        assert!(model.shot_explosion.is_some());
+        assert_eq!(
+            model.shot_status.as_deref(),
+            Some("Terrain hit; 1 soldier(s) hit")
+        );
     }
 
     #[test]
@@ -1214,17 +1556,21 @@ mod tests {
                 phase: Phase::Resolving,
                 revision: 1,
                 mode: GameMode::Function,
+                kind: RoomKind::Standard,
                 players: Vec::new(),
             },
             shot: graphwar_protocol::ShotResolved {
                 path: vec![(100.0, 225.0)],
-                hits: Vec::new(),
-                explosion: None,
+                outcome: ShotOutcome::Miss {
+                    reason: ShotMissReason::WorldExit,
+                    hits: Vec::new(),
+                },
                 winner_team: None,
                 game: GameSnapshot {
                     room_id,
                     revision: 1,
                     mode: GameMode::Function,
+                    winner_team: None,
                     turn_player_id: None,
                     turn_deadline_at: None,
                     soldiers: Vec::new(),
@@ -1253,6 +1599,57 @@ mod tests {
     }
 
     #[test]
+    fn forfeit_after_prior_shot_applies_finished_state() {
+        let room_id = Uuid::new_v4();
+        let player_id = Uuid::new_v4();
+        let history = graphwar_protocol::ShotHistoryEntry {
+            sequence: 1,
+            player_id,
+            display_name: "Ada".into(),
+            team: 1,
+            function: "x".into(),
+            angle_deg: 0.0,
+        };
+        let mut model = Model {
+            room_id: Some(room_id.to_string()),
+            room_revision: Some(1),
+            shot_history: vec![ShotHistoryView {
+                sequence: 1,
+                player_id: player_id.to_string(),
+                display_name: "Ada".into(),
+                team: 1,
+                function: "x".into(),
+                angle_deg: 0.0,
+            }],
+            ..Model::default()
+        };
+        apply_shot(
+            &mut model,
+            graphwar_protocol::ShotResolved {
+                path: Vec::new(),
+                outcome: ShotOutcome::Forfeit,
+                winner_team: Some(1),
+                game: GameSnapshot {
+                    room_id,
+                    revision: 2,
+                    mode: GameMode::Function,
+                    winner_team: None,
+                    turn_player_id: None,
+                    turn_deadline_at: None,
+                    soldiers: Vec::new(),
+                    terrain: Vec::new(),
+                    terrain_cuts: Vec::new(),
+                    shot_history: vec![history],
+                },
+            },
+        );
+        assert_eq!(model.shot_status.as_deref(), Some("Player forfeited"));
+        assert_eq!(model.shot_sequence, 1);
+        assert!(model.notices.iter().any(|notice| notice == "Team 1 wins"));
+        assert!(model.pending_game.is_some());
+    }
+
+    #[test]
     fn shot_keeps_pre_impact_board_until_animation_finishes() {
         let room_id = Uuid::new_v4();
         let player_id = Uuid::new_v4();
@@ -1277,12 +1674,14 @@ mod tests {
             phase: Phase::Resolving,
             revision: 1,
             mode: GameMode::Function,
+            kind: RoomKind::Standard,
             players: Vec::new(),
         };
         let game = GameSnapshot {
             room_id,
             revision: 1,
             mode: GameMode::Function,
+            winner_team: None,
             turn_player_id: Some(player_id),
             turn_deadline_at: None,
             soldiers: vec![graphwar_protocol::SoldierPosition {
@@ -1304,8 +1703,10 @@ mod tests {
                 snapshot,
                 shot: graphwar_protocol::ShotResolved {
                     path: vec![(100.0, 225.0), (120.0, 225.0)],
-                    hits: Vec::new(),
-                    explosion: None,
+                    outcome: ShotOutcome::Miss {
+                        reason: ShotMissReason::WorldExit,
+                        hits: Vec::new(),
+                    },
                     winner_team: None,
                     game,
                 },
@@ -1316,5 +1717,103 @@ mod tests {
         apply_pending_game(&mut model);
         assert!(!model.soldiers[0].alive);
         assert!(model.pending_game.is_none());
+    }
+
+    #[test]
+    fn every_miss_reason_has_visible_status_without_effects() {
+        let room_id = Uuid::new_v4();
+        for (reason, expected) in [
+            (
+                ShotMissReason::WorldExit,
+                "Shot missed: trajectory left the battlefield",
+            ),
+            (
+                ShotMissReason::Numerical,
+                "Shot missed: function became undefined",
+            ),
+            (
+                ShotMissReason::StepLimit,
+                "Shot missed: simulation limit reached",
+            ),
+        ] {
+            let mut model = Model {
+                room_id: Some(room_id.to_string()),
+                room_revision: Some(0),
+                shot_hits: vec![HitView {
+                    player_id: "stale".into(),
+                    index: 0,
+                }],
+                shot_explosion: Some(ExplosionView {
+                    x: 1.0,
+                    y: 2.0,
+                    radius: 3.0,
+                }),
+                ..Model::default()
+            };
+            apply_shot(
+                &mut model,
+                graphwar_protocol::ShotResolved {
+                    path: vec![(100.0, 225.0)],
+                    outcome: ShotOutcome::Miss {
+                        reason,
+                        hits: Vec::new(),
+                    },
+                    winner_team: None,
+                    game: GameSnapshot {
+                        room_id,
+                        revision: 1,
+                        mode: GameMode::Function,
+                        winner_team: None,
+                        turn_player_id: None,
+                        turn_deadline_at: None,
+                        soldiers: Vec::new(),
+                        terrain: Vec::new(),
+                        terrain_cuts: Vec::new(),
+                        shot_history: Vec::new(),
+                    },
+                },
+            );
+            assert_eq!(model.shot_status.as_deref(), Some(expected));
+            assert!(model.shot_hits.is_empty());
+            assert!(model.shot_explosion.is_none());
+        }
+    }
+
+    #[test]
+    fn finished_state_sync_restores_winner_without_duplicate_notice() {
+        let room_id = Uuid::new_v4();
+        let game = GameSnapshot {
+            room_id,
+            revision: 3,
+            mode: GameMode::Function,
+            winner_team: Some(2),
+            turn_player_id: None,
+            turn_deadline_at: None,
+            soldiers: Vec::new(),
+            terrain: Vec::new(),
+            terrain_cuts: Vec::new(),
+            shot_history: Vec::new(),
+        };
+        let message = ServerMessage::StateSync {
+            snapshot: RoomSnapshot {
+                id: room_id,
+                name: "Finished".into(),
+                visibility: RoomVisibility::Public,
+                phase: Phase::Finished,
+                revision: 3,
+                mode: GameMode::Function,
+                kind: RoomKind::Standard,
+                players: Vec::new(),
+            },
+            game: Some(game),
+            practice_setup: None,
+            chat_history: Vec::new(),
+        };
+        let mut model = Model::default();
+        reduce(&mut model, Action::Message(Box::new(message.clone())));
+        reduce(&mut model, Action::Message(Box::new(message)));
+        assert_eq!(model.winner_team, Some(2));
+        assert_eq!(model.shot_status.as_deref(), Some("Team 2 wins"));
+        assert!(model.notices.is_empty());
     }
 }
