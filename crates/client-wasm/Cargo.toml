@@ -29,8 +29,6 @@ web-sys = { workspace = true, features = [
     "CloseEvent",
     "Document",
     "DomRect",
-    "DragEvent",
-    "DataTransfer",
     "Element",
     "ErrorEvent",
     "Event",

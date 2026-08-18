@@ -16,15 +16,16 @@ use graphwar_game_core::{
 };
 
 use graphwar_protocol::{
-    ChatEntry, GameMode, GameSnapshot, Phase, PlayerSnapshot, PracticePlayerPlacement,
-    PracticeSetup, RoomKind, RoomSnapshot, RoomVisibility, SetupPoint, ShotHistoryEntry,
-    ShotMissReason, ShotOutcome, ShotResolved, SoldierPosition, SoldierSnapshot, TerrainCircle,
+    ChatEntry, DEFAULT_TURN_DURATION_SECONDS, GameMode, GameSnapshot, MAX_TURN_DURATION_SECONDS,
+    MIN_TURN_DURATION_SECONDS, Phase, PlayerSnapshot, PracticePlayerPlacement, PracticeSetup,
+    RoomKind, RoomSnapshot, RoomVisibility, SetupPoint, ShotHistoryEntry, ShotMissReason,
+    ShotOutcome, ShotResolved, SoldierPosition, SoldierSnapshot, TerrainCircle,
 };
 use password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-const REGISTRY_FORMAT_VERSION: u32 = 3;
+const REGISTRY_FORMAT_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize)]
 struct PersistedRegistry {
@@ -70,7 +71,6 @@ use uuid::Uuid;
 
 pub type RoomRegistry = std::sync::Arc<tokio::sync::RwLock<Registry>>;
 
-const TURN_DURATION: Duration = Duration::from_secs(60);
 const LOBBY_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_SHOT_HISTORY: usize = 40;
 const MAX_CHAT_HISTORY: usize = 100;
@@ -78,6 +78,7 @@ const MAX_TERRAIN_CUTS: usize = 512;
 const MAX_TRAJECTORY_POINTS: usize = 2_048;
 const MAX_ROOM_PASSWORD_BYTES: usize = 1024;
 const MAX_ROOMS: usize = 256;
+const MAX_TEAM_PLAYERS: usize = MAX_PLAYERS / 2;
 
 #[derive(Clone, Default)]
 pub struct Registry {
@@ -322,13 +323,13 @@ impl Registry {
             };
             match room.snapshot.phase {
                 Phase::Planning => {
-                    game.turn_deadline_at = turn_deadline();
+                    game.turn_deadline_at = turn_deadline(room.snapshot.turn_duration_seconds);
                     room.snapshot.revision += 1;
                     changed = true;
                 }
                 Phase::Resolving => {
                     advance_turn(&mut game.state);
-                    game.turn_deadline_at = turn_deadline();
+                    game.turn_deadline_at = turn_deadline(room.snapshot.turn_duration_seconds);
                     room.snapshot.phase = Phase::Planning;
                     room.snapshot.revision += 1;
                     changed = true;
@@ -447,6 +448,7 @@ impl Registry {
             revision: 0,
             mode: GameMode::Function,
             kind,
+            turn_duration_seconds: DEFAULT_TURN_DURATION_SECONDS,
             players: vec![PlayerSnapshot {
                 id: owner,
                 display_name,
@@ -519,7 +521,8 @@ impl Registry {
                 display_name,
                 owner: false,
                 ready: false,
-                team: 2,
+                team: open_team(&candidate.snapshot.players)
+                    .ok_or(RoomError::Invalid("room is full"))?,
                 soldiers: 2,
                 is_bot: false,
             });
@@ -609,7 +612,7 @@ impl Registry {
             if phase == Phase::Planning && current {
                 let game = candidate.game.as_mut().expect("active game exists");
                 advance_turn(&mut game.state);
-                game.turn_deadline_at = turn_deadline();
+                game.turn_deadline_at = turn_deadline(candidate.snapshot.turn_duration_seconds);
                 let game_snapshot = snapshot_for_game(&candidate);
                 let snapshot = candidate.snapshot.clone();
                 *room = candidate;
@@ -689,6 +692,30 @@ impl Registry {
         Ok(room.snapshot.clone())
     }
 
+    pub fn set_turn_duration(
+        &mut self,
+        player: Uuid,
+        seconds: u8,
+    ) -> Result<RoomSnapshot, RoomError> {
+        let room = self.member_room_mut(player)?;
+        if room.snapshot.phase != Phase::Lobby {
+            return Err(RoomError::WrongPhase);
+        }
+        if !(MIN_TURN_DURATION_SECONDS..=MAX_TURN_DURATION_SECONDS).contains(&seconds) {
+            return Err(RoomError::Invalid("turn duration must be 10-60 seconds"));
+        }
+        if !is_owner(room, player) {
+            return Err(RoomError::NotOwner);
+        }
+        if room.snapshot.turn_duration_seconds != seconds {
+            room.snapshot.turn_duration_seconds = seconds;
+            reset_readiness(room);
+            reset_lobby_deadline(room);
+            room.snapshot.revision += 1;
+        }
+        Ok(room.snapshot.clone())
+    }
+
     pub fn set_team(
         &mut self,
         player: Uuid,
@@ -713,6 +740,9 @@ impl Registry {
             .ok_or(RoomError::NotMember)?
             .team;
         if current_team != team {
+            if team_size(&room.snapshot.players, team) >= MAX_TEAM_PLAYERS {
+                return Err(RoomError::Invalid("team is full"));
+            }
             let mut candidate = room.clone();
             candidate
                 .snapshot
@@ -815,23 +845,7 @@ impl Registry {
             return Err(RoomError::Invalid("room is full"));
         }
         let id = Uuid::new_v4();
-        let team = if room
-            .snapshot
-            .players
-            .iter()
-            .filter(|slot| slot.team == 1)
-            .count()
-            <= room
-                .snapshot
-                .players
-                .iter()
-                .filter(|slot| slot.team == 2)
-                .count()
-        {
-            1
-        } else {
-            2
-        };
+        let team = open_team(&room.snapshot.players).ok_or(RoomError::Invalid("room is full"))?;
         let mut candidate = room.clone();
         candidate.members.insert(id, true);
         candidate.bots.insert(
@@ -927,7 +941,12 @@ impl Registry {
         }
         let seed = match_seed(room.snapshot.id);
         let game_state = match room.snapshot.kind {
-            RoomKind::Standard => new_match(seed, &room.snapshot.players, room.snapshot.mode)?,
+            RoomKind::Standard => new_match(
+                seed,
+                &room.snapshot.players,
+                room.snapshot.mode,
+                room.snapshot.turn_duration_seconds,
+            )?,
             RoomKind::Practice => new_practice_match(
                 seed,
                 room.practice_setup
@@ -935,6 +954,7 @@ impl Registry {
                     .ok_or(RoomError::Invalid("practice setup is missing"))?,
                 &room.snapshot.players,
                 room.snapshot.mode,
+                room.snapshot.turn_duration_seconds,
             )?,
         };
         room.snapshot.phase = Phase::Planning;
@@ -1174,7 +1194,7 @@ impl Registry {
             return Ok(None);
         }
         advance_turn(&mut game.state);
-        game.turn_deadline_at = turn_deadline();
+        game.turn_deadline_at = turn_deadline(room.snapshot.turn_duration_seconds);
         room.snapshot.revision += 1;
         Ok(Some(StartOutcome {
             snapshot: room.snapshot.clone(),
@@ -1193,13 +1213,13 @@ impl Registry {
                 }
                 if room.snapshot.phase == Phase::Resolving {
                     advance_turn(&mut game.state);
-                    game.turn_deadline_at = turn_deadline();
+                    game.turn_deadline_at = turn_deadline(room.snapshot.turn_duration_seconds);
                     room.snapshot.phase = Phase::Planning;
                 } else if room.snapshot.phase != Phase::Planning {
                     return None;
                 } else {
                     advance_turn(&mut game.state);
-                    game.turn_deadline_at = turn_deadline();
+                    game.turn_deadline_at = turn_deadline(room.snapshot.turn_duration_seconds);
                 }
                 room.snapshot.revision += 1;
                 Some(StartOutcome {
@@ -1377,10 +1397,14 @@ fn validate_persisted_room(room: &PersistedRoom) -> Result<(), String> {
         || snapshot.name.len() > 64
         || snapshot.players.is_empty()
         || snapshot.revision == u64::MAX
+        || !(MIN_TURN_DURATION_SECONDS..=MAX_TURN_DURATION_SECONDS)
+            .contains(&snapshot.turn_duration_seconds)
     {
         return Err("invalid room snapshot".into());
     }
     if snapshot.players.len() > MAX_PLAYERS
+        || team_size(&snapshot.players, 1) > MAX_TEAM_PLAYERS
+        || team_size(&snapshot.players, 2) > MAX_TEAM_PLAYERS
         || snapshot
             .players
             .iter()
@@ -1520,7 +1544,12 @@ fn validate_persisted_room(room: &PersistedRoom) -> Result<(), String> {
     Ok(())
 }
 
-fn new_match(seed: u64, players: &[PlayerSnapshot], mode: GameMode) -> Result<Match, RoomError> {
+fn new_match(
+    seed: u64,
+    players: &[PlayerSnapshot],
+    mode: GameMode,
+    turn_duration_seconds: u8,
+) -> Result<Match, RoomError> {
     let mut generator = SeededGenerator::new(seed);
     let terrain = Terrain::new(generator.terrain());
     let slots = alternating_players(players, seed);
@@ -1538,7 +1567,7 @@ fn new_match(seed: u64, players: &[PlayerSnapshot], mode: GameMode) -> Result<Ma
         terrain,
         state: GameState::new(game_players),
         player_ids,
-        turn_deadline_at: turn_deadline(),
+        turn_deadline_at: turn_deadline(turn_duration_seconds),
         shot_history: Vec::new(),
     })
 }
@@ -1548,6 +1577,7 @@ fn new_practice_match(
     setup: &PracticeSetup,
     players: &[PlayerSnapshot],
     mode: GameMode,
+    turn_duration_seconds: u8,
 ) -> Result<Match, RoomError> {
     validate_practice_setup(setup, players)?;
     let terrain = Terrain::new(
@@ -1584,7 +1614,7 @@ fn new_practice_match(
         terrain,
         state: GameState::new(game_players),
         player_ids,
-        turn_deadline_at: turn_deadline(),
+        turn_deadline_at: turn_deadline(turn_duration_seconds),
         shot_history: Vec::new(),
     })
 }
@@ -1914,6 +1944,22 @@ fn has_two_teams(players: &[PlayerSnapshot]) -> bool {
     players.iter().any(|player| player.team == 1) && players.iter().any(|player| player.team == 2)
 }
 
+fn team_size(players: &[PlayerSnapshot], team: u8) -> usize {
+    players.iter().filter(|player| player.team == team).count()
+}
+
+fn open_team(players: &[PlayerSnapshot]) -> Option<u8> {
+    let team_one = team_size(players, 1);
+    let team_two = team_size(players, 2);
+    match (team_one < MAX_TEAM_PLAYERS, team_two < MAX_TEAM_PLAYERS) {
+        (false, false) => None,
+        (true, false) => Some(1),
+        (false, true) => Some(2),
+        (true, true) if team_one <= team_two => Some(1),
+        (true, true) => Some(2),
+    }
+}
+
 fn reset_readiness(room: &mut Room) {
     for (player, ready) in &mut room.members {
         *ready = room.bots.contains_key(player);
@@ -1946,8 +1992,8 @@ fn unix_timestamp() -> i64 {
         .unwrap_or(i64::MAX)
 }
 
-fn turn_deadline() -> i64 {
-    unix_timestamp().saturating_add(TURN_DURATION.as_secs() as i64)
+fn turn_deadline(seconds: u8) -> i64 {
+    unix_timestamp().saturating_add(i64::from(seconds))
 }
 
 fn lobby_deadline() -> i64 {
@@ -2602,6 +2648,387 @@ mod tests {
     }
 
     #[test]
+    fn joins_balance_teams_and_reject_eleventh_player() {
+        let owner = Uuid::new_v4();
+        let mut registry = Registry::default();
+        let room = registry
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
+            .unwrap()
+            .0;
+
+        for index in 0..9 {
+            let snapshot = registry
+                .join(Uuid::new_v4(), format!("Guest {index}"), room.id, None)
+                .unwrap();
+            assert!(team_size(&snapshot.players, 1) <= MAX_TEAM_PLAYERS);
+            assert!(team_size(&snapshot.players, 2) <= MAX_TEAM_PLAYERS);
+        }
+        let snapshot = registry.member_snapshot(owner).unwrap();
+        assert_eq!(snapshot.players.len(), MAX_PLAYERS);
+        assert_eq!(team_size(&snapshot.players, 1), MAX_TEAM_PLAYERS);
+        assert_eq!(team_size(&snapshot.players, 2), MAX_TEAM_PLAYERS);
+        assert!(matches!(
+            registry.join(Uuid::new_v4(), "Overflow".into(), room.id, None),
+            Err(RoomError::Invalid("room is full"))
+        ));
+    }
+
+    #[test]
+    fn add_bot_balances_teams_and_rejects_full_room() {
+        let owner = Uuid::new_v4();
+        let mut registry = Registry::default();
+        registry
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
+            .unwrap();
+
+        let mut snapshot = registry.member_snapshot(owner).unwrap();
+        for _ in 0..9 {
+            snapshot = registry.add_bot(owner, 1).unwrap();
+            assert!(team_size(&snapshot.players, 1) <= MAX_TEAM_PLAYERS);
+            assert!(team_size(&snapshot.players, 2) <= MAX_TEAM_PLAYERS);
+        }
+        assert_eq!(team_size(&snapshot.players, 1), MAX_TEAM_PLAYERS);
+        assert_eq!(team_size(&snapshot.players, 2), MAX_TEAM_PLAYERS);
+        assert!(matches!(
+            registry.add_bot(owner, 1),
+            Err(RoomError::Invalid("room is full"))
+        ));
+    }
+
+    #[test]
+    fn full_target_team_change_is_rejected_without_mutation() {
+        let owner = Uuid::new_v4();
+        let mut registry = Registry::default();
+        let room = registry
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
+            .unwrap()
+            .0;
+        for index in 0..8 {
+            registry
+                .join(Uuid::new_v4(), format!("Guest {index}"), room.id, None)
+                .unwrap();
+        }
+        let players = registry.member_snapshot(owner).unwrap().players;
+        assert_eq!(team_size(&players, 1), MAX_TEAM_PLAYERS);
+        assert_eq!(team_size(&players, 2), MAX_TEAM_PLAYERS - 1);
+        for player in players.iter().filter(|player| !player.is_bot) {
+            registry.set_ready(player.id, true).unwrap();
+        }
+        let before = registry.member_snapshot(owner).unwrap();
+        let members_before = registry.rooms[&room.id].members.clone();
+        let deadline_before = registry.rooms[&room.id].lobby_deadline_at;
+        let moving = before
+            .players
+            .iter()
+            .find(|player| player.team == 2)
+            .unwrap()
+            .id;
+
+        assert!(matches!(
+            registry.set_team(owner, moving, 1),
+            Err(RoomError::Invalid("team is full"))
+        ));
+        assert_eq!(registry.member_snapshot(owner).unwrap(), before);
+        assert_eq!(registry.rooms[&room.id].members, members_before);
+        assert_eq!(registry.rooms[&room.id].lobby_deadline_at, deadline_before);
+        assert_eq!(
+            registry.set_team(moving, moving, 2).unwrap().revision,
+            before.revision
+        );
+    }
+
+    #[test]
+    fn persisted_team_caps_and_turn_duration_are_validated() {
+        let owner = Uuid::new_v4();
+        let mut registry = Registry::default();
+        registry
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
+            .unwrap();
+        registry.set_turn_duration(owner, 10).unwrap();
+        let restored = Registry::from_persisted_json(&registry.persisted_json().unwrap()).unwrap();
+        assert_eq!(
+            restored
+                .member_snapshot(owner)
+                .unwrap()
+                .turn_duration_seconds,
+            10
+        );
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&registry.persisted_json().unwrap()).unwrap();
+        legacy["version"] = 3.into();
+        legacy["rooms"][0]["snapshot"]
+            .as_object_mut()
+            .unwrap()
+            .remove("turn_duration_seconds");
+        let restored = Registry::from_persisted_json(&legacy.to_string()).unwrap();
+        assert_eq!(
+            restored
+                .member_snapshot(owner)
+                .unwrap()
+                .turn_duration_seconds,
+            DEFAULT_TURN_DURATION_SECONDS
+        );
+
+        for seconds in [9, 61] {
+            let mut invalid: serde_json::Value =
+                serde_json::from_str(&registry.persisted_json().unwrap()).unwrap();
+            invalid["rooms"][0]["snapshot"]["turn_duration_seconds"] = serde_json::json!(seconds);
+            assert!(Registry::from_persisted_json(&invalid.to_string()).is_err());
+        }
+
+        let owner = Uuid::new_v4();
+        let mut full = Registry::default();
+        let room = full
+            .create(
+                owner,
+                "Owner".into(),
+                "full".into(),
+                RoomVisibility::Public,
+                None,
+            )
+            .unwrap()
+            .0;
+        for index in 0..9 {
+            full.join(Uuid::new_v4(), format!("Guest {index}"), room.id, None)
+                .unwrap();
+        }
+        let mut overfull: serde_json::Value =
+            serde_json::from_str(&full.persisted_json().unwrap()).unwrap();
+        let players = overfull["rooms"][0]["snapshot"]["players"]
+            .as_array_mut()
+            .unwrap();
+        players
+            .iter_mut()
+            .find(|player| player["team"] == 2)
+            .unwrap()["team"] = 1.into();
+        assert!(Registry::from_persisted_json(&overfull.to_string()).is_err());
+    }
+
+    #[test]
+    fn turn_duration_changes_are_owner_lobby_only_and_reset_readiness() {
+        let owner = Uuid::new_v4();
+        let guest = Uuid::new_v4();
+        let mut registry = Registry::default();
+        let room = registry
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
+            .unwrap()
+            .0;
+        registry.join(guest, "Guest".into(), room.id, None).unwrap();
+        registry.set_ready(owner, true).unwrap();
+        registry.set_ready(guest, true).unwrap();
+        let before = registry.member_snapshot(owner).unwrap();
+
+        assert!(matches!(
+            registry.set_turn_duration(owner, 9),
+            Err(RoomError::Invalid("turn duration must be 10-60 seconds"))
+        ));
+        assert!(matches!(
+            registry.set_turn_duration(owner, 61),
+            Err(RoomError::Invalid("turn duration must be 10-60 seconds"))
+        ));
+        assert!(matches!(
+            registry.set_turn_duration(guest, 25),
+            Err(RoomError::NotOwner)
+        ));
+        assert_eq!(registry.member_snapshot(owner).unwrap(), before);
+
+        let changed = registry.set_turn_duration(owner, 10).unwrap();
+        assert_eq!(changed.turn_duration_seconds, 10);
+        assert!(changed.revision > before.revision);
+        assert!(changed.players.iter().all(|player| !player.ready));
+        let revision = changed.revision;
+        let deadline = registry.rooms[&room.id].lobby_deadline_at;
+        assert_eq!(
+            registry.set_turn_duration(owner, 10).unwrap().revision,
+            revision
+        );
+        assert_eq!(registry.rooms[&room.id].lobby_deadline_at, deadline);
+
+        registry.set_ready(owner, true).unwrap();
+        registry.set_ready(guest, true).unwrap();
+        registry.start_game(owner).unwrap();
+        assert!(matches!(
+            registry.set_turn_duration(owner, 20),
+            Err(RoomError::WrongPhase)
+        ));
+    }
+
+    fn assert_deadline_delta(deadline: i64, seconds: u8) {
+        let delta = deadline.saturating_sub(unix_timestamp());
+        assert!(
+            (i64::from(seconds).saturating_sub(1)..=i64::from(seconds)).contains(&delta),
+            "deadline delta {delta}s, expected about {seconds}s"
+        );
+    }
+
+    #[test]
+    fn configured_turn_duration_drives_planning_deadlines_only() {
+        let owner = Uuid::new_v4();
+        let guest = Uuid::new_v4();
+        let mut registry = Registry::default();
+        let room = registry
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
+            .unwrap()
+            .0;
+        registry.join(guest, "Guest".into(), room.id, None).unwrap();
+        registry.set_turn_duration(owner, 10).unwrap();
+        registry.set_ready(owner, true).unwrap();
+        registry.set_ready(guest, true).unwrap();
+
+        let start = registry.start_game(owner).unwrap();
+        assert_deadline_delta(start.game.turn_deadline_at.unwrap(), 10);
+        assert!(registry.resume_after_restart());
+        assert_deadline_delta(
+            registry
+                .member_state(owner)
+                .unwrap()
+                .1
+                .unwrap()
+                .turn_deadline_at
+                .unwrap(),
+            10,
+        );
+        let active = registry
+            .member_state(owner)
+            .unwrap()
+            .1
+            .unwrap()
+            .turn_player_id
+            .unwrap();
+        registry.fire(active, "0".into(), 0.0).unwrap();
+        assert_eq!(registry.rooms[&room.id].snapshot.phase, Phase::Resolving);
+        assert_deadline_delta(
+            registry.rooms[&room.id]
+                .game
+                .as_ref()
+                .unwrap()
+                .turn_deadline_at,
+            3,
+        );
+        registry
+            .rooms
+            .get_mut(&room.id)
+            .unwrap()
+            .game
+            .as_mut()
+            .unwrap()
+            .turn_deadline_at = 0;
+        let expired = registry.expire_turns();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].snapshot.phase, Phase::Planning);
+        assert_deadline_delta(expired[0].game.turn_deadline_at.unwrap(), 10);
+
+        let practice_owner = Uuid::new_v4();
+        let practice_guest = Uuid::new_v4();
+        let mut practice = Registry::default();
+        let practice_room = practice
+            .create_with_kind(
+                practice_owner,
+                "Owner".into(),
+                "practice".into(),
+                RoomVisibility::Public,
+                RoomKind::Practice,
+                None,
+            )
+            .unwrap()
+            .0;
+        practice
+            .join(practice_guest, "Guest".into(), practice_room.id, None)
+            .unwrap();
+        practice.set_turn_duration(practice_owner, 10).unwrap();
+        practice.set_ready(practice_owner, true).unwrap();
+        practice.set_ready(practice_guest, true).unwrap();
+        assert_deadline_delta(
+            practice
+                .start_game(practice_owner)
+                .unwrap()
+                .game
+                .turn_deadline_at
+                .unwrap(),
+            10,
+        );
+    }
+
+    #[test]
+    fn configured_turn_duration_drives_bot_skip_deadline() {
+        let owner = Uuid::new_v4();
+        let mut registry = Registry::default();
+        let room = registry
+            .create(
+                owner,
+                "Owner".into(),
+                "room".into(),
+                RoomVisibility::Public,
+                None,
+            )
+            .unwrap()
+            .0;
+        registry.add_bot(owner, 1).unwrap();
+        registry.set_turn_duration(owner, 10).unwrap();
+        registry.set_ready(owner, true).unwrap();
+        registry.start_game(owner).unwrap();
+        let active = registry
+            .member_state(owner)
+            .unwrap()
+            .1
+            .unwrap()
+            .turn_player_id
+            .unwrap();
+        registry.fire(active, "0".into(), 0.0).unwrap();
+        registry
+            .rooms
+            .get_mut(&room.id)
+            .unwrap()
+            .game
+            .as_mut()
+            .unwrap()
+            .turn_deadline_at = 0;
+        registry.expire_turns();
+        let turn = registry.pending_bot_turns().into_iter().next().unwrap();
+
+        let skipped = registry.skip_bot_turn(turn).unwrap().unwrap();
+
+        assert_deadline_delta(skipped.game.turn_deadline_at.unwrap(), 10);
+    }
+
+    #[test]
     fn owner_only_starts_ready_two_player_game() {
         let owner = Uuid::new_v4();
         let guest = Uuid::new_v4();
@@ -3154,8 +3581,20 @@ mod tests {
                 is_bot: false,
             },
         ];
-        let first = new_match(124, &players, GameMode::Function).unwrap();
-        let second = new_match(124, &players, GameMode::Function).unwrap();
+        let first = new_match(
+            124,
+            &players,
+            GameMode::Function,
+            DEFAULT_TURN_DURATION_SECONDS,
+        )
+        .unwrap();
+        let second = new_match(
+            124,
+            &players,
+            GameMode::Function,
+            DEFAULT_TURN_DURATION_SECONDS,
+        )
+        .unwrap();
 
         assert_eq!(first.terrain, second.terrain);
         assert_eq!(first.state, second.state);
@@ -3493,6 +3932,7 @@ mod tests {
             .0;
         registry.join(guest, "Guest".into(), room.id, None).unwrap();
         registry.join(third, "Third".into(), room.id, None).unwrap();
+        registry.set_team(third, third, 2).unwrap();
         registry.set_ready(owner, true).unwrap();
         registry.set_ready(guest, true).unwrap();
         registry.set_ready(third, true).unwrap();
@@ -3838,7 +4278,8 @@ mod tests {
                 .collides_point(700.0, 400.0)
         );
         room.snapshot.phase = Phase::Planning;
-        room.game.as_mut().unwrap().turn_deadline_at = turn_deadline();
+        room.game.as_mut().unwrap().turn_deadline_at =
+            turn_deadline(room.snapshot.turn_duration_seconds);
         let revision = room.snapshot.revision;
         let event_sequence = room.event_sequence;
         let game_before = room.game.as_ref().unwrap();
