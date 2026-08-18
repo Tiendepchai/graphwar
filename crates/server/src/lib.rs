@@ -809,6 +809,13 @@ async fn dispatch(
                 room_message(&rooms, snapshot),
             ))
         }
+        ClientMessage::SetTurnDuration { seconds } => {
+            let snapshot = rooms.set_turn_duration(user.id, seconds)?;
+            Ok(DispatchOutcome::room(
+                rooms.member_ids(snapshot.id),
+                room_message(&rooms, snapshot),
+            ))
+        }
         ClientMessage::SetTeam { player_id, team } => {
             let snapshot = rooms.set_team(user.id, player_id, team)?;
             Ok(DispatchOutcome::room(
@@ -1031,9 +1038,9 @@ mod tests {
     #[test]
     fn maximum_valid_outbound_messages_fit_hard_limit() {
         use graphwar_protocol::{
-            ChatEntry, GameMode, GameSnapshot, Phase, PlayerSnapshot, RoomKind, RoomSnapshot,
-            RoomVisibility, ShotHistoryEntry, ShotMissReason, ShotOutcome, ShotResolved,
-            SoldierPosition, TerrainCircle,
+            ChatEntry, DEFAULT_TURN_DURATION_SECONDS, GameMode, GameSnapshot, Phase,
+            PlayerSnapshot, RoomKind, RoomSnapshot, RoomVisibility, ShotHistoryEntry,
+            ShotMissReason, ShotOutcome, ShotResolved, SoldierPosition, TerrainCircle,
         };
 
         let room_id = uuid::Uuid::new_v4();
@@ -1056,6 +1063,7 @@ mod tests {
             revision: u64::MAX - 1,
             mode: GameMode::SecondOrder,
             kind: RoomKind::Standard,
+            turn_duration_seconds: DEFAULT_TURN_DURATION_SECONDS,
             players: players.clone(),
         };
         let game = GameSnapshot {

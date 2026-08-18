@@ -1,6 +1,6 @@
 use graphwar_protocol::{
-    GameMode, GameSnapshot, Phase, PlayerSnapshot, PracticeSetup, RoomKind, RoomSnapshot,
-    RoomVisibility, ServerMessage, ShotMissReason, ShotOutcome,
+    DEFAULT_TURN_DURATION_SECONDS, GameMode, GameSnapshot, Phase, PlayerSnapshot, PracticeSetup,
+    RoomKind, RoomSnapshot, RoomVisibility, ServerMessage, ShotMissReason, ShotOutcome,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -31,6 +31,7 @@ pub struct RoomSummary {
     pub capacity: u16,
     pub protected: bool,
     pub kind: RoomKind,
+    pub mode: GameMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,7 +95,7 @@ pub struct ShotHistoryView {
     pub angle_deg: f64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Model {
     pub screen: Screen,
     pub connection: Connection,
@@ -107,6 +108,7 @@ pub struct Model {
     pub room_kind: Option<RoomKind>,
     pub practice_setup: Option<PracticeSetup>,
     pub game_mode: Option<GameMode>,
+    pub turn_duration_seconds: u8,
     pub rooms: Vec<RoomSummary>,
     pub players: Vec<PlayerSummary>,
     pub soldiers: Vec<SoldierView>,
@@ -127,6 +129,45 @@ pub struct Model {
     pub chat: Vec<ChatView>,
     pub shot_history: Vec<ShotHistoryView>,
     pub notices: Vec<String>,
+}
+
+impl Default for Model {
+    fn default() -> Self {
+        Self {
+            screen: Screen::default(),
+            connection: Connection::default(),
+            player_id: None,
+            player_name: String::new(),
+            room_id: None,
+            room_revision: None,
+            room_name: String::new(),
+            room_phase: None,
+            room_kind: None,
+            practice_setup: None,
+            game_mode: None,
+            turn_duration_seconds: DEFAULT_TURN_DURATION_SECONDS,
+            rooms: Vec::new(),
+            players: Vec::new(),
+            soldiers: Vec::new(),
+            terrain: Vec::new(),
+            authoritative_path: Vec::new(),
+            preview_path: Vec::new(),
+            shot_hits: Vec::new(),
+            shot_explosion: None,
+            shot_status: None,
+            winner_team: None,
+            shot_sequence: 0,
+            last_shot_revision: None,
+            pending_game: None,
+            draft_function: String::new(),
+            aim_angle_deg: 0.0,
+            turn_player_id: None,
+            turn_deadline_at: None,
+            chat: Vec::new(),
+            shot_history: Vec::new(),
+            notices: Vec::new(),
+        }
+    }
 }
 
 impl Model {
@@ -312,6 +353,7 @@ fn apply_room(model: &mut Model, snapshot: RoomSnapshot) -> bool {
     model.room_phase = Some(snapshot.phase);
     model.room_kind = Some(snapshot.kind);
     model.game_mode = Some(snapshot.mode);
+    model.turn_duration_seconds = snapshot.turn_duration_seconds;
     model.players = snapshot.players.iter().map(player_summary).collect();
     model.screen = match snapshot.phase {
         Phase::Planning | Phase::Resolving | Phase::Finished => Screen::Game,
@@ -529,6 +571,7 @@ fn room_summary(room: &RoomSnapshot) -> RoomSummary {
         capacity: 10,
         protected: room.visibility == RoomVisibility::Private,
         kind: room.kind,
+        mode: room.mode,
     }
 }
 
@@ -553,6 +596,7 @@ fn leave_room(model: &mut Model) {
     model.room_kind = None;
     model.practice_setup = None;
     model.game_mode = None;
+    model.turn_duration_seconds = DEFAULT_TURN_DURATION_SECONDS;
     model.players.clear();
     model.soldiers.clear();
     model.terrain.clear();
@@ -641,6 +685,7 @@ mod tests {
                     revision: 0,
                     mode: GameMode::Function,
                     kind: RoomKind::Standard,
+                    turn_duration_seconds: DEFAULT_TURN_DURATION_SECONDS,
                     players: vec![PlayerSnapshot {
                         id: player_id,
                         display_name: "Ada".into(),
@@ -670,6 +715,7 @@ mod tests {
             revision: 1,
             mode: GameMode::Function,
             kind: RoomKind::Standard,
+            turn_duration_seconds: DEFAULT_TURN_DURATION_SECONDS,
             players: Vec::new(),
         };
         let mut model = Model::default();
@@ -735,6 +781,7 @@ mod tests {
                         revision,
                         mode: GameMode::Function,
                         kind: RoomKind::Practice,
+                        turn_duration_seconds: DEFAULT_TURN_DURATION_SECONDS,
                         players: vec![PlayerSnapshot {
                             id: player_id,
                             display_name: "Ada".into(),
@@ -770,6 +817,7 @@ mod tests {
                     revision: 0,
                     mode: GameMode::Function,
                     kind: RoomKind::Standard,
+                    turn_duration_seconds: DEFAULT_TURN_DURATION_SECONDS,
                     players: Vec::new(),
                 }],
             })),
@@ -783,6 +831,7 @@ mod tests {
                 capacity: 10,
                 protected: true,
                 kind: RoomKind::Standard,
+                mode: GameMode::Function,
             }]
         );
     }
@@ -804,6 +853,7 @@ mod tests {
                     revision: 4,
                     mode: GameMode::Function,
                     kind: RoomKind::Standard,
+                    turn_duration_seconds: DEFAULT_TURN_DURATION_SECONDS,
                     players: vec![PlayerSnapshot {
                         id: player_id,
                         display_name: "Ada".into(),
@@ -869,6 +919,7 @@ mod tests {
                     revision: 1,
                     mode: GameMode::Function,
                     kind: RoomKind::Standard,
+                    turn_duration_seconds: DEFAULT_TURN_DURATION_SECONDS,
                     players: Vec::new(),
                 },
                 game: None,
@@ -906,6 +957,7 @@ mod tests {
                         revision,
                         mode: GameMode::Function,
                         kind: RoomKind::Standard,
+                        turn_duration_seconds: DEFAULT_TURN_DURATION_SECONDS,
                         players: vec![PlayerSnapshot {
                             id: player_id,
                             display_name: "Ada".into(),
@@ -943,6 +995,7 @@ mod tests {
                         revision,
                         mode: GameMode::Function,
                         kind: RoomKind::Standard,
+                        turn_duration_seconds: DEFAULT_TURN_DURATION_SECONDS,
                         players: vec![PlayerSnapshot {
                             id: player_id,
                             display_name: "Ada".into(),
@@ -1076,6 +1129,7 @@ mod tests {
             revision,
             mode: GameMode::Function,
             kind: RoomKind::Standard,
+            turn_duration_seconds: DEFAULT_TURN_DURATION_SECONDS,
             players: Vec::new(),
         };
         let game = GameSnapshot {
@@ -1200,6 +1254,7 @@ mod tests {
                     revision: 1,
                     mode: GameMode::Function,
                     kind: RoomKind::Standard,
+                    turn_duration_seconds: DEFAULT_TURN_DURATION_SECONDS,
                     players: Vec::new(),
                 },
                 game: None,
@@ -1241,6 +1296,7 @@ mod tests {
                     revision: 1,
                     mode: GameMode::Function,
                     kind: RoomKind::Standard,
+                    turn_duration_seconds: DEFAULT_TURN_DURATION_SECONDS,
                     players: Vec::new(),
                 },
                 game: None,
@@ -1292,6 +1348,7 @@ mod tests {
                     revision: 1,
                     mode: GameMode::Function,
                     kind: RoomKind::Standard,
+                    turn_duration_seconds: DEFAULT_TURN_DURATION_SECONDS,
                     players: Vec::new(),
                 },
                 chat_history: Vec::new(),
@@ -1364,6 +1421,7 @@ mod tests {
                     revision: 1,
                     mode: GameMode::Function,
                     kind: RoomKind::Standard,
+                    turn_duration_seconds: DEFAULT_TURN_DURATION_SECONDS,
                     players: Vec::new(),
                 },
                 game: GameSnapshot {
@@ -1405,6 +1463,7 @@ mod tests {
             revision: 1,
             mode: GameMode::Function,
             kind: RoomKind::Standard,
+            turn_duration_seconds: DEFAULT_TURN_DURATION_SECONDS,
             players: Vec::new(),
         };
         reduce(
@@ -1557,6 +1616,7 @@ mod tests {
                 revision: 1,
                 mode: GameMode::Function,
                 kind: RoomKind::Standard,
+                turn_duration_seconds: DEFAULT_TURN_DURATION_SECONDS,
                 players: Vec::new(),
             },
             shot: graphwar_protocol::ShotResolved {
@@ -1675,6 +1735,7 @@ mod tests {
             revision: 1,
             mode: GameMode::Function,
             kind: RoomKind::Standard,
+            turn_duration_seconds: DEFAULT_TURN_DURATION_SECONDS,
             players: Vec::new(),
         };
         let game = GameSnapshot {
@@ -1803,6 +1864,7 @@ mod tests {
                 revision: 3,
                 mode: GameMode::Function,
                 kind: RoomKind::Standard,
+                turn_duration_seconds: DEFAULT_TURN_DURATION_SECONDS,
                 players: Vec::new(),
             },
             game: Some(game),

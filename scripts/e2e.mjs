@@ -24,7 +24,7 @@ const CHROME_CANDIDATES = process.env.CHROME_BIN
           `${process.env["PROGRAMFILES(X86)"] ?? "C:\\Program Files (x86)"}\\Google\\Chrome\\Application\\chrome.exe`,
         ]
       : ["google-chrome", "chromium", "chromium-browser"];
-const PROTOCOL_VERSION = 10;
+const PROTOCOL_VERSION = 11;
 const CAPTURE_PATH = process.env.E2E_CAPTURE_PATH ? path.resolve(process.env.E2E_CAPTURE_PATH) : null;
 const timeoutMs = Number(process.env.E2E_TIMEOUT_MS ?? 15_000);
 if (BASE.protocol === "https:" && process.env.E2E_TLS_VERIFY === "false") {
@@ -275,6 +275,20 @@ async function openWs(cookie, origin = ORIGIN) {
   return socket;
 }
 
+async function activeRoomSnapshot(cookie, label) {
+  const socket = await rawWs(cookie);
+  try {
+    socket.sendText(JSON.stringify({type: "hello", payload: {version: PROTOCOL_VERSION}}));
+    const hello = JSON.parse((await socket.next(`${label} hello`)).text);
+    ok(hello.type === "hello" && hello.payload.version === PROTOCOL_VERSION, `${label} server hello mismatch`);
+    const sync = JSON.parse((await socket.next(`${label} state sync`)).text);
+    ok(sync.type === "state_sync" && sync.payload?.snapshot, `${label} state sync missing: ${JSON.stringify(sync)}`);
+    return sync.payload.snapshot;
+  } finally {
+    socket.close();
+  }
+}
+
 async function nextWsMessage(socket, type, label) {
   return nextWsMessageAny(socket, [type], label);
 }
@@ -318,8 +332,14 @@ async function wsBoundaryChecks(session) {
   wrongOrigin.socket.destroy();
 
   const unsupported = await rawWs(session.cookie);
-  unsupported.sendText(JSON.stringify({type: "hello", payload: {version: 2}}));
-  ok((await unsupported.next()).text.includes("unsupported protocol"), "unsupported version not rejected");
+  unsupported.sendText(JSON.stringify({type: "hello", payload: {version: PROTOCOL_VERSION - 1}}));
+  const unsupportedError = JSON.parse((await unsupported.next("unsupported protocol error")).text);
+  ok(
+    unsupportedError.type === "error" && unsupportedError.payload?.code === "unsupported_protocol",
+    `unsupported version not rejected: ${JSON.stringify(unsupportedError)}`,
+  );
+  const unsupportedClose = await unsupported.next("unsupported protocol close");
+  ok(unsupportedClose.closeCode === 1002, `unsupported version close ${unsupportedClose.closeCode}, expected 1002`);
   unsupported.close();
 
   const firstCommand = await rawWs(session.cookie);
@@ -645,9 +665,11 @@ async function browserFlows() {
       return parseFloat(getComputedStyle(title).fontSize) <= 52
         && document.querySelectorAll('.player-team').length === 0
         && document.querySelectorAll('.player-soldiers').length === 1
+        && [...document.querySelectorAll('.player-soldiers')].every(select => select.offsetParent !== null && select.getBoundingClientRect().height >= 44)
         && document.querySelectorAll('.remove-player').length === 0
         && teamTwo?.querySelectorAll('.player-slot').length === 0
-        && teamTwo?.querySelector('.empty-team')?.tagName === 'P'
+        && teamTwo?.querySelectorAll('.empty-slot').length === 5
+        && !teamTwo?.querySelector('.empty-team')
         && row?.querySelector('.player-soldiers')
         && !row?.querySelector('.remove-player');
     })()`, "compact owner roster");
@@ -673,23 +695,21 @@ async function browserFlows() {
       const guestRow = [...document.querySelectorAll('.player-slot')]
         .find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(bravo.display_name)});
       const remove = guestRow?.querySelector('.remove-player');
-      const select = guestRow?.querySelector('.player-soldiers');
       const removeRect = remove?.getBoundingClientRect();
-      const selectRect = select?.getBoundingClientRect();
       return teams.length === 2
-        && teams.map(team => team.querySelector('h3')?.textContent).join('|') === 'Team One|Team Two'
-        && document.querySelectorAll('.roster li').length === 2
+        && teams.map(team => team.querySelector('h3')?.childNodes[0]?.textContent.trim()).join('|') === 'Team One|Team Two'
+        && document.querySelectorAll('.roster li.player-slot').length === 2
+        && document.querySelectorAll('.empty-slot').length === 8
         && document.querySelectorAll('.player-team').length === 0
         && document.querySelectorAll('.player-soldiers').length === 2
+        && [...document.querySelectorAll('.player-soldiers')].every(select => select.offsetParent !== null && select.getBoundingClientRect().height >= 44)
         && document.querySelectorAll('.remove-player').length === 1
         && roster['1']?.includes(${JSON.stringify(alpha.display_name)})
         && roster['2']?.includes(${JSON.stringify(bravo.display_name)})
-        && remove?.previousElementSibling?.querySelector('.player-soldiers') === select
         && removeRect?.width >= 44
-        && removeRect?.height >= 44
-        && selectRect?.right <= removeRect?.left;
+        && removeRect?.height >= 44;
     })()`, "public team roster synchronization");
-    await browserWait(b.cdp, `document.querySelectorAll('.player-soldiers').length === 2 && document.querySelectorAll('.remove-player').length === 0`, "guest roster controls");
+    await browserWait(b.cdp, `document.querySelectorAll('.player-soldiers').length === 2 && [...document.querySelectorAll('.player-soldiers')].every(select => select.offsetParent !== null && select.getBoundingClientRect().height >= 44) && document.querySelectorAll('.remove-player').length === 0`, "guest roster controls");
     for (const [cdp, owner] of [[a.cdp, true], [b.cdp, false]]) {
       ok(await cdp.evaluate(`(() => {
         const alpha = ${JSON.stringify(alpha.display_name)};
@@ -698,24 +718,148 @@ async function browserFlows() {
           .find(row => row.querySelector('strong')?.textContent === name);
         const alphaRow = rowFor(alpha);
         const bravoRow = rowFor(bravo);
-        const targets = [...document.querySelectorAll('.team-drop-target')];
-        return Boolean(alphaRow?.querySelector('.select-player')) === ${owner}
-          && Boolean(bravoRow?.querySelector('.select-player'))
-          && Boolean(alphaRow?.matches('[draggable="true"]')) === ${owner}
-          && Boolean(bravoRow?.matches('[draggable="true"]'))
-          && targets.length === 2
-          && targets.every(target => target.tabIndex >= 0
-            && target.getBoundingClientRect().width > 0
-            && target.getBoundingClientRect().height >= 44
-            && target.getAttribute('aria-disabled') === 'true');
-      })()`), `${owner ? "owner" : "guest"} team-transfer permissions or targets missing`);
+        const alphaMove = alphaRow?.querySelector('.select-player');
+        const bravoMove = bravoRow?.querySelector('.select-player');
+        const add = document.querySelector('#add-bot');
+        const start = document.querySelector('#start-game');
+        const ready = document.querySelector('#ready-button');
+        return document.querySelector('.room-title-line > span')?.textContent.trim() === 'Room:'
+          && document.querySelector('#room-title')?.textContent === ${publicNameJs}
+          && Boolean(document.querySelector('#leave-room'))
+          && Boolean(ready) && !ready.hidden
+          && Boolean(add && !add.hidden && !add.disabled) === ${owner}
+          && Boolean(start && !start.hidden) === ${owner}
+          && (!${owner} || start.disabled)
+          && !document.body.textContent.includes('Copy Invite Link')
+          && Boolean(alphaMove) === ${owner}
+          && Boolean(bravoMove)
+          && !document.querySelector('.team-drop-target')
+          && !document.querySelector('.player-slot[draggable="true"]')
+          && [...document.querySelectorAll('.select-player')].every(button => !button.hasAttribute('aria-pressed'))
+          && [...document.querySelectorAll('.select-player')].every(button => button.dataset.targetTeam && button.getBoundingClientRect().height >= 44 && button.textContent.trim() === '⇄ Team ' + button.dataset.targetTeam)
+          && [...document.querySelectorAll('.player-soldiers')].every(select => select.offsetParent !== null && select.getBoundingClientRect().height >= 44)
+          && [...document.querySelectorAll('.player-name-line strong')].every(name => getComputedStyle(name).whiteSpace !== 'nowrap' && getComputedStyle(name).textOverflow !== 'ellipsis')
+          && [...document.querySelectorAll('.player-slot')].every(row => row.getBoundingClientRect().height >= 92)
+          && bravoMove?.getAttribute('aria-label') === 'Move ' + bravo + ' to Team One';
+      })()`), `${owner ? "owner" : "guest"} staging controls or direct team-transfer permissions missing`);
     }
-    const guestSoldiers = await a.cdp.evaluate(`(() => {
-      const row = [...document.querySelectorAll('.player-slot')]
-        .find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(bravo.display_name)});
-      return row?.querySelector('.player-soldiers')?.value;
-    })()`);
-    ok(guestSoldiers, "guest soldier count missing before team move");
+    for (const [cdp, owner] of [[a.cdp, true], [b.cdp, false]]) {
+      ok(await cdp.evaluate(`(() => {
+        const input = document.querySelector('#turn-duration-input');
+        const output = document.querySelector('#turn-duration-output');
+        const hint = document.querySelector('#turn-duration-hint');
+        const inputProgress = Number.parseFloat(getComputedStyle(input).getPropertyValue('--turn-duration-progress'));
+        const controlProgress = Number.parseFloat(getComputedStyle(document.querySelector('.turn-duration-control')).getPropertyValue('--turn-duration-progress'));
+        return input?.type === 'range'
+          && input.min === '10'
+          && input.max === '60'
+          && input.step === '1'
+          && input.value === '60'
+          && input.disabled === ${!owner}
+          && output?.textContent.trim() === '60s'
+          && hint?.textContent.includes('Per-turn thinking time')
+          && input.getBoundingClientRect().height >= 44
+          && inputProgress === 100
+          && controlProgress === 100;
+      })()`), `${owner ? "owner" : "guest"} turn duration control missing`);
+    }
+    const ownerCookie = await browserSessionCookie(a.cdp);
+    const guestCookie = await browserSessionCookie(b.cdp);
+    const ownerTurnWs = await openWs(ownerCookie);
+    const guestTurnWs = await openWs(guestCookie);
+    try {
+      guestTurnWs.sendText(JSON.stringify({type: "set_turn_duration", payload: {seconds: 25}}));
+      const guestRejected = await nextWsMessage(guestTurnWs, "error", "guest turn duration rejection");
+      ok(guestRejected.payload.code === "not_owner", `guest turn duration mutation was not rejected: ${JSON.stringify(guestRejected)}`);
+      for (const seconds of [9, 61]) {
+        ownerTurnWs.sendText(JSON.stringify({type: "set_turn_duration", payload: {seconds}}));
+        const invalid = await nextWsMessage(ownerTurnWs, "error", `invalid turn duration ${seconds}`);
+        ok(invalid.payload.code === "invalid" && invalid.payload.message.includes("10-60"), `invalid duration ${seconds} accepted: ${JSON.stringify(invalid)}`);
+      }
+    } finally {
+      ownerTurnWs.close();
+      guestTurnWs.close();
+    }
+    await sleep(150);
+    const rejectedDurationSnapshot = await activeRoomSnapshot(ownerCookie, "turn duration rejection");
+    ok(rejectedDurationSnapshot.turn_duration_seconds === 60, `rejected turn duration mutated room: ${JSON.stringify(rejectedDurationSnapshot)}`);
+    for (const cdp of [a.cdp, b.cdp]) {
+      ok(await cdp.evaluate(`(() => document.querySelector('#turn-duration-input')?.value === '60'
+        && document.querySelector('#turn-duration-output')?.textContent.trim() === '60s')()`), "rejected turn duration mutated UI");
+    }
+    ok(await a.cdp.evaluate(`(() => {
+      const input = document.querySelector('#turn-duration-input');
+      if (!input) return false;
+      const setter = Object.getOwnPropertyDescriptor(input.constructor.prototype, 'value')?.set;
+      setter?.call(input, '10');
+      input.dispatchEvent(new Event('input', {bubbles: true}));
+      return true;
+    })()`), "missing owner turn duration input");
+    ok(await a.cdp.evaluate(`(() => {
+      const input = document.querySelector('#turn-duration-input');
+      const output = document.querySelector('#turn-duration-output');
+      const inputProgress = Number.parseFloat(getComputedStyle(input).getPropertyValue('--turn-duration-progress'));
+      const controlProgress = Number.parseFloat(getComputedStyle(document.querySelector('.turn-duration-control')).getPropertyValue('--turn-duration-progress'));
+      return input?.value === '10'
+        && output?.textContent.trim() === '10s'
+        && inputProgress === 0
+        && controlProgress === 0;
+    })()`), "owner turn duration live input missing");
+    ok(await b.cdp.evaluate(`(() => document.querySelector('#turn-duration-input')?.value === '60'
+      && document.querySelector('#turn-duration-output')?.textContent.trim() === '60s')()`), "guest turn duration changed before server commit");
+    ok(await a.cdp.evaluate(`(() => {
+      const input = document.querySelector('#turn-duration-input');
+      if (!input) return false;
+      input.dispatchEvent(new Event('change', {bubbles: true}));
+      return true;
+    })()`), "missing owner turn duration change");
+    for (const cdp of [a.cdp, b.cdp]) {
+      await browserWait(cdp, `(() => {
+        const input = document.querySelector('#turn-duration-input');
+        const output = document.querySelector('#turn-duration-output');
+        const inputProgress = Number.parseFloat(getComputedStyle(input).getPropertyValue('--turn-duration-progress'));
+        const controlProgress = Number.parseFloat(getComputedStyle(document.querySelector('.turn-duration-control')).getPropertyValue('--turn-duration-progress'));
+        return input?.value === '10'
+          && output?.textContent.trim() === '10s'
+          && inputProgress === 0
+          && controlProgress === 0
+          && document.querySelector('#start-game')?.disabled !== false;
+      })()`, "authoritative turn duration sync");
+    }
+    await browserClick(a.cdp, "#ready-button");
+    await browserClick(b.cdp, "#ready-button");
+    await browserWait(a.cdp, "document.querySelector('#start-game')?.disabled === false", "turn duration reset precondition");
+    ok(await a.cdp.evaluate(`(() => {
+      const input = document.querySelector('#turn-duration-input');
+      if (!input) return false;
+      const setter = Object.getOwnPropertyDescriptor(input.constructor.prototype, 'value')?.set;
+      setter?.call(input, '11');
+      input.dispatchEvent(new Event('input', {bubbles: true}));
+      input.dispatchEvent(new Event('change', {bubbles: true}));
+      return true;
+    })()`), "missing ready-state turn duration change");
+    for (const cdp of [a.cdp, b.cdp]) {
+      await browserWait(cdp, `(() => {
+        const start = document.querySelector('#start-game');
+        return document.querySelector('#turn-duration-input')?.value === '11'
+          && document.querySelector('#turn-duration-output')?.textContent.trim() === '11s'
+          && [...document.querySelectorAll('.player-slot')].every(row => row.dataset.ready !== 'true')
+          && (!start || start.disabled === true);
+      })()`, "turn duration change resets readiness");
+    }
+    ok((await activeRoomSnapshot(ownerCookie, "turn duration reset")).turn_duration_seconds === 11, "turn duration reset snapshot mismatch");
+    ok(await a.cdp.evaluate(`(() => {
+      const input = document.querySelector('#turn-duration-input');
+      if (!input) return false;
+      const setter = Object.getOwnPropertyDescriptor(input.constructor.prototype, 'value')?.set;
+      setter?.call(input, '10');
+      input.dispatchEvent(new Event('input', {bubbles: true}));
+      input.dispatchEvent(new Event('change', {bubbles: true}));
+      return true;
+    })()`), "missing final turn duration change");
+    for (const cdp of [a.cdp, b.cdp]) {
+      await browserWait(cdp, "document.querySelector('#turn-duration-input')?.value === '10'", "final turn duration sync");
+    }
     await browserClick(a.cdp, "#ready-button");
     await browserClick(b.cdp, "#ready-button");
     await browserWait(a.cdp, "document.querySelector('#start-game')?.disabled === false", "ready before team move");
@@ -723,80 +867,75 @@ async function browserFlows() {
       const row = [...document.querySelectorAll('.player-slot')]
         .find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(bravo.display_name)});
       const move = row?.querySelector('.select-player');
-      move?.click();
-      return move
-        && row.closest('.team-roster')?.dataset.team === '2'
-        && move.getAttribute('aria-pressed') === 'true'
-        && document.querySelector('.team-drop-target[data-team="1"]')?.getAttribute('aria-disabled') === 'false'
-        && document.querySelector('.team-drop-target[data-team="2"]')?.getAttribute('aria-disabled') === 'true'
-        && document.querySelector('#roster-move-status')?.textContent.includes('selected');
-    })()`), "team selection should not optimistically move a card");
-    await browserClick(a.cdp, '.team-drop-target[data-team="1"]');
+      if (!move || move.dataset.targetTeam !== '1') return false;
+      move.click();
+      return row.closest('.team-roster')?.dataset.team === '2'
+        && document.querySelector('#roster-move-status')?.textContent === ''
+        && !document.querySelector('.team-drop-target');
+    })()`), "direct owner team move should not optimistically move a card");
     for (const cdp of [a.cdp, b.cdp]) {
       await browserWait(cdp, `(() => {
         const row = [...document.querySelectorAll('.player-slot')]
           .find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(bravo.display_name)});
         return row?.closest('.team-roster')?.dataset.team === '1'
-          && document.querySelector('#start-game')?.disabled === true
-          && row.querySelector('.player-soldiers')?.value === ${JSON.stringify(guestSoldiers)};
+          && document.querySelector('#start-game')?.disabled === true;
       })()`, "authoritative owner team move");
     }
     ok(await a.cdp.evaluate(`(() => {
       const button = [...document.querySelectorAll('.select-player')]
         .find(button => button.closest('.player-slot')?.querySelector('strong')?.textContent === ${JSON.stringify(bravo.display_name)});
       button?.focus();
-      return document.activeElement === button;
+      return document.activeElement === button
+        && button.dataset.targetTeam === '2'
+        && button.getAttribute('aria-label') === ${JSON.stringify(`Move ${bravo.display_name} to Team Two`)};
     })()`), "owner move focus setup");
     ok(await b.cdp.evaluate(`(() => {
       const row = [...document.querySelectorAll('.player-slot')]
         .find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(bravo.display_name)});
       const move = row?.querySelector('.select-player');
-      move?.click();
-      return Boolean(move) && document.querySelector('.team-drop-target[data-team="2"]')?.getAttribute('aria-disabled') === 'false';
-    })()`), "guest self team selection missing");
-    await browserClick(b.cdp, '.team-drop-target[data-team="2"]');
+      if (!move || move.dataset.targetTeam !== '2') return false;
+      move.click();
+      return row.closest('.team-roster')?.dataset.team === '1';
+    })()`), "guest self direct team move missing");
     for (const cdp of [a.cdp, b.cdp]) {
       await browserWait(cdp, `(() => {
         const row = [...document.querySelectorAll('.player-slot')]
           .find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(bravo.display_name)});
-        return row?.closest('.team-roster')?.dataset.team === '2'
-          && row.querySelector('.player-soldiers')?.value === ${JSON.stringify(guestSoldiers)};
+        return row?.closest('.team-roster')?.dataset.team === '2';
       })()`, "authoritative guest self team move");
     }
     await browserWait(a.cdp, `(() => {
       const active = document.activeElement;
       return active?.matches('.select-player')
+        && active.dataset.targetTeam === '1'
         && active.closest('.player-slot')?.querySelector('strong')?.textContent === ${JSON.stringify(bravo.display_name)};
     })()`, "team refresh focus restoration");
     await browserWait(a.cdp, `document.querySelector('#announcements')?.textContent.includes(${JSON.stringify(`${bravo.display_name} moved to Team Two`)})`, "team move live announcement");
     ok(await a.cdp.evaluate(`(() => {
       const row = [...document.querySelectorAll('.player-slot')]
         .find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(alpha.display_name)});
-      const source = row?.closest('.team-roster')?.dataset.team;
-      const target = source === '1' ? '2' : '1';
-      const roster = document.querySelector('.team-roster-' + target);
-      const data = new DataTransfer();
-      row?.dispatchEvent(new DragEvent('dragstart', {bubbles: true, cancelable: true, dataTransfer: data}));
-      const unchanged = row?.closest('.team-roster')?.dataset.team === source
-        && data.getData('text/plain') === row?.dataset.playerId;
-      roster?.dispatchEvent(new DragEvent('dragover', {bubbles: true, cancelable: true, dataTransfer: data}));
-      roster?.dispatchEvent(new DragEvent('drop', {bubbles: true, cancelable: true, dataTransfer: data}));
-      return unchanged;
-    })()`), "desktop drag setup should retain the card until server confirmation");
+      const move = row?.querySelector('.select-player');
+      if (!move || move.dataset.targetTeam !== '2') return false;
+      move.click();
+      return row.closest('.team-roster')?.dataset.team === '1'
+        && !document.querySelector('.player-slot[draggable="true"]')
+        && !document.querySelector('.team-drop-target');
+    })()`), "owner direct self move should retain the card until server confirmation");
     for (const cdp of [a.cdp, b.cdp]) {
       await browserWait(cdp, `(() => {
         const row = [...document.querySelectorAll('.player-slot')]
           .find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(alpha.display_name)});
         return row?.closest('.team-roster')?.dataset.team === '2';
-      })()`, "authoritative desktop drag move");
+      })()`, "authoritative owner direct move");
     }
     ok(await a.cdp.evaluate(`(() => {
       const row = [...document.querySelectorAll('.player-slot')]
         .find(row => row.querySelector('strong')?.textContent === ${JSON.stringify(alpha.display_name)});
-      row?.querySelector('.select-player')?.click();
-      return Boolean(row);
-    })()`), "owner restore selection missing");
-    await browserClick(a.cdp, '.team-drop-target[data-team="1"]');
+      const move = row?.querySelector('.select-player');
+      if (!move || move.dataset.targetTeam !== '1') return false;
+      move.click();
+      return true;
+    })()`), "owner direct restoration missing");
     for (const cdp of [a.cdp, b.cdp]) {
       await browserWait(cdp, `(() => {
         const row = [...document.querySelectorAll('.player-slot')]
@@ -804,19 +943,70 @@ async function browserFlows() {
         return row?.closest('.team-roster')?.dataset.team === '1';
       })()`, "authoritative team restoration");
     }
-    await browserWait(a.cdp, `(() => {
+    await a.cdp.command("Emulation.setDeviceMetricsOverride", {width: 1280, height: 800, deviceScaleFactor: 1, mobile: false});
+    const desktopStagingLayout = `(() => {
+      const shell = document.querySelector('.room-shell')?.getBoundingClientRect();
+      const main = document.querySelector('.room-main')?.getBoundingClientRect();
+      const command = document.querySelector('.room-command')?.getBoundingClientRect();
       const first = document.querySelector('.team-roster-1')?.getBoundingClientRect();
       const second = document.querySelector('.team-roster-2')?.getBoundingClientRect();
-      return first && second && first.left < second.left && Math.abs(first.top - second.top) < 4
+      const chatList = document.querySelector('.room-chat ul')?.getBoundingClientRect();
+      const rosterList = document.querySelector('.team-roster ul')?.getBoundingClientRect();
+      const ratio = main && command ? main.width / (main.width + command.width) : 0;
+      const centered = shell ? Math.abs(shell.left - (document.documentElement.clientWidth - shell.width) / 2) <= 2 : false;
+      const slotsFit = [...document.querySelectorAll('.player-slot, .empty-slot')].every(row => row.getBoundingClientRect().height >= 92);
+      const controlsFit = [...document.querySelectorAll('.player-controls')].every(controls => {
+        const controlsRect = controls.getBoundingClientRect();
+        return [...controls.children].every(child => {
+          const rect = child.getBoundingClientRect();
+          return rect.left >= controlsRect.left - 1 && rect.right <= controlsRect.right + 1;
+        });
+      });
+      const ok = shell && main && command && first && second && chatList && rosterList
+        && centered
+        && shell.width <= document.documentElement.clientWidth
+        && ratio > .68 && ratio < .72
+        && Math.abs(main.height - command.height) < 4
+        && main.height >= 680 && main.height <= 720
+        && slotsFit
+        && controlsFit
+        && first.left < second.left && Math.abs(first.top - second.top) < 4
+        && chatList.height >= 100
+        && getComputedStyle(document.querySelector('.room-chat ul')).overflowY === 'auto'
+        && getComputedStyle(document.querySelector('.team-roster ul')).overflowY === 'visible'
+        && rosterList.height <= first.height
         && document.documentElement.scrollWidth <= innerWidth;
-    })()`, "desktop team roster layout");
+      return {
+        ok: Boolean(ok), centered, ratio, slotsFit, controlsFit,
+        shell: shell?.toJSON(), main: main?.toJSON(), command: command?.toJSON(),
+        first: first?.toJSON(), second: second?.toJSON(), chatList: chatList?.toJSON(), rosterList: rosterList?.toJSON(),
+        chatOverflow: getComputedStyle(document.querySelector('.room-chat ul')).overflowY,
+        rosterOverflow: getComputedStyle(document.querySelector('.team-roster ul')).overflowY,
+        scrollWidth: document.documentElement.scrollWidth,
+        innerWidth,
+      };
+    })()`;
+    await browserWait(a.cdp, `${desktopStagingLayout}.ok`, "desktop staging layout").catch(async error => {
+      const debug = await a.cdp.evaluate(desktopStagingLayout).catch(reason => ({debugError: String(reason)}));
+      throw new Error(`${error.message}: ${JSON.stringify(debug)}`);
+    });
     await a.cdp.command("Emulation.setDeviceMetricsOverride", {width: 390, height: 844, deviceScaleFactor: 1, mobile: true});
     await browserWait(a.cdp, `(() => {
+      const main = document.querySelector('.room-main')?.getBoundingClientRect();
+      const command = document.querySelector('.room-command')?.getBoundingClientRect();
       const first = document.querySelector('.team-roster-1')?.getBoundingClientRect();
       const second = document.querySelector('.team-roster-2')?.getBoundingClientRect();
-      return first && second && first.top < second.top && document.documentElement.scrollWidth <= innerWidth;
-    })()`, "mobile team roster stack");
-    await a.cdp.command("Emulation.setDeviceMetricsOverride", {width: 1280, height: 800, deviceScaleFactor: 1, mobile: false});
+      const button = document.querySelector('.select-player')?.getBoundingClientRect();
+      const soldier = document.querySelector('.player-soldiers')?.getBoundingClientRect();
+      return main && command && first && second && button && soldier
+        && main.top < command.top
+        && first.top < second.top
+        && main.height > 540
+        && command.height > 540
+        && button.height >= 44
+        && soldier.height >= 44
+        && document.documentElement.scrollWidth <= innerWidth;
+    })()`, "mobile staging stack");
     const roomModeUi = await a.cdp.evaluate(`(() => ({
       modePicker: Boolean(document.querySelector('.mode-picker')),
       radioCount: document.querySelectorAll('input[name="game-mode"]').length,
@@ -856,7 +1046,7 @@ async function browserFlows() {
       && roomChatLayout.inCommandRail
       && roomChatLayout.left >= 0
       && roomChatLayout.right <= roomChatLayout.viewport[0]
-      && roomChatLayout.width <= 440
+      && roomChatLayout.width <= 560
       && roomChatLayout.top >= roomChatLayout.commandTop - 1
       && roomChatLayout.bottom <= roomChatLayout.commandBottom + 1
       && roomChatLayout.transform === 'none'
@@ -1001,7 +1191,14 @@ async function browserFlows() {
     await browserClick(a.cdp, "#ready-button");
     await browserClick(b.cdp, "#ready-button");
     await browserWait(a.cdp, "document.querySelector('#start-game')?.disabled === false", "start enabled");
+    const publicStart = browserWsMessage(a.cdp, "game_started", "public game start");
+    const publicStartClickedAt = Math.floor(Date.now() / 1000);
     await browserClick(a.cdp, "#start-game");
+    const publicStarted = (await publicStart).payload;
+    const publicGame = publicStarted.game;
+    const publicDeadlineDelta = publicGame.turn_deadline_at - publicStartClickedAt;
+    ok(publicStarted.snapshot.turn_duration_seconds === 10, `public snapshot turn duration mismatch: ${JSON.stringify(publicStarted.snapshot)}`);
+    ok(publicDeadlineDelta >= 10 && publicDeadlineDelta <= 11, `public turn deadline used ${publicDeadlineDelta}s from click, expected 10s`);
     await browserWait(a.cdp, "Boolean(document.querySelector('#game-canvas'))", "public game owner", 20_000);
     await browserWait(b.cdp, "Boolean(document.querySelector('#game-canvas'))", "public game guest", 20_000);
     await browserWait(a.cdp, "document.querySelectorAll('.soldier-name-label').length === 2 && document.querySelectorAll('.soldier-name-label.is-active').length === 1", "owner soldier labels", 20_000);
@@ -1071,10 +1268,14 @@ async function browserFlows() {
         const heading = document.querySelector('.map-heading');
         const button = document.querySelector('.fire-button');
         const progress = Number.parseFloat(getComputedStyle(button).getPropertyValue('--turn-progress'));
+        const remaining = Number.parseInt(timer?.textContent ?? '', 10);
         return heading?.querySelector('.eyebrow')?.textContent.trim() === 'Coordinate field / 01'
           && heading?.querySelector('h2')?.textContent.trim() === 'Battlefield'
           && timer?.getAttribute('role') === 'timer'
           && /^\\d+s$/.test(timer.textContent.trim())
+          && Number.isInteger(remaining)
+          && remaining >= 0
+          && remaining <= 10
           && button?.getAttribute('aria-describedby')?.split(/\\s+/).includes('turn-timer')
           && progress >= 0 && progress <= 100;
       })()`), "fire countdown semantics missing");
@@ -1612,20 +1813,20 @@ async function browserFlows() {
           && remove?.getAttribute('data-is-bot') === 'true'
           && document.querySelectorAll('.player-team').length === 0;
       })()`, "bot slot");
+      ok(await c.cdp.evaluate("document.querySelector('#add-bot')?.textContent.trim() === 'Add computer · auto-balance'"), "auto-balance bot action missing");
       const botTarget = await c.cdp.evaluate(`(() => {
         const bot = [...document.querySelectorAll('.player-slot')]
           .find(row => row.querySelector('.remove-player')?.dataset.isBot === 'true');
         const source = bot?.closest('.team-roster')?.dataset.team;
         const target = source === '1' ? '2' : '1';
         const move = bot?.querySelector('.select-player');
-        move?.click();
-        return move?.getAttribute('aria-pressed') === 'true'
-          && document.querySelector('.team-drop-target[data-team="' + target + '"]')?.getAttribute('aria-disabled') === 'false'
+        if (!move || move.dataset.targetTeam !== target || move.hasAttribute('aria-pressed')) return null;
+        move.click();
+        return bot.closest('.team-roster')?.dataset.team === source && !document.querySelector('.team-drop-target')
           ? target
           : null;
       })()`);
-      ok(botTarget, "owner bot transfer selection missing");
-      await browserClick(c.cdp, `#team-${botTarget}-target`);
+      ok(botTarget, "owner bot direct switch missing");
       await browserWait(c.cdp, `(() => {
         const bot = [...document.querySelectorAll('.player-slot')]
           .find(row => row.querySelector('.remove-player')?.dataset.isBot === 'true');

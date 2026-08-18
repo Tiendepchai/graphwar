@@ -2,7 +2,14 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
+pub const MIN_TURN_DURATION_SECONDS: u8 = 10;
+pub const DEFAULT_TURN_DURATION_SECONDS: u8 = 60;
+pub const MAX_TURN_DURATION_SECONDS: u8 = 60;
+
+pub fn default_turn_duration_seconds() -> u8 {
+    DEFAULT_TURN_DURATION_SECONDS
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RegisterRequest {
@@ -78,6 +85,8 @@ pub struct RoomSnapshot {
     pub mode: GameMode,
     #[serde(default)]
     pub kind: RoomKind,
+    #[serde(default = "default_turn_duration_seconds")]
+    pub turn_duration_seconds: u8,
     pub players: Vec<PlayerSnapshot>,
 }
 
@@ -219,6 +228,9 @@ pub enum ClientMessage {
     SetMode {
         mode: GameMode,
     },
+    SetTurnDuration {
+        seconds: u8,
+    },
     SetTeam {
         player_id: Uuid,
         team: u8,
@@ -321,7 +333,7 @@ mod tests {
             version: PROTOCOL_VERSION,
         };
         let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(json, r#"{"type":"hello","payload":{"version":10}}"#);
+        assert_eq!(json, r#"{"type":"hello","payload":{"version":11}}"#);
         let snap = SnapshotEnvelope {
             version: PROTOCOL_VERSION,
             sequence: 3,
@@ -398,6 +410,7 @@ mod tests {
                 revision: 4,
                 mode: GameMode::Function,
                 kind: RoomKind::Practice,
+                turn_duration_seconds: DEFAULT_TURN_DURATION_SECONDS,
                 players: Vec::new(),
             },
             practice_setup: Some(setup),
@@ -450,6 +463,7 @@ mod tests {
             revision: u64::MAX - 1,
             mode: GameMode::SecondOrder,
             kind: RoomKind::Practice,
+            turn_duration_seconds: 60,
             players,
         };
         let inbound = serde_json::to_vec(&ClientMessage::SetPracticeSetup {
@@ -477,10 +491,23 @@ mod tests {
     #[test]
     fn old_room_snapshot_defaults_to_standard() {
         let json = r#"{"id":"00000000-0000-0000-0000-000000000001","name":"Old","visibility":"public","phase":"lobby","revision":0,"mode":"function","players":[]}"#;
+        let snapshot = serde_json::from_str::<RoomSnapshot>(json).unwrap();
+        assert_eq!(snapshot.kind, RoomKind::Standard);
         assert_eq!(
-            serde_json::from_str::<RoomSnapshot>(json).unwrap().kind,
-            RoomKind::Standard
+            snapshot.turn_duration_seconds,
+            DEFAULT_TURN_DURATION_SECONDS
         );
+    }
+
+    #[test]
+    fn turn_duration_message_round_trips() {
+        let message = ClientMessage::SetTurnDuration { seconds: 10 };
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&json).unwrap(),
+            message
+        );
+        assert!(json.contains("set_turn_duration"));
     }
 
     #[test]
@@ -512,6 +539,7 @@ mod tests {
         );
         for message in [
             ClientMessage::AddBot { level: 4 },
+            ClientMessage::SetTurnDuration { seconds: 25 },
             ClientMessage::RemoveBot { player_id: bot },
             ClientMessage::KickPlayer { player_id: bot },
             ClientMessage::ReturnToLobby,

@@ -12,3 +12,4 @@
 /deploy/cloudflare-tunnel-token
 /compose.env
 /deploy/compose.env
+/backups/
