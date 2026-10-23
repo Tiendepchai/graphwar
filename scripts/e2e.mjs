@@ -1891,12 +1891,14 @@ async function browserFlows({launch = launchBrowser, close = closeBrowser} = {})
     await inactive.command("Emulation.setEmulatedMedia", {media: "", features: [{name: "prefers-reduced-motion", value: "reduce"}]});
     await browserRafIdle(inactive, "reduced-motion initial RAF");
     await browserSet(inactive, '#function-input', '0');
+    await inactive.command('Page.bringToFront');
     await inactive.evaluate(`(() => {
       const field = document.querySelector('#function-input');
       window.__physicalSubmits = 0;
       document.querySelector('#fire-form').addEventListener('submit', () => { window.__physicalSubmits++; });
       field.focus();
     })()`);
+    await browserWait(inactive, "document.hasFocus() && document.activeElement === document.querySelector('#function-input')", 'physical Enter editor focus');
     await inactive.command('Input.dispatchKeyEvent', {type:'keyDown', key:'Enter', code:'Enter', windowsVirtualKeyCode:13, modifiers:8});
     await inactive.command('Input.dispatchKeyEvent', {type:'keyUp', key:'Enter', code:'Enter', windowsVirtualKeyCode:13, modifiers:8});
     ok(await inactive.evaluate('window.__physicalSubmits === 0'), 'Shift+Enter fired a shot');
