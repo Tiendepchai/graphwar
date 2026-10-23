@@ -774,19 +774,19 @@ async function closeBrowsers(browsers, failed, close = closeBrowser) {
 async function launchBrowser(url, {
   findChrome = chromeCommand, mkdtemp = fs.mkdtemp, start = spawn, fetchTargets = fetch,
   createCdp = url => new Cdp(url), wait = browserWait, close = closeBrowser, pause = sleep,
+  readFile = fs.readFile, now = Date.now, startupMs = timeoutMs,
 } = {}) {
   ok(typeof WebSocket === "function", "Node 22+ required: global WebSocket unavailable");
   const chrome = await findChrome();
   const browser = {};
   try {
     browser.dir = await mkdtemp(path.join(os.tmpdir(), "graphwar-e2e-"));
-    const port = 9300 + crypto.randomInt(500);
     let page;
     let startupStderr = "";
     browser.child = start(chrome, [
       "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
       ...(BASE.protocol === "https:" && process.env.E2E_TLS_VERIFY === "false" ? ["--ignore-certificate-errors"] : []),
-      `--remote-debugging-port=${port}`, `--user-data-dir=${browser.dir}`, "about:blank",
+      "--remote-debugging-port=0", `--user-data-dir=${browser.dir}`, "about:blank",
     ], {stdio: ["ignore", "ignore", "pipe"]});
     // Capture only about:blank startup; never log authenticated page diagnostics.
     browser.child.stderr?.on("data", chunk => {
@@ -794,19 +794,27 @@ async function launchBrowser(url, {
     });
     let spawnError;
     browser.child.once("error", error => { spawnError = error; });
-    for (let attempt = 0; attempt < 80; attempt++) {
+    const deadline = now() + startupMs;
+    while (now() < deadline) {
       if (spawnError) throw spawnError;
       ok(browser.child.exitCode === null && browser.child.signalCode === null,
         `Chrome exited before DevTools was ready (code ${browser.child.exitCode}, signal ${browser.child.signalCode}): ${startupStderr.trim()}`);
-      const targets = await fetchTargets(`http://127.0.0.1:${port}/json/list`, {signal: AbortSignal.timeout(1_000)})
-        .then(response => response.json())
-        .catch(() => null);
-      if (spawnError) throw spawnError;
-      page = targets?.find(target => target.type === "page");
-      if (page) break;
+      let portFile;
+      try { portFile = await readFile(path.join(browser.dir, "DevToolsActivePort"), "utf8"); }
+      catch (error) { if (error.code !== "ENOENT") throw error; }
+      const portLine = portFile?.split("\n")[0];
+      const port = /^\d+$/.test(portLine ?? "") ? Number(portLine) : 0;
+      if (port > 0 && port <= 65535) {
+        const targets = await fetchTargets(`http://127.0.0.1:${port}/json/list`, {signal: AbortSignal.timeout(1_000)})
+          .then(response => response.json())
+          .catch(() => null);
+        if (spawnError) throw spawnError;
+        page = targets?.find(target => target.type === "page");
+        if (page) break;
+      }
       await pause(100);
     }
-    ok(page?.webSocketDebuggerUrl, "Chrome page DevTools endpoint unavailable");
+    ok(page?.webSocketDebuggerUrl, `Chrome page DevTools endpoint unavailable after ${startupMs}ms: ${startupStderr.trim()}`);
     browser.cdp = createCdp(page.webSocketDebuggerUrl);
     await browser.cdp.connect();
     await browser.cdp.command("Page.enable");
@@ -1898,7 +1906,11 @@ async function browserFlows({launch = launchBrowser, close = closeBrowser} = {})
       document.querySelector('#fire-form').addEventListener('submit', () => { window.__physicalSubmits++; });
       field.focus();
     })()`);
-    await browserWait(inactive, "document.hasFocus() && document.activeElement === document.querySelector('#function-input')", 'physical Enter editor focus');
+    await browserWait(inactive, `(() => {
+      const field = document.querySelector('#function-input');
+      return document.hasFocus() && document.activeElement === field
+        && Boolean(field?.shadowRoot?.activeElement?.classList.contains('ML__keyboard-sink'));
+    })()`, 'physical Enter editor focus');
     await inactive.command('Input.dispatchKeyEvent', {type:'keyDown', key:'Enter', code:'Enter', windowsVirtualKeyCode:13, modifiers:8});
     await inactive.command('Input.dispatchKeyEvent', {type:'keyUp', key:'Enter', code:'Enter', windowsVirtualKeyCode:13, modifiers:8});
     ok(await inactive.evaluate('window.__physicalSubmits === 0'), 'Shift+Enter fired a shot');
@@ -2389,6 +2401,7 @@ async function cleanupSelfCheck() {
     const child = fakeChild();
     let cdpClosed = 0;
     let removed = 0;
+    let time = 0;
     const cdp = {
       on() {},
       connect: async () => { if (stage === "connect") throw original; },
@@ -2405,6 +2418,7 @@ async function cleanupSelfCheck() {
       mkdtemp: async () => "owned-profile",
       start: (_chrome, args, options) => {
         ok(!args.includes("--no-sandbox"), "browser sandbox disabled");
+        ok(args.includes("--remote-debugging-port=0"), "Chrome did not allocate its own debugging port");
         assert.deepEqual(options.stdio, ["ignore", "ignore", "pipe"]);
         child.stderr = new EventEmitter();
         if (stage === "spawn") { child.pid = undefined; throw original; }
@@ -2422,7 +2436,10 @@ async function cleanupSelfCheck() {
       fetchTargets: async () => ({json: async () => stage === "exit" ? [] : [{type: "page", ...(stage === "endpoint" ? {} : {webSocketDebuggerUrl: "fake-cdp"})}]}),
       createCdp: () => cdp,
       wait: async () => { if (stage === "wait") throw original; },
-      pause: async () => {},
+      readFile: async file => { assert.equal(file, path.join("owned-profile", "DevToolsActivePort")); return "12345\n/devtools/browser/test"; },
+      now: () => time,
+      startupMs: 1000,
+      pause: async () => { time += 100; },
       close: browser => closeBrowser(browser, {rm, shutdownMs: 5}),
     });
     await assert.rejects(launch, error => stage === "endpoint"
@@ -2468,11 +2485,39 @@ async function cleanupSelfCheck() {
   const original = new Error("navigation failed");
   await assert.rejects(() => launchBrowser(BASE, {
     findChrome: async () => "fake-chrome", mkdtemp: async () => "owned-profile", start: () => fakeChild(),
+    readFile: async () => "12345\n/devtools/browser/test",
     fetchTargets: async () => ({json: async () => [{type: "page", webSocketDebuggerUrl: "fake-cdp"}]}),
     createCdp: () => ({connect: async () => { throw original; }}),
     close: async () => { throw new Error("cleanup failed"); },
   }), error => error === original);
-  log("cleanup self-check: partial launch, first/second allocation, forced/already-exited shutdown, cleanup failures: pass");
+  for (const mode of ["delayed", "timeout", "read-error"]) {
+    const child = fakeChild();
+    let time = 0;
+    let removed = 0;
+    const original = new Error("port file unreadable");
+    const close = browser => closeBrowser(browser, {rm: async () => { removed++; }, shutdownMs: 5});
+    const launch = () => launchBrowser(BASE, {
+      findChrome: async () => "fake-chrome", mkdtemp: async () => "owned-profile", start: () => child,
+      readFile: async () => {
+        if (mode === "read-error") throw original;
+        if (time < 9000) throw Object.assign(new Error("not ready"), {code: "ENOENT"});
+        return time < 10000 ? "partial" : "12345\n/devtools/browser/test";
+      },
+      fetchTargets: async url => {
+        assert.equal(url, "http://127.0.0.1:12345/json/list");
+        return {json: async () => [{type: "page", webSocketDebuggerUrl: "fake-cdp"}]};
+      },
+      createCdp: () => ({on() {}, connect: async () => {}, command: async () => {}, close() {}}),
+      wait: async () => {}, close, now: () => time, startupMs: mode === "timeout" ? 9500 : 12000,
+      pause: async () => { time += 100; },
+    });
+    if (mode === "delayed") await close(await launch());
+    else await assert.rejects(launch, error => mode === "read-error" ? error === original
+      : error.message.includes("DevTools endpoint unavailable after 9500ms"));
+    assert.equal(removed, 1, `${mode}: profile leaked`);
+    assert.ok(child.signalCode, `${mode}: Chrome still running`);
+  }
+  log("cleanup self-check: partial/delayed launch, allocated port, startup timeout, forced/already-exited shutdown, cleanup failures: pass");
 }
 
 async function harnessSelfCheck() {
