@@ -94,14 +94,17 @@ impl AppState {
     fn subscribe(&self, player: uuid::Uuid) -> broadcast::Receiver<ServerMessage> {
         self.account_events
             .write()
-            .expect("account event lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entry(player)
             .or_insert_with(|| broadcast::channel(256).0)
             .subscribe()
     }
 
     fn publish(&self, event: ScopedEvent) {
-        let events = self.account_events.read().expect("account event lock");
+        let events = self
+            .account_events
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let recipients = match event.audience {
             Audience::Lobby => events.keys().copied().collect(),
             Audience::Accounts(players) | Audience::Room { players } => players,
@@ -247,7 +250,7 @@ impl AppState {
             .or_insert(1);
         self.account_events
             .write()
-            .expect("account event lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entry(player)
             .or_insert_with(|| broadcast::channel(256).0);
     }
@@ -297,7 +300,7 @@ impl AppState {
             presence.remove(&player);
             self.account_events
                 .write()
-                .expect("account event lock")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&player);
             (cleanup, public_rooms)
         };

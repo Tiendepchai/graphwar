@@ -3,46 +3,153 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: graphwar
+          POSTGRES_PASSWORD: ci-test-only
+          POSTGRES_DB: postgres
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U graphwar -d postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: stable
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo check -p graphwar-client-wasm --target wasm32-unknown-unknown
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - name: PostgreSQL persistence and recovery
+        env:
+          GRAPHWAR_TEST_DATABASE_URL: postgres://graphwar:ci-test-only@127.0.0.1:${{ job.services.postgres.ports[5432] }}/postgres
+        run: cargo test --locked -p graphwar-server --lib room_store::tests::postgres_round_trip_and_restart -- --ignored --exact
+      - run: cargo check --locked -p graphwar-client-wasm --target wasm32-unknown-unknown
+      - run: python3 -I deploy/update-home.py --self-check
+
+  msrv:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: 1.89.0
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo check --workspace --all-targets --locked
+      - run: cargo check --locked -p graphwar-client-wasm --target wasm32-unknown-unknown
 
   image:
-    runs-on: ubuntu-latest
-    needs: rust
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    needs: [rust, msrv]
     steps:
-      - uses: actions/checkout@v4
-      - run: docker build -f deploy/Dockerfile .
-      # Image smoke needs Docker Compose plus an externally reachable TLS endpoint.
-      # GitHub-hosted runners cannot expose Caddy's localhost certificate reliably.
-      # Run this exact gate in the deploy environment before release.
-      - name: Validate deployment manifest
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build ARM64 release image once
         env:
-          DOMAIN: graphwar.invalid
-          POSTGRES_PASSWORD: ci-secret-not-production
+          REVISION: ${{ github.sha }}
         run: |
-          test -f deploy/Caddyfile
-          grep -F 'graphwar_client_wasm.js' assets/web/index.html
-          grep -F -- '--out-name graphwar_client_wasm' deploy/Dockerfile
-          grep -F '/healthz' deploy/compose.yaml
-          grep -F 'condition: service_healthy' deploy/compose.yaml
-      - name: Publish release gate
+          docker build --platform linux/arm64 -t graphwar:ci \
+            --label org.opencontainers.image.source=https://github.com/Tiendepchai/graphwar \
+            --label org.opencontainers.image.revision="$REVISION" \
+            -f deploy/Dockerfile .
+          test "$(docker image inspect graphwar:ci --format '{{.Architecture}}')" = arm64
+          docker save graphwar:ci | gzip > "$RUNNER_TEMP/graphwar-arm64.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: graphwar-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/graphwar-arm64.tar.gz
+          retention-days: 2
+          if-no-files-found: error
+
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: image
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: graphwar-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/graphwar-image
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+      - run: docker load --input "$RUNNER_TEMP/graphwar-image/graphwar-arm64.tar.gz"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - uses: browser-actions/setup-chrome@c785b87e244131f27c9f19c1a33e2ead956ab7ce # v1
+        id: chrome
+      - run: node scripts/e2e.mjs --self-check
+      - name: Test the release image, restart and restore
+        env:
+          CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
+          E2E_TIMEOUT_MS: '30000'
+        run: node scripts/e2e.mjs --local-image graphwar:ci
+
+  publish:
+    if: >-
+      github.repository == 'Tiendepchai/graphwar' &&
+      github.ref == 'refs/heads/master' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [rust, msrv, image, browser]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    environment: production
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: graphwar-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/graphwar-image
+      - run: docker load --input "$RUNNER_TEMP/graphwar-image/graphwar-arm64.tar.gz"
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish only the tested image
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          REVISION: ${{ github.sha }}
         run: |
-          printf '%s\n' 'Before publishing: DOMAIN=example.com POSTGRES_PASSWORD=... docker compose -f deploy/compose.yaml up --build --wait'
-          printf '%s\n' 'Then verify HTTPS /healthz, /, graphwar.css, graphwar_client_wasm.js, graphwar_client_wasm_bg.wasm, auth, and WSS.'
-          printf '%s\n' 'Skipped: remote deploy and Docker cleanup need explicit authorization.'
+          test "$(docker image inspect graphwar:ci --format '{{.Architecture}}')" = arm64
+          test "$(docker image inspect graphwar:ci --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$REVISION"
+          image="ghcr.io/tiendepchai/graphwar:run-$RUN_ID-$RUN_ATTEMPT"
+          docker tag graphwar:ci "$image"
+          docker push "$image"
+          printf 'Published tested ARM64 image: `%s`\n' "$image" >> "$GITHUB_STEP_SUMMARY"
+      # Armbian polls only successful master runs, then pins the published digest.
+      # No SSH credentials or self-hosted runner live in this public repository.

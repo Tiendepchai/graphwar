@@ -25,6 +25,13 @@ wasm-bindgen-futures.workspace = true
 web-sys = { workspace = true, features = [
     "AbortController",
     "AbortSignal",
+    "AudioContext",
+    "AudioDestinationNode",
+    "AudioNode",
+    "AudioParam",
+    "GainNode",
+    "OscillatorNode",
+    "OscillatorType",
     "CanvasRenderingContext2d",
     "CloseEvent",
     "Document",
@@ -34,6 +41,7 @@ web-sys = { workspace = true, features = [
     "Event",
     "EventTarget",
     "KeyboardEvent",
+    "InputEvent",
     "HtmlCanvasElement",
     "HtmlDialogElement",
     "HtmlElement",
@@ -48,7 +56,14 @@ web-sys = { workspace = true, features = [
     "ProgressEvent",
     "PointerEvent",
     "RequestCredentials",
+    "Storage",
     "WebSocket",
     "Window",
     "console",
 ] }
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[package.metadata.wasm-pack.profile.dev]
+wasm-opt = false

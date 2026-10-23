@@ -3,3 +3,13 @@
 .codegraph/
 target/
 .DS_Store
+.env
+.env.*
+**/compose.env
+**/image.env
+**/state.json
+**/automatic.enabled
+**/update.lock
+**/cloudflare-tunnel-token
+backups/
+**/backups/

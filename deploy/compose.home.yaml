@@ -1,0 +1,56 @@
+name: graphwar-home
+
+services:
+  app:
+    image: ${GRAPHWAR_IMAGE:?set an immutable GRAPHWAR_IMAGE digest in image.env}
+    platform: linux/arm64
+    environment:
+      BIND_ADDR: 0.0.0.0:8080
+      DATABASE_URL: postgres://graphwar@postgres:5432/graphwar
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in compose.env}
+      DATABASE_MAX_CONNECTIONS: "10"
+      ALLOWED_ORIGINS: https://${DOMAIN:?set DOMAIN in compose.env}
+      SECURE_COOKIES: "true"
+      SESSION_TTL_SECONDS: "2592000"
+      GRAPHWAR_STATIC_DIR: /app/assets/web
+      GRAPHWAR_RSC_DIR: /app/assets/rsc
+      RUST_LOG: graphwar_server=info,tower_http=info
+    ports:
+      - "127.0.0.1:18081:8080"
+    networks:
+      - database
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    platform: linux/arm64
+    environment:
+      POSTGRES_DB: graphwar
+      POSTGRES_USER: graphwar
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in compose.env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - database
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "graphwar", "-d", "graphwar"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+networks:
+  database:
+    driver: bridge
+
+volumes:
+  postgres-data:

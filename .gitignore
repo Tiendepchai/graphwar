@@ -13,3 +13,8 @@
 /compose.env
 /deploy/compose.env
 /backups/
+/deploy/image.env
+/deploy/state.json
+/deploy/automatic.enabled
+/deploy/update.lock
+/deploy/backups/

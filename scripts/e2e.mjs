@@ -2,14 +2,29 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import {EventEmitter} from "node:events";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import {spawn} from "node:child_process";
 import tls from "node:tls";
+import {isDeepStrictEqual} from "node:util";
 
-const BASE = new URL(process.argv[2] ?? process.env.GRAPHWAR_URL ?? "http://127.0.0.1:8080");
-const ORIGIN = BASE.origin;
+function parseArgs(args, endpoint = process.env.GRAPHWAR_URL) {
+  if (args.length === 1 && args[0] === "--self-check") return {selfCheck: true};
+  if (args[0] === "--local-image") {
+    ok(args.length === 2 && /^[a-zA-Z0-9][a-zA-Z0-9._:/@-]*$/.test(args[1]), "usage: --local-image IMAGE (prebuilt local image)");
+    return {image: args[1]};
+  }
+  ok(args.length <= 1 && !args[0]?.startsWith("-"), "usage: [http(s)://TEST-URL | --local-image IMAGE | --self-check]");
+  const url = new URL(args[0] ?? endpoint ?? "http://127.0.0.1:8080");
+  ok(["http:", "https:"].includes(url.protocol) && !url.username && !url.password, "endpoint must use http:// or https:// without credentials");
+  return {url};
+}
+
+const OPTIONS = parseArgs(process.argv.slice(2));
+const BASE = OPTIONS.url ?? new URL("http://127.0.0.1:8080");
+let ORIGIN = BASE.origin;
 const PASSWORD = `Graphwar-E2E-${crypto.randomBytes(18).toString("base64url")}!`;
 const CHROME_CANDIDATES = process.env.CHROME_BIN
   ? [process.env.CHROME_BIN]
@@ -41,6 +56,167 @@ function withTimeout(promise, ms, label) {
     promise,
     new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`timeout: ${label}`)), ms); }),
   ]).finally(() => clearTimeout(timer));
+}
+
+// Never surface Docker output: environment, SQL input and dumps contain test secrets.
+function docker(args, {input, env = {}, ms = 60_000} = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("docker", args, {env: {...process.env, ...env}, stdio: ["pipe", "pipe", "pipe"]});
+    const chunks = [];
+    let size = 0;
+    let failure;
+    const timer = setTimeout(() => { failure = new Error(`Docker ${args[0]} timed out`); child.kill("SIGKILL"); }, ms);
+    child.stdout.on("data", chunk => {
+      size += chunk.length;
+      if (size <= 64 * 1024 * 1024) chunks.push(chunk);
+      else { failure = new Error(`Docker ${args[0]} output limit exceeded`); child.kill("SIGKILL"); }
+    });
+    child.stderr.resume();
+    child.stdin.on("error", () => {}); // Early exit is reported by close, not an unhandled EPIPE.
+    child.once("error", () => { clearTimeout(timer); reject(new Error("Docker unavailable; local-image mode requires a running Docker daemon")); });
+    child.once("close", code => {
+      clearTimeout(timer);
+      if (failure || code !== 0) reject(failure ?? new Error(`Docker ${args[0]} failed (exit ${code})`));
+      else resolve(Buffer.concat(chunks));
+    });
+    child.stdin.end(input);
+  });
+}
+
+async function unusedLoopbackPort() {
+  const server = net.createServer();
+  await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+  const {port} = server.address();
+  await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  return port;
+}
+
+function localHarness(image, run = docker, {
+  findPort = unusedLoopbackPort,
+  health = () => request("/healthz", {signal: AbortSignal.timeout(1_000)}).then(response => response.ok).catch(() => false),
+} = {}) {
+  const name = `graphwar-e2e-${crypto.randomUUID()}`;
+  const password = crypto.randomBytes(24).toString("hex");
+  const owned = [];
+  let network;
+  let postgres;
+  let app;
+  let port;
+  let interrupted;
+  async function allocate(kind, args, env) {
+    if (interrupted) throw interrupted;
+    try {
+      const id = (await run(args, {env})).toString().trim();
+      ok(/^[a-f0-9]{12,64}$/.test(id), `Docker ${kind} returned no resource ID`);
+      owned.push({kind, id});
+      return id;
+    } catch (error) {
+      // A timed-out create may still have succeeded in the daemon. Recover only our labelled ID.
+      const resourceName = kind === "network" ? args.at(-1) : args[args.indexOf("--name") + 1];
+      try {
+        const [resource] = JSON.parse((await run(kind === "network" ? ["network", "inspect", resourceName] : ["inspect", resourceName])).toString());
+        if ((kind === "network" ? resource.Labels : resource.Config?.Labels)?.["graphwar.e2e"] === name) {
+          owned.push({kind, id: resource.Id});
+        }
+      } catch {}
+      throw error;
+    }
+  }
+  async function running(id) {
+    const value = (await run(["inspect", "--format", "{{.State.Running}}", id])).toString().trim();
+    ok(value === "true", "owned container exited before readiness");
+  }
+  async function ready(label, probe, ids) {
+    const end = Date.now() + 60_000;
+    while (Date.now() < end) {
+      if (interrupted) throw interrupted;
+      for (const id of ids) await running(id);
+      if (await probe()) return;
+      await sleep(250);
+    }
+    throw new Error(`timeout: ${label}`);
+  }
+  async function stopApp() {
+    if (!app) return;
+    await run(["stop", "--time", "10", app]);
+    const value = (await run(["inspect", "--format", "{{.State.Running}}", app])).toString().trim();
+    ok(value === "false", "previous app writer is still running");
+    app = null;
+  }
+  async function startApp(database = "graphwar") {
+    ok(!app, "stop previous app writer before replacement");
+    if (interrupted) throw interrupted;
+    const env = {
+      DATABASE_URL: `postgres://graphwar:${password}@postgres:5432/${database}`,
+      ALLOWED_ORIGINS: `http://127.0.0.1:${port}`,
+      SECURE_COOKIES: "false",
+      BIND_ADDR: "0.0.0.0:8080",
+    };
+    app = await allocate("container", [
+      "create", "--pull=never", "--name", `${name}-app-${crypto.randomBytes(4).toString("hex")}`,
+      "--label", `graphwar.e2e=${name}`, "--network", network, "--publish", `127.0.0.1:${port}:8080`,
+      ...Object.keys(env).flatMap(key => ["--env", key]), image,
+    ], env);
+    await run(["start", app]);
+    BASE.href = env.ALLOWED_ORIGINS;
+    ORIGIN = BASE.origin;
+    await ready("app healthz", health, [postgres, app]);
+  }
+  async function sql(database, query) {
+    const bytes = await run(["exec", "-i", postgres, "psql", "-X", "--no-password", "-U", "graphwar", "-d", database, "-v", "ON_ERROR_STOP=1", "-At"], {input: Buffer.from(query)});
+    return bytes.toString().trim();
+  }
+  async function databaseState(database) {
+    return JSON.parse(await sql(database, `SELECT json_build_object(
+      'snapshot', (SELECT snapshot FROM room_registry_state WHERE singleton = TRUE),
+      'users', (SELECT json_agg(t ORDER BY t.id) FROM users t),
+      'sessions', (SELECT json_agg(t ORDER BY t.id) FROM sessions t),
+      'migrations', (SELECT json_agg(t ORDER BY t.version) FROM _sqlx_migrations t));`));
+  }
+  return {
+    interrupt(error) { interrupted = error; },
+    async start() {
+      // App images must already exist. Never build, push, or pull the supplied image.
+      await run(["image", "inspect", image]);
+      port = await findPort();
+      network = await allocate("network", ["network", "create", "--label", `graphwar.e2e=${name}`, `${name}-network`]);
+      postgres = await allocate("container", [
+        "create", "--name", `${name}-postgres`, "--label", `graphwar.e2e=${name}`, "--network", network, "--network-alias", "postgres",
+        "--env", "POSTGRES_USER=graphwar", "--env", "POSTGRES_DB=graphwar", "--env", "POSTGRES_PASSWORD", "postgres:17-alpine",
+      ], {POSTGRES_PASSWORD: password});
+      await run(["start", postgres]);
+      await ready("PostgreSQL", () => run(["exec", postgres, "pg_isready", "-h", "127.0.0.1", "-U", "graphwar", "-d", "graphwar"]).then(() => true).catch(() => false), [postgres]);
+      await startApp();
+    },
+    async restart() { await stopApp(); await startApp(); },
+    async restore() {
+      await stopApp(); // No singleton writer during dump, restore, or comparison.
+      const before = await databaseState("graphwar");
+      ok(before.snapshot && before.users?.length && before.sessions?.length, "restore source lacks persisted test data");
+      let dump = await run(["exec", postgres, "pg_dump", "--no-password", "-U", "graphwar", "-d", "graphwar", "--no-owner", "--no-privileges"]);
+      try {
+        ok(dump.length > 0, "empty PostgreSQL dump");
+        await run(["exec", postgres, "createdb", "--no-password", "-U", "graphwar", "-T", "template0", "graphwar_restored"]);
+        await run(["exec", "-i", postgres, "psql", "-X", "--no-password", "-U", "graphwar", "-d", "graphwar_restored", "-v", "ON_ERROR_STOP=1"], {input: dump});
+      } finally { dump.fill(0); dump = null; }
+      const after = await databaseState("graphwar_restored");
+      ok(isDeepStrictEqual(before, after), "restored snapshot/accounts/sessions/migrations differ from stopped source");
+      await startApp("graphwar_restored"); // Startup runs the same migrations and snapshot deserializer.
+    },
+    async close(failed) {
+      const errors = [];
+      for (const resource of [...owned].reverse()) {
+        try {
+          await run(resource.kind === "container" ? ["rm", "--force", "--volumes", resource.id] : ["network", "rm", resource.id]);
+          owned.splice(owned.indexOf(resource), 1);
+        } catch (error) { errors.push(error); }
+      }
+      if (errors.length) {
+        if (!failed) throw errors[0];
+        process.stderr.write("[e2e] cleanup also failed for owned Docker resources\n");
+      }
+    },
+  };
 }
 
 function cookieFrom(response) {
@@ -105,6 +281,47 @@ function browserUser(label) {
     display_name: `Browser ${label}`,
     password: PASSWORD,
   };
+}
+
+const SPRITES = ["soldierNormal.png", "helmetTeamOne.png", "helmetTeamTwo.png"].map(name => `/rsc/soldiers/${name}`);
+
+async function assetChecks() {
+  async function asset(url, type, signature) {
+    const response = await request(url);
+    ok(response.status === 200, `required asset ${url} status ${response.status}`);
+    ok(type.test(response.headers.get("content-type") ?? ""), `required asset ${url} has wrong content type`);
+    const bytes = Buffer.from(await response.arrayBuffer());
+    ok(bytes.length > 0 && (!signature || bytes.subarray(0, signature.length).equals(signature)), `required asset ${url} signature invalid`);
+    return bytes.toString("utf8");
+  }
+  const html = await asset("/", /^text\/html\b/i);
+  // Check the cache-busted URLs the delivered page actually requests, not source-tree files.
+  const urls = [...html.matchAll(/["'](\/[^"'\s]+)["']/g)].map(match => match[1]);
+  const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  for (const [pathname, type, signature] of [
+    ["/graphwar.css", /^text\/css\b/i],
+    ["/graphwar_client_wasm.js", /^(?:text|application)\/javascript\b/i],
+    ["/graphwar_client_wasm_bg.wasm", /^application\/wasm\b/i, Buffer.from([0, 97, 115, 109, 1, 0, 0, 0])],
+    ["/favicon.svg", /^image\/svg\+xml\b/i],
+    ["/favicon.png", /^image\/png\b/i, png],
+    ["/vendor/mathlive/mathlive.min.js", /^(?:text|application)\/javascript\b/i],
+    ["/vendor/mathlive/mathlive-static.css", /^text\/css\b/i],
+  ]) {
+    const url = urls.find(url => new URL(url, BASE).pathname === pathname);
+    ok(url, `delivered HTML does not reference ${pathname}`);
+    const text = await asset(url, type, signature);
+    if (pathname.endsWith("mathlive-static.css")) {
+      const fonts = [...new Set([...text.matchAll(/url\(\s*["']?([^\s)'"?]+\.woff2)(?:\?[^)'"\s]*)?["']?\s*\)/g)].map(match => new URL(match[1], new URL(url, BASE))))];
+      ok(fonts.length > 0, "MathLive CSS contains no packaged fonts");
+      for (const font of fonts) {
+        ok(font.origin === ORIGIN && font.pathname.startsWith("/vendor/mathlive/fonts/"), "MathLive font escaped packaged assets");
+        await asset(font, /^font\/woff2\b/i, Buffer.from("wOF2"));
+      }
+    }
+  }
+  for (const sprite of SPRITES) await asset(sprite, /^image\/png\b/i, png);
+  ok((await request("/rsc/soldiers/e2e-missing.png")).status === 404, "missing sprite must return 404, not an HTML fallback");
+  log("image-delivered HTML/CSS/JS/WASM, favicon, MathLive fonts, sprite signatures and missing-sprite 404: pass");
 }
 
 async function httpChecks() {
@@ -184,14 +401,17 @@ function socketConnect(url, headers) {
   });
 }
 
+const ACTIVE_SOCKETS = new Set();
+
 class RawWs {
   constructor(handshake) {
+    ACTIVE_SOCKETS.add(this);
     this.socket = handshake.socket;
     this.buffer = handshake.buffer;
     this.waiters = [];
     this.closed = false;
     this.socket.on("data", chunk => { this.buffer = Buffer.concat([this.buffer, chunk]); this.flush(); });
-    this.socket.once("close", () => { this.closed = true; this.flush(); });
+    this.socket.once("close", () => { ACTIVE_SOCKETS.delete(this); this.closed = true; this.flush(); });
     this.socket.once("error", () => { this.closed = true; this.flush(); });
   }
   send(opcode, payload) {
@@ -270,22 +490,98 @@ async function openWs(cookie, origin = ORIGIN) {
   ok(hello.type === "hello" && hello.payload.version === PROTOCOL_VERSION, "server hello mismatch");
   const sync = JSON.parse((await socket.next("state sync")).text);
   ok(["state_sync", "left_room"].includes(sync.type), "state sync missing");
+  socket.sync = sync.type === "state_sync" ? sync.payload : null;
   const roomList = JSON.parse((await socket.next("room list")).text);
   ok(roomList.type === "room_list", "room list missing");
   return socket;
 }
 
-async function activeRoomSnapshot(cookie, label) {
-  const socket = await rawWs(cookie);
+async function activeRoomState(cookie, label) {
+  const socket = await openWs(cookie);
   try {
-    socket.sendText(JSON.stringify({type: "hello", payload: {version: PROTOCOL_VERSION}}));
-    const hello = JSON.parse((await socket.next(`${label} hello`)).text);
-    ok(hello.type === "hello" && hello.payload.version === PROTOCOL_VERSION, `${label} server hello mismatch`);
-    const sync = JSON.parse((await socket.next(`${label} state sync`)).text);
-    ok(sync.type === "state_sync" && sync.payload?.snapshot, `${label} state sync missing: ${JSON.stringify(sync)}`);
-    return sync.payload.snapshot;
+    ok(socket.sync?.snapshot, `${label} state sync missing`);
+    return socket.sync;
   } finally {
     socket.close();
+  }
+}
+
+async function activeRoomSnapshot(cookie, label) {
+  return (await activeRoomState(cookie, label)).snapshot;
+}
+
+// Deadlines/revisions are deliberately renewed at startup; all other visible state must survive.
+function comparableState(state) {
+  const copy = structuredClone(state);
+  delete copy.snapshot.revision;
+  copy.snapshot.players.sort((a, b) => a.id.localeCompare(b.id));
+  if (copy.game) {
+    delete copy.game.revision;
+    delete copy.game.turn_deadline_at;
+  }
+  return copy;
+}
+
+async function recoveryChecks(harness) {
+  const owner = await registerAndLogin("restart-owner");
+  const guest = await registerAndLogin("restart-guest");
+  const sockets = [];
+  try {
+    const a = await openWs(owner.cookie); sockets.push(a);
+    const b = await openWs(guest.cookie); sockets.push(b);
+    async function command(socket, type, payload, expected) {
+      socket.sendText(JSON.stringify({type, ...(payload ? {payload} : {})}));
+      const response = await nextWsMessageAny(socket, [expected, "error"], `recovery ${type}`);
+      ok(response.type === expected, `recovery ${type} rejected`);
+      return response.payload;
+    }
+    const created = await command(a, "create_room", {name: "Recovery E2E", visibility: "public", kind: "practice"}, "room_created");
+    const joined = await command(b, "join_room", {room_id: created.snapshot.id, invite: null}, "room");
+    await nextWsMessage(a, "room", "recovery owner observes join");
+    const setup = {
+      terrain: [{x: 385, y: 100, radius: 20}],
+      players: joined.snapshot.players.map((player, index) => ({
+        player_id: player.id,
+        soldiers: Array.from({length: player.soldiers}, (_, soldier) => ({x: 100 + index * 500, y: 180 + soldier * 40})),
+      })),
+    };
+    await command(a, "set_practice_setup", {base_revision: joined.snapshot.revision, setup}, "room");
+    await nextWsMessage(b, "room", "recovery guest observes setup");
+    const chat = await command(a, "chat", {text: "recovery-chat"}, "chat");
+    ok(chat.entry.text === "recovery-chat", "recovery chat missing");
+    await nextWsMessage(b, "chat", "recovery guest observes chat");
+    const ready = await command(a, "set_ready", {ready: true}, "room");
+    ok(ready.snapshot.players.some(player => player.ready), "recovery owner readiness missing");
+    await nextWsMessage(b, "room", "recovery guest observes owner readiness");
+    await command(b, "set_ready", {ready: true}, "room");
+    await nextWsMessage(a, "room", "recovery owner observes guest readiness");
+    const started = await command(a, "start_game", null, "game_started");
+    await nextWsMessage(b, "game_started", "recovery guest observes game");
+    ok(started.snapshot.phase === "planning" && started.game.turn_player_id, "recovery requires stable Planning state");
+    const expected = await activeRoomState(owner.cookie, "recovery baseline");
+    ok(expected.snapshot.players.length === 2 && expected.chat_history.some(entry => entry.text === "recovery-chat"), "recovery baseline lacks roster/chat");
+    ok(isDeepStrictEqual(expected.practice_setup, setup), "recovery baseline lost practice setup");
+    for (const [label, operation] of [
+      ["restart 1", () => harness.restart()],
+      ["restart 2", () => harness.restart()],
+      ["dump/restore", () => harness.restore()],
+    ]) {
+      const startedAt = Math.floor(Date.now() / 1000);
+      await operation();
+      for (const session of [owner, guest]) {
+        const me = await request("/auth/me", {headers: {cookie: session.cookie}});
+        ok(me.status === 200 && (await me.json()).id === session.account.id, `${label}: original session no longer authenticates`);
+        const restored = await activeRoomState(session.cookie, label);
+        ok(isDeepStrictEqual(comparableState(restored), comparableState(expected)), `${label}: room/roster/chat/practice/game/turn changed`);
+        ok(restored.snapshot.revision === expected.snapshot.revision + (label === "restart 1" ? 1 : label === "restart 2" ? 2 : 3), `${label}: unexpected startup revision`);
+        ok(restored.game.turn_deadline_at >= startedAt + restored.snapshot.turn_duration_seconds
+          && restored.game.turn_deadline_at <= Math.floor(Date.now() / 1000) + restored.snapshot.turn_duration_seconds,
+        `${label}: Planning deadline not renewed`);
+      }
+      log(`owned image ${label}: session, reconnect, roster, chat, practice and Planning turn: pass`);
+    }
+  } finally {
+    sockets.forEach(socket => socket.close());
   }
 }
 
@@ -443,42 +739,151 @@ async function chromeCommand() {
   throw new Error(`Chrome not found; set CHROME_BIN. Checked: ${CHROME_CANDIDATES.join(", ")}`);
 }
 
-async function closeBrowser(browser) {
+async function closeBrowser(browser, {rm = fs.rm, shutdownMs = timeoutMs} = {}) {
   if (!browser) return;
-  browser.cdp.close();
-  if (!browser.child.killed) browser.child.kill("SIGTERM");
-  await withTimeout(new Promise(resolve => browser.child.once("exit", resolve)), timeoutMs, "Chrome shutdown")
-    .catch(() => browser.child.kill("SIGKILL"));
-  await fs.rm(browser.dir, {recursive: true, force: true, maxRetries: 5, retryDelay: 200});
+  const errors = [];
+  if (browser.failures?.length) errors.push(new Error(`browser runtime/asset diagnostics: ${[...new Set(browser.failures)].join(", ")}`));
+  try { browser.cdp?.close(); } catch (error) { errors.push(error); }
+  const child = browser.child;
+  if (child?.pid && child.exitCode === null && child.signalCode === null) {
+    let onExit;
+    const exited = new Promise(resolve => { onExit = resolve; child.once("exit", onExit); });
+    try {
+      child.kill("SIGTERM");
+      await withTimeout(exited, shutdownMs, "Chrome shutdown").catch(async () => {
+        child.kill("SIGKILL");
+        await withTimeout(exited, shutdownMs, "Chrome forced shutdown");
+      });
+    } catch (error) { errors.push(error); }
+    finally { child.off("exit", onExit); }
+  }
+  // Do not remove a profile while its process could still be writing it.
+  if (browser.dir && (!child?.pid || child.exitCode !== null || child.signalCode !== null)) {
+    try { await rm(browser.dir, {recursive: true, force: true, maxRetries: 5, retryDelay: 200}); }
+    catch (error) { errors.push(error); }
+  }
+  if (errors.length) throw errors[0];
 }
 
-async function launchBrowser(url) {
+async function closeBrowsers(browsers, failed, close = closeBrowser) {
+  const results = await Promise.allSettled(browsers.map(browser => close(browser)));
+  const failure = results.find(result => result.status === "rejected");
+  if (!failed && failure) throw failure.reason;
+}
+
+async function launchBrowser(url, {
+  findChrome = chromeCommand, mkdtemp = fs.mkdtemp, start = spawn, fetchTargets = fetch,
+  createCdp = url => new Cdp(url), wait = browserWait, close = closeBrowser, pause = sleep,
+} = {}) {
   ok(typeof WebSocket === "function", "Node 22+ required: global WebSocket unavailable");
-  const chrome = await chromeCommand();
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "graphwar-e2e-"));
-  const port = 9300 + crypto.randomInt(500);
-  const child = spawn(chrome, [
-    "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
-    ...(BASE.protocol === "https:" && process.env.E2E_TLS_VERIFY === "false" ? ["--ignore-certificate-errors"] : []),
-    `--remote-debugging-port=${port}`, `--user-data-dir=${dir}`, "about:blank",
-  ], {stdio: "ignore"});
-  let page;
-  for (let attempt = 0; attempt < 80; attempt++) {
-    const targets = await fetch(`http://127.0.0.1:${port}/json/list`)
-      .then(response => response.json())
-      .catch(() => null);
-    page = targets?.find(target => target.type === "page");
-    if (page) break;
-    await sleep(100);
+  const chrome = await findChrome();
+  const browser = {};
+  try {
+    browser.dir = await mkdtemp(path.join(os.tmpdir(), "graphwar-e2e-"));
+    const port = 9300 + crypto.randomInt(500);
+    browser.child = start(chrome, [
+      "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+      ...(BASE.protocol === "https:" && process.env.E2E_TLS_VERIFY === "false" ? ["--ignore-certificate-errors"] : []),
+      `--remote-debugging-port=${port}`, `--user-data-dir=${browser.dir}`, "about:blank",
+    ], {stdio: "ignore"});
+    let spawnError;
+    browser.child.once("error", error => { spawnError = error; });
+    let page;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      if (spawnError) throw spawnError;
+      ok(browser.child.exitCode === null && browser.child.signalCode === null, "Chrome exited before DevTools was ready");
+      const targets = await fetchTargets(`http://127.0.0.1:${port}/json/list`, {signal: AbortSignal.timeout(1_000)})
+        .then(response => response.json())
+        .catch(() => null);
+      if (spawnError) throw spawnError;
+      page = targets?.find(target => target.type === "page");
+      if (page) break;
+      await pause(100);
+    }
+    ok(page?.webSocketDebuggerUrl, "Chrome page DevTools endpoint unavailable");
+    browser.cdp = createCdp(page.webSocketDebuggerUrl);
+    await browser.cdp.connect();
+    await browser.cdp.command("Page.enable");
+    await browser.cdp.command("Runtime.enable");
+    await browser.cdp.command("Network.enable");
+    installBrowserDiagnostics(browser);
+    await browser.cdp.command("Page.addScriptToEvaluateOnNewDocument", {source: `(() => {
+      const request = window.requestAnimationFrame.bind(window);
+      const cancel = window.cancelAnimationFrame.bind(window);
+      const pending = new Set();
+      window.__graphwarRaf = {pending, count: 0};
+      window.requestAnimationFrame = callback => {
+        // MathLive schedules layout RAFs too; track only the application's WASM animation loop.
+        const tracked = new Error().stack?.split('\\n')[2]?.includes('graphwar_client_wasm');
+        const id = request(timestamp => {
+          if (tracked) { pending.delete(id); window.__graphwarRaf.count++; }
+          callback(timestamp);
+        });
+        if (tracked) pending.add(id);
+        return id;
+      };
+      window.cancelAnimationFrame = id => { pending.delete(id); cancel(id); };
+    })();`});
+    await browser.cdp.command("Page.navigate", {url: url.toString()});
+    await wait(browser.cdp, "Boolean(document.querySelector('#login-form') || document.querySelector('.lobby-shell') || document.querySelector('.room-shell') || document.querySelector('.game-shell'))", "initial app render");
+    return browser;
+  } catch (error) {
+    await closeBrowsers([browser], true, close);
+    throw error;
   }
-  ok(page?.webSocketDebuggerUrl, "Chrome page DevTools endpoint unavailable");
-  const cdp = new Cdp(page.webSocketDebuggerUrl);
-  await cdp.connect();
-  await cdp.command("Page.enable");
-  await cdp.command("Runtime.enable");
-  await cdp.command("Network.enable");
-  await cdp.command("Page.navigate", {url: url.toString()});
-  return {cdp, child, dir};
+}
+
+function installBrowserDiagnostics(browser) {
+  const {cdp} = browser;
+  browser.failures = [];
+  const required = value => {
+    try {
+      const url = new URL(value);
+      return url.origin === ORIGIN && (/\.(?:css|js|wasm|png|svg|woff2)(?:$)/.test(url.pathname));
+    } catch { return false; }
+  };
+  const resources = new Map();
+  cdp.on("Runtime.exceptionThrown", () => browser.failures.push("uncaught JavaScript exception"));
+  cdp.on("Runtime.consoleAPICalled", ({type}) => {
+    if (["error", "warning"].includes(type)) browser.failures.push(`console ${type}`);
+  });
+  cdp.on("Network.requestWillBeSent", ({requestId, request}) => {
+    if (required(request.url)) resources.set(requestId, new URL(request.url).pathname);
+  });
+  cdp.on("Network.responseReceived", ({response}) => {
+    if (required(response.url) && response.status >= 400) browser.failures.push(`asset ${new URL(response.url).pathname} status ${response.status}`);
+  });
+  cdp.on("Network.loadingFailed", ({requestId, canceled}) => {
+    if (!canceled && resources.has(requestId)) browser.failures.push(`asset ${resources.get(requestId)} failed`);
+  });
+}
+
+async function browserAssetChecks(cdp) {
+  const decoded = await cdp.evaluate(`Promise.all(${JSON.stringify([...SPRITES, "/favicon.png"])}.map(async src => {
+    const image = new Image(); image.src = src; await image.decode();
+    return image.complete && image.naturalWidth > 0 && image.naturalHeight > 0;
+  }))`);
+  ok(decoded.every(Boolean), "browser failed to decode packaged PNG images");
+  const fonts = await cdp.evaluate(`(async () => {
+    await customElements.whenDefined('math-field');
+    await document.fonts.ready;
+    const loaded = [...document.fonts].filter(font => font.status === 'loaded' && /KaTeX/.test(font.family));
+    const requested = performance.getEntriesByType('resource').map(entry => new URL(entry.name));
+    return loaded.length > 0 && loaded.every(font => document.fonts.check('16px ' + font.family))
+      && requested.some(url => url.pathname === '/graphwar_client_wasm_bg.wasm')
+      && requested.some(url => url.pathname === '/vendor/mathlive/mathlive.min.js')
+      && requested.some(url => url.pathname === '/vendor/mathlive/mathlive-static.css')
+      && requested.some(url => url.pathname.startsWith('/vendor/mathlive/fonts/') && url.pathname.endsWith('.woff2'));
+  })()`);
+  ok(fonts, "WASM/MathLive boot or requested packaged font loading missing");
+  log(`browser ${String((await cdp.command("Browser.getVersion")).product)}: WASM/MathLive/font boot and image decoding: pass`);
+}
+
+async function browserRafIdle(cdp, label) {
+  await browserWait(cdp, "window.__graphwarRaf?.pending.size === 0", label, 20_000);
+  const count = await cdp.evaluate("window.__graphwarRaf.count");
+  await sleep(200);
+  ok(await cdp.evaluate(`window.__graphwarRaf.pending.size === 0 && window.__graphwarRaf.count === ${count}`), `${label}: animation frame loop did not stop`);
 }
 
 async function browserWait(cdp, expression, label, ms = timeoutMs) {
@@ -615,12 +1020,15 @@ async function browserLeave(cdp) {
   await browserWait(cdp, "Boolean(document.querySelector('#create-room-open'))", "lobby after leave");
 }
 
-async function browserFlows() {
+async function browserFlows({launch = launchBrowser, close = closeBrowser} = {}) {
   const alpha = browserUser("alpha");
   const bravo = browserUser("bravo");
-  const a = await launchBrowser(BASE);
-  const b = await launchBrowser(BASE);
+  let a;
+  let b;
+  let failed = false;
   try {
+    a = await launch(BASE);
+    b = await launch(BASE);
     await browserInstallRenderProbe(a.cdp, "login-notice", [
       ".app-frame", "#screen", ".login-shell", "#login-form", "#register-form", "#login-password",
     ]);
@@ -1201,6 +1609,7 @@ async function browserFlows() {
     ok(publicDeadlineDelta >= 10 && publicDeadlineDelta <= 11, `public turn deadline used ${publicDeadlineDelta}s from click, expected 10s`);
     await browserWait(a.cdp, "Boolean(document.querySelector('#game-canvas'))", "public game owner", 20_000);
     await browserWait(b.cdp, "Boolean(document.querySelector('#game-canvas'))", "public game guest", 20_000);
+    await browserAssetChecks(a.cdp);
     await browserWait(a.cdp, "document.querySelectorAll('.soldier-name-label').length === 2 && document.querySelectorAll('.soldier-name-label.is-active').length === 1", "owner soldier labels", 20_000);
     await browserWait(b.cdp, "document.querySelectorAll('.soldier-name-label').length === 2 && document.querySelectorAll('.soldier-name-label.is-active').length === 1", "guest soldier labels", 20_000);
     const activeIsA = await a.cdp.evaluate("document.querySelector('#function-input')?.disabled === false");
@@ -1359,6 +1768,35 @@ async function browserFlows() {
     for (const cdp of [a.cdp, b.cdp]) await browserInstallGameRenderProbe(cdp);
     const previewExceptions = [];
     active.on("Runtime.exceptionThrown", ({exceptionDetails}) => previewExceptions.push(exceptionDetails.text ?? "browser exception"));
+    await active.evaluate(`(() => {
+      const form = document.querySelector('#fire-form');
+      window.__fireSubmits = 0;
+      form.addEventListener('submit', () => { window.__fireSubmits++; });
+    })()`);
+    for (const invalid of ['x+', '']) {
+      await browserSet(active, '#function-input', invalid);
+      await browserSubmit(active, '#fire-form');
+      ok(await active.evaluate(`document.querySelector('#function-input')?.getAttribute('aria-invalid') === 'true'
+        && document.querySelector('#function-error')?.textContent.trim().length > 0
+        && document.querySelectorAll('.game-chat .shot-entry').length === 0`), 'invalid expression submitted or lacked a visible error');
+    }
+    await browserSet(active, '#function-input', String.raw`y^{\prime}`);
+    await browserWait(active, "document.querySelector('#function-error')?.textContent === 'Variable unavailable in this mode'", 'MathLive prime keeps derivative semantics');
+    await active.evaluate(`(() => {
+      const field = document.querySelector('#function-input');
+      field.value = '';
+      field.executeCommand(['insert', '\\\\exponentialE^{x}']);
+      field.dispatchEvent(new Event('input', {bubbles:true}));
+    })()`);
+    await browserWait(active, "document.querySelector('#function-error')?.textContent === ''", 'MathLive Euler preview');
+    const submitsBeforeBlur = await active.evaluate('window.__fireSubmits');
+    await active.evaluate(`(() => {
+      const field = document.querySelector('#function-input');
+      field.focus();
+      field.blur();
+      field.dispatchEvent(new Event('change', {bubbles:true}));
+    })()`);
+    ok(await active.evaluate(`window.__fireSubmits === ${submitsBeforeBlur}`), 'blur/change fired a shot');
     await browserSet(active, "#function-input", String.raw`\unknown{x}`);
     await browserWait(active, "document.querySelector('#function-error')?.textContent.includes('byte 0')", "malformed LaTeX preview error");
     await browserSet(active, "#function-input", String.raw`\frac{\sin(x)}{\sqrt{2}}`);
@@ -1400,7 +1838,9 @@ async function browserFlows() {
     })()`;
     await sendGameChat(active, "chat-before");
     await browserWait(inactive, "document.querySelector('.game-chat ul')?.textContent.includes('chat-before')", "pre-shot chat delivery");
-    await browserSubmit(active, "#fire-form");
+    const submitsBeforeCommit = await active.evaluate('window.__fireSubmits');
+    await active.evaluate("document.querySelector('#function-input').executeCommand('commit')");
+    ok(await active.evaluate(`window.__fireSubmits === ${submitsBeforeCommit + 1}`), 'virtual Enter did not submit exactly once');
     await browserWait(active, "document.querySelector('#turn-timer')?.textContent.includes('Resolving')", "authoritative shot", 20_000);
     await browserWait(inactive, "document.querySelector('#turn-timer')?.textContent.includes('Resolving')", "remote authoritative shot", 20_000);
     for (const cdp of [active, inactive]) {
@@ -1440,6 +1880,27 @@ async function browserFlows() {
         && labels.length === 2
         && activeLabel?.textContent === ${JSON.stringify(activeIsA ? bravo.display_name : alpha.display_name)};
     })()`, "next authoritative turn highlight", 20_000);
+    ok(await active.evaluate("window.__graphwarRaf.count > 0"), "shot RAF probe did not observe WASM animation");
+    await browserRafIdle(active, "completed shot RAF");
+    await inactive.command("Emulation.setEmulatedMedia", {media: "", features: [{name: "prefers-reduced-motion", value: "reduce"}]});
+    await browserRafIdle(inactive, "reduced-motion initial RAF");
+    await browserSet(inactive, '#function-input', '0');
+    await inactive.evaluate(`(() => {
+      const field = document.querySelector('#function-input');
+      window.__physicalSubmits = 0;
+      document.querySelector('#fire-form').addEventListener('submit', () => { window.__physicalSubmits++; });
+      field.focus();
+    })()`);
+    await inactive.command('Input.dispatchKeyEvent', {type:'keyDown', key:'Enter', code:'Enter', windowsVirtualKeyCode:13, modifiers:8});
+    await inactive.command('Input.dispatchKeyEvent', {type:'keyUp', key:'Enter', code:'Enter', windowsVirtualKeyCode:13, modifiers:8});
+    ok(await inactive.evaluate('window.__physicalSubmits === 0'), 'Shift+Enter fired a shot');
+    await inactive.command('Input.dispatchKeyEvent', {type:'keyDown', key:'Enter', code:'Enter', windowsVirtualKeyCode:13});
+    await inactive.command('Input.dispatchKeyEvent', {type:'keyUp', key:'Enter', code:'Enter', windowsVirtualKeyCode:13});
+    ok(await inactive.evaluate('window.__physicalSubmits === 1'), 'physical Enter did not submit exactly once');
+    await browserWait(inactive, "document.querySelectorAll('.game-chat .shot-entry').length === 2", 'physical Enter authoritative shot');
+    await browserWait(inactive, "document.querySelector('#shot-status')?.textContent.trim().length > 0", "reduced-motion shot outcome");
+    await browserRafIdle(inactive, "reduced-motion shot RAF");
+    await inactive.command("Emulation.setEmulatedMedia", {media: "", features: []});
     await sendGameChat(active, "game-chat");
     await browserWait(inactive, `(() => {
       const feed = document.querySelector('.game-chat ul');
@@ -1490,9 +1951,10 @@ async function browserFlows() {
 
     let e;
     let f;
+    let practiceFailed = false;
     try {
-      e = await launchBrowser(BASE);
-      f = await launchBrowser(BASE);
+      e = await launch(BASE);
+      f = await launch(BASE);
       const practiceOwner = browserUser("practice-owner");
       const practiceGuest = browserUser("practice-guest");
       await browserRegister(e, practiceOwner);
@@ -1605,7 +2067,8 @@ async function browserFlows() {
       log("practice owner/guest controls, rejection, setup readiness reset, reconnect, start: pass");
 
       // Finished -> ReturnToLobby -> rematch keeps the practice setup.
-      const ownerShotWs = await openWs(await browserSessionCookie(e.cdp));
+      const shooterCdp = (await e.cdp.evaluate("document.querySelector('#function-input')?.disabled === false")) ? e.cdp : f.cdp;
+      const ownerShotWs = await openWs(await browserSessionCookie(shooterCdp));
       const finishShot = new Promise((resolve, reject) => {
         ownerShotWs.sendText(JSON.stringify({type: "fire_function", payload: {function: "0", angle_deg: 0}}));
         (async () => {
@@ -1621,7 +2084,7 @@ async function browserFlows() {
       const finishMessage = await finishShot;
       ok(finishMessage.type === "game_finished", `practice decisive shot returned ${JSON.stringify(finishMessage)}`);
       ok(finishMessage.payload.snapshot.phase === "finished"
-        && finishMessage.payload.shot.winner_team === 1
+        && [1, 2].includes(finishMessage.payload.shot.winner_team)
         && finishMessage.payload.shot.outcome.type === "terrain_impact"
         && finishMessage.payload.shot.outcome.payload.hits.length === 1,
       `practice decisive shot did not finish the game: ${JSON.stringify(finishMessage.payload.shot)}`);
@@ -1650,15 +2113,19 @@ async function browserFlows() {
       ok(JSON.stringify(rematch.terrain) === JSON.stringify(mutatedSetup.terrain),
         `practice rematch lost the setup terrain: ${JSON.stringify(rematch.terrain)}`);
       log("practice finished, return-to-lobby, rematch: pass");
+    } catch (error) {
+      practiceFailed = true;
+      throw error;
     } finally {
-      for (const browser of [e, f]) await closeBrowser(browser);
+      await closeBrowsers([e, f], practiceFailed, close);
     }
 
     let c;
     let d;
+    let privateFailed = false;
     try {
-      c = await launchBrowser(BASE);
-      d = await launchBrowser(BASE);
+      c = await launch(BASE);
+      d = await launch(BASE);
       const privateGuest = browserUser("private-guest");
       await browserRegister(c, browserUser("private-owner"));
       await browserRegister(d, privateGuest);
@@ -1774,15 +2241,15 @@ async function browserFlows() {
       const privateButton = `.join-room[data-room-id="${privateRoom.id}"]`;
       await browserClickWithDialog(d.cdp, privateButton, null);
       await sleep(150);
-      ok(await d.cdp.evaluate("Boolean(document.querySelector('#create-room-open')) && !document.querySelector('#create-room-dialog')?.open && !document.querySelector('.notices')?.textContent.includes('room is private')"), "cancelled password prompt changed lobby");
+      ok(await d.cdp.evaluate("Boolean(document.querySelector('#create-room-open')) && !document.querySelector('#create-room-dialog')?.open && !document.querySelector('#announcements')?.textContent.includes('room is private') && !document.querySelector('.notices')?.textContent.trim()"), "cancelled password prompt changed lobby");
       await browserClickWithDialog(d.cdp, privateButton, "");
-      await browserWait(d.cdp, "document.querySelector('.notices')?.textContent.includes('Room password is required')", "empty password notice");
+      await browserWait(d.cdp, "document.querySelector('#announcements')?.textContent.includes('Room password is required') && document.querySelector('.notices')?.textContent.includes('Room password is required')", "empty password notice");
       await browserAssertRenderStable(d.cdp, "lobby-notice", "empty password notice");
       await browserInstallRenderProbe(d.cdp, "lobby-wrong-password", [
         ".app-frame", "#screen", ".lobby-shell", "#create-room-open", "#create-room-dialog",
       ]);
       await browserClickWithDialog(d.cdp, privateButton, "wrong-password");
-      await browserWait(d.cdp, "document.querySelector('.notices')?.textContent.includes('room is private')", "wrong password rejection");
+      await browserWait(d.cdp, "document.querySelector('#announcements')?.textContent.includes('room is private') && document.querySelector('.notices')?.textContent.includes('room is private')", "wrong password rejection");
       await browserWait(d.cdp, "document.querySelector('#announcements')?.textContent.includes('room is private')", "wrong password live error");
       await browserAssertRenderStable(d.cdp, "lobby-wrong-password", "wrong password notice");
       ok(!await d.cdp.evaluate(`document.body.textContent.includes(${JSON.stringify(roomPassword)})`), "room password leaked after failed join");
@@ -1882,23 +2349,266 @@ async function browserFlows() {
       );
       await c.cdp.command("Emulation.setEmulatedMedia", {media: "", features: []});
       log("browser bot match and bot turn completion: pass");
+    } catch (error) {
+      privateFailed = true;
+      throw error;
     } finally {
-      for (const browser of [c, d]) await closeBrowser(browser);
+      await closeBrowsers([c, d], privateFailed, close);
     }
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
-    for (const browser of [a, b]) await closeBrowser(browser);
+    await closeBrowsers([a, b], failed, close);
   }
 }
 
-async function main() {
-  ok(["http:", "https:"].includes(BASE.protocol), "endpoint must use http:// or https://");
+async function cleanupSelfCheck() {
+  function fakeChild(force = false) {
+    const child = Object.assign(new EventEmitter(), {pid: 123, exitCode: null, signalCode: null, signals: []});
+    child.kill = signal => {
+      child.signals.push(signal);
+      if (!force || signal === "SIGKILL") queueMicrotask(() => {
+        child.signalCode = signal;
+        child.emit("exit", null, signal);
+      });
+      return true;
+    };
+    return child;
+  }
+  for (const stage of ["spawn", "spawn-error", "endpoint", "connect", "Page.enable", "Runtime.enable", "Network.enable", "Page.addScriptToEvaluateOnNewDocument", "Page.navigate", "wait"]) {
+    const original = new Error(stage);
+    const child = fakeChild();
+    let cdpClosed = 0;
+    let removed = 0;
+    const cdp = {
+      on() {},
+      connect: async () => { if (stage === "connect") throw original; },
+      command: async method => { if (stage === method) throw original; },
+      close: () => { cdpClosed++; },
+    };
+    const rm = async dir => {
+      assert.equal(dir, "owned-profile");
+      ok(!child.pid || child.signalCode !== null, "profile removed before Chrome terminated");
+      removed++;
+    };
+    const launch = () => launchBrowser(BASE, {
+      findChrome: async () => "fake-chrome",
+      mkdtemp: async () => "owned-profile",
+      start: () => {
+        if (stage === "spawn") { child.pid = undefined; throw original; }
+        if (stage === "spawn-error") {
+          child.pid = undefined;
+          queueMicrotask(() => child.emit("error", original));
+        }
+        return child;
+      },
+      fetchTargets: async () => ({json: async () => [{type: "page", ...(stage === "endpoint" ? {} : {webSocketDebuggerUrl: "fake-cdp"})}]}),
+      createCdp: () => cdp,
+      wait: async () => { if (stage === "wait") throw original; },
+      close: browser => closeBrowser(browser, {rm, shutdownMs: 5}),
+    });
+    await assert.rejects(launch, error => stage === "endpoint"
+      ? error.message.includes("DevTools endpoint unavailable") : error === original);
+    assert.equal(removed, 1, `${stage}: owned profile cleanup missing`);
+    assert.equal(cdpClosed, ["spawn", "spawn-error", "endpoint"].includes(stage) ? 0 : 1, `${stage}: CDP cleanup missing`);
+    assert.equal(child.listenerCount("exit"), 0, `${stage}: shutdown listener leaked`);
+  }
+  for (const force of [false, true]) {
+    const child = fakeChild(force);
+    child.killed = true; // A signalled process is not necessarily terminated.
+    let removed = false;
+    await closeBrowser({child, dir: "owned-profile", cdp: {close() { throw new Error("CDP close failed"); }}}, {
+      shutdownMs: 5,
+      rm: async () => { ok(child.signalCode !== null, "cleanup did not wait for process exit"); removed = true; },
+    }).then(() => assert.fail("CDP cleanup failure suppressed"), error => assert.equal(error.message, "CDP close failed"));
+    assert.deepEqual(child.signals, force ? ["SIGTERM", "SIGKILL"] : ["SIGTERM"]);
+    ok(removed, "CDP error prevented profile cleanup");
+  }
+  const exited = fakeChild();
+  exited.exitCode = 0;
+  await closeBrowser({child: exited, dir: "owned-profile"}, {rm: async () => {}});
+  assert.deepEqual(exited.signals, [], "already-exited Chrome was signalled");
+  for (const failAt of [1, 2]) {
+    const original = new Error(`launch ${failAt}`);
+    const first = {owned: true};
+    const cleaned = [];
+    let count = 0;
+    await assert.rejects(() => browserFlows({
+      launch: async () => { if (++count === failAt) throw original; return first; },
+      close: async browser => { if (browser) { cleaned.push(browser); throw new Error("cleanup failed"); } },
+    }), error => error === original);
+    assert.deepEqual(cleaned, failAt === 1 ? [] : [first], "failed allocation leaked an earlier browser");
+  }
+  const cleaned = [];
+  await assert.rejects(() => closeBrowsers([1, 2], false, async browser => {
+    cleaned.push(browser);
+    if (browser === 1) throw new Error("cleanup failed");
+  }), /cleanup failed/);
+  assert.deepEqual(cleaned, [1, 2], "one cleanup error skipped the next browser");
+  const original = new Error("navigation failed");
+  await assert.rejects(() => launchBrowser(BASE, {
+    findChrome: async () => "fake-chrome", mkdtemp: async () => "owned-profile", start: () => fakeChild(),
+    fetchTargets: async () => ({json: async () => [{type: "page", webSocketDebuggerUrl: "fake-cdp"}]}),
+    createCdp: () => ({connect: async () => { throw original; }}),
+    close: async () => { throw new Error("cleanup failed"); },
+  }), error => error === original);
+  log("cleanup self-check: partial launch, first/second allocation, forced/already-exited shutdown, cleanup failures: pass");
+}
+
+async function harnessSelfCheck() {
+  assert.deepEqual(parseArgs(["--local-image", "graphwar:ci"], "https://ignored.invalid"), {image: "graphwar:ci"});
+  assert.deepEqual(parseArgs(["--self-check"]), {selfCheck: true});
+  assert.equal(parseArgs([], "http://127.0.0.1:9090").url.origin, "http://127.0.0.1:9090");
+  assert.equal(parseArgs(["http://127.0.0.1:8081"]).image, undefined);
+  for (const args of [["--local-image"], ["--local-image", "-bad"], ["--local-image", "x;false"], ["--local-image", "x", "extra"], ["--self-check", "extra"], ["ftp://example.test"], ["http://user:secret@example.test"]]) {
+    assert.throws(() => parseArgs(args));
+  }
+  for (const failAt of ["image", "network", "database-create", "database-start", "readiness"]) {
+    const calls = [];
+    const original = new Error(failAt);
+    const network = "a".repeat(64);
+    const database = "b".repeat(64);
+    const harness = localHarness("graphwar:ci", async (args, options) => {
+      calls.push(args);
+      if (args[0] === "image") { if (failAt === "image") throw original; return Buffer.from("[]"); }
+      if (args[0] === "network" && args[1] === "create") { if (failAt === "network") throw original; return Buffer.from(network); }
+      if (args[0] === "create") {
+        ok(options.env.POSTGRES_PASSWORD && !args.join(" ").includes(options.env.POSTGRES_PASSWORD), "database password leaked into arguments");
+        if (failAt === "database-create") throw original;
+        return Buffer.from(database);
+      }
+      if (args[0] === "start") { if (failAt === "database-start") throw original; return Buffer.alloc(0); }
+      if (args[0] === "inspect") throw original;
+      if (args[0] === "rm") throw new Error("cleanup failure");
+      return Buffer.alloc(0);
+    }, {findPort: async () => 12345});
+    await assert.rejects(() => harness.start(), error => error === original);
+    if (["database-start", "readiness"].includes(failAt)) await assert.rejects(() => harness.close(false), /cleanup failure/);
+    else await harness.close(false);
+    const removals = calls.filter(args => args[0] === "rm" || args[0] === "network" && args[1] === "rm");
+    assert.deepEqual(removals, ["image", "network"].includes(failAt) ? [] : failAt === "database-create"
+      ? [["network", "rm", network]]
+      : [["rm", "--force", "--volumes", database], ["network", "rm", network]], "cleanup touched unowned resources or stopped after failure");
+  }
+  for (const sameOwner of [true, false]) {
+    const original = new Error("create response lost");
+    const calls = [];
+    const resourceId = "f".repeat(64);
+    let ownerLabel;
+    const harness = localHarness("graphwar:ci", async args => {
+      calls.push(args);
+      if (args[0] === "image") return Buffer.from("[]");
+      if (args[0] === "network" && args[1] === "create") {
+        ownerLabel = args[args.indexOf("--label") + 1].split("=")[1];
+        throw original; // Daemon allocation succeeded, CLI response did not.
+      }
+      if (args[0] === "network" && args[1] === "inspect") return Buffer.from(JSON.stringify([
+        {Id: resourceId, Labels: {"graphwar.e2e": sameOwner ? ownerLabel : "another-run"}},
+      ]));
+      return Buffer.alloc(0);
+    }, {findPort: async () => 12345});
+    await assert.rejects(() => harness.start(), error => error === original);
+    await harness.close(false);
+    assert.deepEqual(calls.filter(args => args[0] === "network" && args[1] === "rm"), sameOwner ? [["network", "rm", resourceId]] : [], "uncertain create cleanup ignored ownership label");
+  }
+  const calls = [];
+  const ids = ["a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64), "e".repeat(64)];
+  const savedUrl = BASE.href;
+  const running = new Set();
+  let nextId = 0;
+  let appId;
+  let dumpInput = false;
+  const databaseState = {snapshot: {rooms: [{id: "test"}]}, users: [{id: "test"}], sessions: [{id: "test"}]};
+  const harness = localHarness("graphwar:ci", async (args, options = {}) => {
+    calls.push(args);
+    if (args[0] === "image") return Buffer.from("[]");
+    if (args[0] === "create" || args[0] === "network" && args[1] === "create") {
+      if (args.at(-1) === "graphwar:ci") {
+        ok(!appId || !running.has(appId), "replacement app allocated while old writer runs");
+        appId = ids[nextId];
+        assert.equal(options.env.SECURE_COOKIES, "false");
+        assert.equal(options.env.ALLOWED_ORIGINS, "http://127.0.0.1:12345");
+        assert.equal(options.env.BIND_ADDR, "0.0.0.0:8080");
+        ok(args.includes("127.0.0.1:12345:8080") && !args.includes(options.env.DATABASE_URL), "app port/env isolation missing");
+      }
+      return Buffer.from(ids[nextId++]);
+    }
+    if (args[0] === "start") running.add(args[1]);
+    if (args[0] === "stop") running.delete(args.at(-1));
+    if (args[0] === "inspect") return Buffer.from(String(running.has(args.at(-1))));
+    if (args.includes("pg_dump")) return Buffer.from("test dump bytes");
+    if (args.includes("psql") && options.input?.toString().startsWith("SELECT")) return Buffer.from(JSON.stringify(databaseState));
+    if (args.includes("psql")) {
+      assert.equal(options.input.toString(), "test dump bytes");
+      ok(args.includes("ON_ERROR_STOP=1") && args.includes("graphwar_restored"), "restore did not target isolated database with SQL errors fatal");
+      dumpInput = true;
+    }
+    return Buffer.alloc(0);
+  }, {findPort: async () => 12345, health: async () => true});
+  try {
+    await harness.start();
+    await harness.restart();
+    await harness.restore();
+    ok(dumpInput, "dump bytes were not piped to restore");
+    await harness.close(false);
+    assert.deepEqual(calls.filter(args => args[0] === "rm").map(args => args.at(-1)), ids.slice(1).reverse(), "successful lifecycle did not remove all owned containers");
+    assert.deepEqual(calls.at(-1), ["network", "rm", ids[0]], "network removed before owned containers");
+    const count = calls.length;
+    await harness.close(false);
+    assert.equal(calls.length, count, "cleanup was not idempotent");
+  } finally { BASE.href = savedUrl; ORIGIN = BASE.origin; }
+  const state = {snapshot: {revision: 1, players: [{id: "b"}, {id: "a"}]}, game: {revision: 1, turn_deadline_at: 1, turn_player_id: "a"}};
+  const renewed = structuredClone(state);
+  renewed.snapshot.revision++; renewed.game.revision++; renewed.game.turn_deadline_at++;
+  assert.deepEqual(comparableState(state), comparableState(renewed));
+  renewed.game.turn_player_id = "b";
+  assert.notDeepEqual(comparableState(state), comparableState(renewed));
+  assert.equal(state.snapshot.players[0].id, "b", "comparison mutated baseline");
+  log("local harness self-check: strict arguments, partial ownership, reverse cleanup, cleanup failures, restart comparison: pass (no Docker gate run)");
+}
+
+async function deliveryChecks() {
   const response = await request("/healthz");
   ok(response.ok, `healthz status ${response.status}`);
   await requireExpectedBuild();
+  await assetChecks();
   const session = await httpChecks();
   await wsBoundaryChecks(session);
   await browserFlows();
-  log("all local delivery gates: pass");
+}
+
+async function main() {
+  if (OPTIONS.selfCheck) { await harnessSelfCheck(); return cleanupSelfCheck(); }
+  if (!OPTIONS.image) {
+    await deliveryChecks();
+    log("URL delivery gates: pass (external server not restarted)");
+    return;
+  }
+  const harness = localHarness(OPTIONS.image);
+  let failed = false;
+  const onSignal = signal => {
+    harness.interrupt(new Error(`interrupted: ${signal}`));
+    process.exitCode = 1;
+    for (const socket of ACTIVE_SOCKETS) socket.close();
+  };
+  const onInt = () => onSignal("SIGINT");
+  const onTerm = () => onSignal("SIGTERM");
+  process.once("SIGINT", onInt);
+  process.once("SIGTERM", onTerm);
+  try {
+    await harness.start();
+    await deliveryChecks();
+    await recoveryChecks(harness);
+  } catch (error) {
+    failed = true;
+    throw error;
+  } finally {
+    for (const socket of ACTIVE_SOCKETS) socket.close();
+    try { await harness.close(failed); }
+    finally { process.off("SIGINT", onInt); process.off("SIGTERM", onTerm); }
+  }
+  log("local image delivery, two restarts and real PostgreSQL dump/restore gates: pass");
 }
 
 main().catch(fail);

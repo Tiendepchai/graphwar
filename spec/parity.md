@@ -45,6 +45,26 @@ Rust/WASM is the sole supported implementation. The browser release preserves us
 - [ ] Keyboard function submit and angle controls.
 - [ ] Chrome, Firefox, Safari, Edge current desktop releases.
 
+## Public beta release evidence
+
+These are release gates, not claims that the checklist above has passed. Record the tested commit/image ID, tool/browser versions, date, result (`pass`, `fail`, `blocked`, `not run`) and evidence location. Keep credentials, session tokens, dumps and player snapshots out of evidence logs. See the [release and rollback runbook](../readme.md#public-beta-release-gates).
+
+- [ ] Rust 1.89.0 native/WASM checks, fmt/clippy and workspace tests pass.
+- [ ] Explicit PostgreSQL round-trip/recovery test passes (ordinary ignored-test output is insufficient).
+- [ ] Local-image E2E passes against the release image: auth, rooms, editor/fire, bot/practice/rematch, reconnect and desktop/mobile accessibility.
+- [ ] Image assets load and decode, including MathLive, WASM and all soldier sprites; missing assets return 404.
+- [ ] Two owned-server restarts retain sessions, room data and the expected turn; Resolving recovery advances only once in the database test.
+- [ ] Backup is restored into a separate database; migrations, snapshot load, data comparison and synthetic-session reconnect pass.
+- [ ] Separately approved staging HTTPS, Secure cookies, WSS and two-browser gameplay pass.
+- [ ] Release owner records previous image, verified backup time, rollback compatibility and accepts the release.
+
+| Gate | Commit / image | Environment / versions | Date | Result | Evidence |
+|---|---|---|---|---|---|
+| Native / MSRV | — | — | — | not run for release | — |
+| PostgreSQL | — | — | — | not run for release | — |
+| Image / browser / restart / restore | — | — | — | not run for release | — |
+| Staging HTTPS / WSS | — | — | — | not run | — |
+
 ## Deliberate incompatibilities
 
 - No compatibility with the removed Java client/server or its raw TCP numeric `&` wire protocol.

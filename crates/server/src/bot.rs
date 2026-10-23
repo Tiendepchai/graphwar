@@ -1,6 +1,6 @@
 use graphwar_game_core::{
-    Expr, GameState, Team, Terrain, TrajectoryEnd, TrajectoryMode, UnaryFunction, parse,
-    projectile_hits, trace,
+    Expr, GameState, Team, Terrain, TrajectoryEnd, TrajectoryMode, UnaryFunction,
+    constants::MAX_SECOND_ORDER_ANGLE_DEG, parse, projectile_hits, trace,
 };
 use graphwar_protocol::GameMode;
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -143,6 +143,12 @@ pub fn search(input: SearchInput<'_>) -> SearchOutcome {
 
     for _ in 0..generations {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
+        if population
+            .first()
+            .is_some_and(|c| c.score >= ENEMY_HIT_SCORE)
+        {
             break;
         }
         let mut next = next_generation(&population, mode, &mut rng);
@@ -567,13 +573,14 @@ fn mutate_angle(angle: f64, mode: GameMode, rng: &mut StdRng) -> f64 {
     if rng.random_bool(0.5) {
         random_angle(mode, rng)
     } else {
-        (angle + angle * (rng.random_range(0.0..1.0) - 0.5) / 5.0).clamp(-89.999, 89.999)
+        (angle + angle * (rng.random_range(0.0..1.0) - 0.5) / 5.0)
+            .clamp(-MAX_SECOND_ORDER_ANGLE_DEG, MAX_SECOND_ORDER_ANGLE_DEG)
     }
 }
 
 fn random_angle(mode: GameMode, rng: &mut StdRng) -> f64 {
     if mode == GameMode::SecondOrder {
-        rng.random_range(-90.0..90.0)
+        rng.random_range(-MAX_SECOND_ORDER_ANGLE_DEG..=MAX_SECOND_ORDER_ANGLE_DEG)
     } else {
         0.0
     }
@@ -634,6 +641,23 @@ mod tests {
             Player::new(1, Team::One, vec![Soldier::new(100.0, 225.0)]),
             Player::new(2, Team::Two, vec![Soldier::new(650.0, 225.0)]),
         ])
+    }
+
+    #[test]
+    fn generated_angles_stay_inside_supported_second_order_bounds() {
+        let mut rng = StdRng::seed_from_u64(42);
+        for _ in 0..1_000 {
+            let angle = random_angle(GameMode::SecondOrder, &mut rng);
+            assert!(angle.is_finite() && angle.abs() <= MAX_SECOND_ORDER_ANGLE_DEG);
+            for initial in [
+                -MAX_SECOND_ORDER_ANGLE_DEG,
+                angle,
+                MAX_SECOND_ORDER_ANGLE_DEG,
+            ] {
+                let mutated = mutate_angle(initial, GameMode::SecondOrder, &mut rng);
+                assert!(mutated.is_finite() && mutated.abs() <= MAX_SECOND_ORDER_ANGLE_DEG);
+            }
+        }
     }
 
     #[test]

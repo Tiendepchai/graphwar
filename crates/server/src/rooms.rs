@@ -9,8 +9,8 @@ use graphwar_game_core::{
     TrajectoryMissReason, TrajectoryMode,
     constants::{
         MAX_GAME_TERRAIN_CIRCLES, MAX_PLAYERS, MAX_PRACTICE_TERRAIN_CIRCLES,
-        MAX_SOLDIERS_PER_PLAYER, PLANE_HEIGHT, PLANE_LENGTH, PRACTICE_TERRAIN_RADII,
-        SOLDIER_RADIUS,
+        MAX_SECOND_ORDER_ANGLE_DEG, MAX_SOLDIERS_PER_PLAYER, PLANE_HEIGHT, PLANE_LENGTH,
+        PRACTICE_TERRAIN_RADII, SOLDIER_RADIUS,
     },
     parse, projectile_hits, trace,
 };
@@ -48,6 +48,8 @@ struct PersistedRoom {
     chat_history: Vec<ChatEntry>,
     #[serde(default)]
     lobby_deadline_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    legacy_team_overflow: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -97,6 +99,7 @@ struct Room {
     event_sequence: u64,
     chat_history: Vec<ChatEntry>,
     lobby_deadline_at: Option<i64>,
+    legacy_team_overflow: bool,
 }
 
 #[derive(Clone)]
@@ -231,6 +234,12 @@ impl Registry {
             if normalize_lobby_deadline(&mut persisted, version, now) {
                 needs_save_after_load = true;
             }
+            let legacy_team_overflow = (version < 4 || persisted.legacy_team_overflow)
+                && has_team_overflow(&persisted.snapshot.players);
+            if persisted.legacy_team_overflow != legacy_team_overflow {
+                persisted.legacy_team_overflow = legacy_team_overflow;
+                needs_save_after_load = true;
+            }
             validate_persisted_room(&persisted)?;
             let bots = persisted
                 .bots
@@ -266,6 +275,7 @@ impl Registry {
                     event_sequence: persisted.event_sequence,
                     chat_history: persisted.chat_history,
                     lobby_deadline_at: persisted.lobby_deadline_at,
+                    legacy_team_overflow: persisted.legacy_team_overflow,
                 },
             );
         }
@@ -310,6 +320,8 @@ impl Registry {
                     event_sequence: room.event_sequence,
                     chat_history: room.chat_history.clone(),
                     lobby_deadline_at: room.lobby_deadline_at,
+                    legacy_team_overflow: room.legacy_team_overflow
+                        && has_team_overflow(&room.snapshot.players),
                 })
                 .collect(),
         })
@@ -474,6 +486,7 @@ impl Registry {
                 event_sequence: 0,
                 chat_history: Vec::new(),
                 lobby_deadline_at: Some(lobby_deadline()),
+                legacy_team_overflow: false,
             },
         );
         Ok((snapshot, None))
@@ -751,6 +764,7 @@ impl Registry {
                 .find(|member| member.id == player_id)
                 .expect("validated member")
                 .team = team;
+            candidate.legacy_team_overflow &= has_team_overflow(&candidate.snapshot.players);
             reconcile_room_practice_setup(&mut candidate)?;
             reset_readiness(&mut candidate);
             reset_lobby_deadline(&mut candidate);
@@ -891,6 +905,7 @@ impl Registry {
             .snapshot
             .players
             .retain(|slot| slot.id != player_id);
+        candidate.legacy_team_overflow &= has_team_overflow(&candidate.snapshot.players);
         reconcile_room_practice_setup(&mut candidate)?;
         reset_readiness(&mut candidate);
         reset_lobby_deadline(&mut candidate);
@@ -933,6 +948,9 @@ impl Registry {
         }
         if room.snapshot.phase != Phase::Lobby || room.snapshot.players.len() < 2 {
             return Err(RoomError::WrongPhase);
+        }
+        if has_team_overflow(&room.snapshot.players) {
+            return Err(RoomError::Invalid("team is full"));
         }
         if room.snapshot.players.iter().any(|member| !member.ready)
             || !has_two_teams(&room.snapshot.players)
@@ -1014,6 +1032,9 @@ impl Registry {
             .ok_or(RoomError::NotMember)?;
         let trajectory = {
             let game = room.game.as_ref().expect("checked above");
+            if game.mode == GameMode::SecondOrder && angle_deg.abs() > MAX_SECOND_ORDER_ANGLE_DEG {
+                return Err(RoomError::Invalid("second-order angle is out of range"));
+            }
             if !mode_allows(&expr, game.mode) {
                 return Err(RoomError::Invalid(
                     "function uses variables unavailable in this mode",
@@ -1403,8 +1424,7 @@ fn validate_persisted_room(room: &PersistedRoom) -> Result<(), String> {
         return Err("invalid room snapshot".into());
     }
     if snapshot.players.len() > MAX_PLAYERS
-        || team_size(&snapshot.players, 1) > MAX_TEAM_PLAYERS
-        || team_size(&snapshot.players, 2) > MAX_TEAM_PLAYERS
+        || (!room.legacy_team_overflow && has_team_overflow(&snapshot.players))
         || snapshot
             .players
             .iter()
@@ -1816,11 +1836,11 @@ fn alternating_players(players: &[PlayerSnapshot], seed: u64) -> Vec<&PlayerSnap
         } else if last_team == Some(2) {
             true
         } else if team_one.len() == team_two.len() {
-            seed % 2 == 0
+            seed.is_multiple_of(2)
         } else if team_one.len() > team_two.len() {
-            seed % 3 != 0
+            !seed.is_multiple_of(3)
         } else {
-            seed % 3 == 0
+            seed.is_multiple_of(3)
         };
         if take_one {
             result.push(team_one.remove(0));
@@ -1907,6 +1927,7 @@ fn remove_member(room: &mut Room, player: Uuid) -> bool {
     room.members.remove(&player);
     room.bots.remove(&player);
     room.snapshot.players.retain(|member| member.id != player);
+    room.legacy_team_overflow &= has_team_overflow(&room.snapshot.players);
     room.snapshot.revision += 1;
     if room.snapshot.players.iter().all(|member| member.is_bot) {
         return false;
@@ -1946,6 +1967,10 @@ fn has_two_teams(players: &[PlayerSnapshot]) -> bool {
 
 fn team_size(players: &[PlayerSnapshot], team: u8) -> usize {
     players.iter().filter(|player| player.team == team).count()
+}
+
+fn has_team_overflow(players: &[PlayerSnapshot]) -> bool {
+    team_size(players, 1) > MAX_TEAM_PLAYERS || team_size(players, 2) > MAX_TEAM_PLAYERS
 }
 
 fn open_team(players: &[PlayerSnapshot]) -> Option<u8> {
@@ -2827,6 +2852,254 @@ mod tests {
             .find(|player| player["team"] == 2)
             .unwrap()["team"] = 1.into();
         assert!(Registry::from_persisted_json(&overfull.to_string()).is_err());
+    }
+
+    fn legacy_overflow_snapshot(phase: Phase, version: u32) -> (serde_json::Value, Uuid, Uuid) {
+        let owner = Uuid::new_v4();
+        let mut registry = Registry::default();
+        let room_id = registry
+            .create(
+                owner,
+                "Owner".into(),
+                "legacy".into(),
+                RoomVisibility::Public,
+                None,
+            )
+            .unwrap()
+            .0
+            .id;
+        for _ in 0..6 {
+            registry.add_bot(owner, 1).unwrap();
+        }
+        registry.set_ready(owner, true).unwrap();
+        registry.chat(owner, "preserve history".into()).unwrap();
+        let room = registry.rooms.get_mut(&room_id).unwrap();
+        room.snapshot.mode = GameMode::SecondOrder;
+        for player in &mut room.snapshot.players {
+            player.team = if player.owner { 1 } else { 2 };
+            player.soldiers = 1;
+        }
+        room.snapshot.phase = phase;
+        room.lobby_deadline_at = (phase == Phase::Lobby).then_some(42);
+        if phase != Phase::Lobby {
+            room.event_sequence += 1;
+            room.game = Some(Match {
+                mode: room.snapshot.mode,
+                terrain: Terrain::new(Vec::new()),
+                state: GameState::new(
+                    room.snapshot
+                        .players
+                        .iter()
+                        .enumerate()
+                        .map(|(index, player)| {
+                            let mut soldier = Soldier::new(
+                                if player.team == 1 { 100.0 } else { 700.0 },
+                                100.0 + index as f64 * 30.0,
+                            );
+                            soldier.alive = phase != Phase::Finished || player.team == 1;
+                            Player::new(index as u32, team(player.team), vec![soldier])
+                        })
+                        .collect(),
+                ),
+                player_ids: room
+                    .snapshot
+                    .players
+                    .iter()
+                    .map(|player| player.id)
+                    .collect(),
+                turn_deadline_at: 123,
+                shot_history: vec![ShotHistoryEntry {
+                    sequence: room.event_sequence,
+                    player_id: owner,
+                    display_name: "Owner".into(),
+                    team: 1,
+                    function: "y''=0".into(),
+                    angle_deg: 90.0,
+                }],
+            });
+        }
+        let mut snapshot: serde_json::Value =
+            serde_json::from_str(&registry.persisted_json().unwrap()).unwrap();
+        snapshot["version"] = version.into();
+        (snapshot, room_id, owner)
+    }
+
+    #[test]
+    fn legacy_team_overflow_round_trips_all_phases() {
+        for version in 1..=3 {
+            for phase in [
+                Phase::Lobby,
+                Phase::Planning,
+                Phase::Resolving,
+                Phase::Finished,
+            ] {
+                let (snapshot, room_id, _) = legacy_overflow_snapshot(phase, version);
+                let mut restored = Registry::from_persisted_json(&snapshot.to_string()).unwrap();
+                assert!(restored.needs_save_after_load);
+                let mut expected = snapshot;
+                expected["version"] = REGISTRY_FORMAT_VERSION.into();
+                expected["rooms"][0]["legacy_team_overflow"] = true.into();
+                for _ in 0..2 {
+                    assert!(restored.rooms[&room_id].legacy_team_overflow);
+                    let saved = restored.persisted_json().unwrap();
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(&saved).unwrap(),
+                        expected
+                    );
+                    restored = Registry::from_persisted_json(&saved).unwrap();
+                    assert!(!restored.needs_save_after_load);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_team_overflow_requires_marker_for_current_snapshots() {
+        let (mut snapshot, _, owner) =
+            legacy_overflow_snapshot(Phase::Planning, REGISTRY_FORMAT_VERSION);
+        assert!(Registry::from_persisted_json(&snapshot.to_string()).is_err());
+        snapshot["rooms"][0]["legacy_team_overflow"] = true.into();
+        assert!(Registry::from_persisted_json(&snapshot.to_string()).is_ok());
+
+        for version in [1, 2, 3, REGISTRY_FORMAT_VERSION] {
+            let mut invalid = snapshot.clone();
+            invalid["version"] = version.into();
+            invalid["rooms"][0]["members"]
+                .as_object_mut()
+                .unwrap()
+                .remove(&owner.to_string());
+            assert!(Registry::from_persisted_json(&invalid.to_string()).is_err());
+
+            let mut invalid = snapshot.clone();
+            invalid["version"] = version.into();
+            invalid["rooms"][0]["game"]["state"]["players"][1]["team"] =
+                invalid["rooms"][0]["game"]["state"]["players"][0]["team"].clone();
+            assert!(Registry::from_persisted_json(&invalid.to_string()).is_err());
+
+            let mut invalid = snapshot.clone();
+            invalid["version"] = version.into();
+            invalid["rooms"][0]["snapshot"]["players"][1]["team"] = 0.into();
+            assert!(Registry::from_persisted_json(&invalid.to_string()).is_err());
+        }
+
+        let (mut overfull, _, _) = legacy_overflow_snapshot(Phase::Lobby, REGISTRY_FORMAT_VERSION);
+        overfull["rooms"][0]["legacy_team_overflow"] = true.into();
+        for _ in 0..4 {
+            let id = Uuid::new_v4().to_string();
+            let mut player = overfull["rooms"][0]["snapshot"]["players"][1].clone();
+            player["id"] = id.clone().into();
+            overfull["rooms"][0]["snapshot"]["players"]
+                .as_array_mut()
+                .unwrap()
+                .push(player);
+            overfull["rooms"][0]["members"][&id] = true.into();
+            overfull["rooms"][0]["bots"][&id] = overfull["rooms"][0]["bots"]
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+        }
+        assert!(Registry::from_persisted_json(&overfull.to_string()).is_err());
+
+        for version in [3, REGISTRY_FORMAT_VERSION] {
+            let (mut invalid, _, _) = legacy_overflow_snapshot(Phase::Lobby, version);
+            invalid["rooms"][0]["legacy_team_overflow"] = true.into();
+            invalid["rooms"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("lobby_deadline_at");
+            assert!(Registry::from_persisted_json(&invalid.to_string()).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_team_overflow_returns_to_lobby_but_must_rebalance_before_start() {
+        let (snapshot, room_id, owner) = legacy_overflow_snapshot(Phase::Finished, 3);
+        let mut registry = Registry::from_persisted_json(&snapshot.to_string()).unwrap();
+        let players = registry.member_snapshot(owner).unwrap().players;
+        registry.return_to_lobby(owner).unwrap();
+        assert_eq!(
+            registry
+                .member_snapshot(owner)
+                .unwrap()
+                .players
+                .iter()
+                .map(|p| (p.id, p.team))
+                .collect::<Vec<_>>(),
+            players.iter().map(|p| (p.id, p.team)).collect::<Vec<_>>()
+        );
+        registry = Registry::from_persisted_json(&registry.persisted_json().unwrap()).unwrap();
+        registry.set_ready(owner, true).unwrap();
+        let before: serde_json::Value =
+            serde_json::from_str(&registry.persisted_json().unwrap()).unwrap();
+        assert!(matches!(
+            registry.start_game(owner),
+            Err(RoomError::Invalid("team is full"))
+        ));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&registry.persisted_json().unwrap()).unwrap(),
+            before
+        );
+
+        registry.set_team(owner, players[1].id, 1).unwrap();
+        assert!(!registry.rooms[&room_id].legacy_team_overflow);
+        let saved = registry.persisted_json().unwrap();
+        let mut balanced: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        assert!(balanced["rooms"][0].get("legacy_team_overflow").is_none());
+        assert!(Registry::from_persisted_json(&saved).is_ok());
+        balanced["rooms"][0]["legacy_team_overflow"] = true.into();
+        let restored = Registry::from_persisted_json(&balanced.to_string()).unwrap();
+        assert!(!restored.rooms[&room_id].legacy_team_overflow);
+        assert!(restored.needs_save_after_load);
+        assert!(matches!(
+            registry.set_team(owner, owner, 2),
+            Err(RoomError::Invalid("team is full"))
+        ));
+        registry.set_ready(owner, true).unwrap();
+        assert!(registry.start_game(owner).is_ok());
+    }
+
+    #[test]
+    fn legacy_team_overflow_member_removal_revokes_marker() {
+        for remove_bot in [false, true] {
+            let (snapshot, room_id, owner) = legacy_overflow_snapshot(Phase::Lobby, 2);
+            let mut registry = Registry::from_persisted_json(&snapshot.to_string()).unwrap();
+            let bot = registry.rooms[&room_id].snapshot.players[1].id;
+            if remove_bot {
+                registry.remove_bot(owner, bot).unwrap();
+            } else {
+                registry.leave(bot).unwrap();
+            }
+            assert!(!registry.rooms[&room_id].legacy_team_overflow);
+            assert!(Registry::from_persisted_json(&registry.persisted_json().unwrap()).is_ok());
+        }
+    }
+
+    #[test]
+    fn legacy_team_overflow_resolving_restart_advances_only_once() {
+        let (snapshot, room_id, owner) = legacy_overflow_snapshot(Phase::Resolving, 1);
+        let mut registry = Registry::from_persisted_json(&snapshot.to_string()).unwrap();
+        let mut expected = registry.rooms[&room_id]
+            .game
+            .as_ref()
+            .unwrap()
+            .state
+            .clone();
+        advance_turn(&mut expected);
+        for _ in 0..2 {
+            assert!(registry.resume_after_restart());
+            let room = &registry.rooms[&room_id];
+            assert_eq!(room.snapshot.phase, Phase::Planning);
+            assert_eq!(
+                serde_json::to_value(&room.game.as_ref().unwrap().state).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(room.game.as_ref().unwrap().shot_history[0].angle_deg, 90.0);
+            assert_eq!(registry.member_snapshot(owner).unwrap().players.len(), 7);
+            registry = Registry::from_persisted_json(&registry.persisted_json().unwrap()).unwrap();
+        }
     }
 
     #[test]
@@ -4188,6 +4461,163 @@ mod tests {
             Err(RoomError::NotTurn)
         ));
         assert!(registry.fire(owner, "0".into(), 0.0).is_ok());
+    }
+
+    #[test]
+    fn second_order_angle_edges_work_for_both_teams_and_reject_without_mutation() {
+        for shooter_team in [Team::One, Team::Two] {
+            for angle in [-MAX_SECOND_ORDER_ANGLE_DEG, MAX_SECOND_ORDER_ANGLE_DEG] {
+                let (mut registry, room_id, _, _) = started_registry();
+                let room = registry.rooms.get_mut(&room_id).unwrap();
+                room.snapshot.mode = GameMode::SecondOrder;
+                let game = room.game.as_mut().unwrap();
+                game.mode = GameMode::SecondOrder;
+                game.terrain = Terrain::new(Vec::new());
+                game.state.turn = game
+                    .state
+                    .players
+                    .iter()
+                    .position(|player| player.team == shooter_team)
+                    .unwrap();
+                let shooter = game.player_ids[game.state.turn];
+                for invalid in [
+                    -90.0,
+                    90.0,
+                    -90.1,
+                    90.1,
+                    f64::NAN,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                ] {
+                    let before: serde_json::Value =
+                        serde_json::from_str(&registry.persisted_json().unwrap()).unwrap();
+                    assert!(matches!(
+                        registry.fire(shooter, "y''=0".into(), invalid),
+                        Err(RoomError::Invalid(_))
+                    ));
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(
+                            &registry.persisted_json().unwrap()
+                        )
+                        .unwrap(),
+                        before
+                    );
+                }
+                let outcome = registry.fire(shooter, "y''=0".into(), angle).unwrap();
+                assert!(outcome.shot.path.len() > 1);
+                assert!(!matches!(
+                    outcome.shot.outcome,
+                    ShotOutcome::Miss {
+                        reason: ShotMissReason::Numerical,
+                        ..
+                    }
+                ));
+                assert_eq!(outcome.shot.game.shot_history[0].angle_deg, angle);
+                let mut json: serde_json::Value =
+                    serde_json::from_str(&registry.persisted_json().unwrap()).unwrap();
+                json["rooms"][0]["game"]["shot_history"][0]["angle_deg"] = 90.0.into();
+                assert!(Registry::from_persisted_json(&json.to_string()).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn non_second_order_modes_keep_the_existing_angle_contract() {
+        for mode in [GameMode::Function, GameMode::FirstOrder] {
+            for angle in [-90.0, 90.0] {
+                let (mut registry, room_id, owner, _) = started_registry();
+                let room = registry.rooms.get_mut(&room_id).unwrap();
+                room.snapshot.mode = mode;
+                room.game.as_mut().unwrap().mode = mode;
+                assert!(registry.fire(owner, "0".into(), angle).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn second_order_angle_edges_work_for_both_teams() {
+        for shooter_team in [Team::One, Team::Two] {
+            for angle_deg in [-MAX_SECOND_ORDER_ANGLE_DEG, MAX_SECOND_ORDER_ANGLE_DEG] {
+                let (mut registry, room_id, _, _) = started_registry();
+                let room = registry.rooms.get_mut(&room_id).unwrap();
+                room.snapshot.mode = GameMode::SecondOrder;
+                let game = room.game.as_mut().unwrap();
+                game.mode = GameMode::SecondOrder;
+                game.terrain = Terrain::new(Vec::new());
+                game.state.turn = game
+                    .state
+                    .players
+                    .iter()
+                    .position(|player| player.team == shooter_team)
+                    .unwrap();
+                let active = game.player_ids[game.state.turn];
+                let shot = registry
+                    .fire(active, "y''=0".into(), angle_deg)
+                    .unwrap()
+                    .shot;
+                assert!(shot.path.len() > 1);
+                assert!(!matches!(
+                    shot.outcome,
+                    ShotOutcome::Miss {
+                        reason: ShotMissReason::Numerical,
+                        ..
+                    }
+                ));
+                assert_eq!(shot.game.shot_history[0].angle_deg, angle_deg);
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_second_order_angles_leave_entire_room_unchanged() {
+        let (mut registry, room_id, owner, _) = started_registry();
+        let room = registry.rooms.get_mut(&room_id).unwrap();
+        room.snapshot.mode = GameMode::SecondOrder;
+        room.game.as_mut().unwrap().mode = GameMode::SecondOrder;
+        let before: serde_json::Value =
+            serde_json::from_str(&registry.persisted_json().unwrap()).unwrap();
+        for angle_deg in [
+            -90.0,
+            90.0,
+            -89.91,
+            89.91,
+            -91.0,
+            91.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert!(matches!(
+                registry.fire(owner, "y''=0".into(), angle_deg),
+                Err(RoomError::Invalid(_))
+            ));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&registry.persisted_json().unwrap())
+                    .unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn unused_angles_keep_existing_contract_and_history_remains_loadable() {
+        for mode in [GameMode::Function, GameMode::FirstOrder] {
+            for angle_deg in [-90.0, 90.0] {
+                let (mut registry, room_id, owner, _) = started_registry();
+                let room = registry.rooms.get_mut(&room_id).unwrap();
+                room.snapshot.mode = mode;
+                let game = room.game.as_mut().unwrap();
+                game.mode = mode;
+                game.terrain = Terrain::new(Vec::new());
+                registry.fire(owner, "0".into(), angle_deg).unwrap();
+                let restored =
+                    Registry::from_persisted_json(&registry.persisted_json().unwrap()).unwrap();
+                assert_eq!(
+                    restored.rooms[&room_id].game.as_ref().unwrap().shot_history[0].angle_deg,
+                    angle_deg
+                );
+            }
+        }
     }
 
     #[test]
