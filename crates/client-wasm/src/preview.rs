@@ -1,5 +1,6 @@
 use graphwar_game_core::{
-    Circle, GameState, Player, Soldier, Team, Terrain, TrajectoryMode, parse, trace,
+    Circle, GameState, Player, Soldier, Team, Terrain, TrajectoryMode,
+    constants::MAX_SECOND_ORDER_ANGLE_DEG, parse, trace,
 };
 use graphwar_protocol::GameMode;
 
@@ -54,9 +55,14 @@ pub fn trace_preview(
     let mode = match game_mode {
         GameMode::Function => TrajectoryMode::Function,
         GameMode::FirstOrder => TrajectoryMode::FirstOrder,
-        GameMode::SecondOrder => TrajectoryMode::SecondOrder {
-            angle: angle_deg.clamp(-90.0, 90.0).to_radians(),
-        },
+        GameMode::SecondOrder => {
+            if !angle_deg.is_finite() || angle_deg.abs() > MAX_SECOND_ORDER_ANGLE_DEG {
+                return Err("Launch angle must be between -89.9° and 89.9°".into());
+            }
+            TrajectoryMode::SecondOrder {
+                angle: angle_deg.to_radians(),
+            }
+        }
     };
     trace(
         &expression,
@@ -137,6 +143,19 @@ mod tests {
         );
         model.game_mode = Some(GameMode::SecondOrder);
         assert!(trace_preview(&model, "y + y'", 0.0).is_ok());
+        for team in [1, 2] {
+            model.soldiers[0].team = team;
+            for angle in [-MAX_SECOND_ORDER_ANGLE_DEG, MAX_SECOND_ORDER_ANGLE_DEG] {
+                assert!(trace_preview(&model, "0", angle).unwrap().len() > 2);
+            }
+        }
+        for angle in [-90.0, 90.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(trace_preview(&model, "0", angle).is_err());
+        }
+        for mode in [GameMode::Function, GameMode::FirstOrder] {
+            model.game_mode = Some(mode);
+            assert!(trace_preview(&model, "0", 90.0).is_ok());
+        }
 
         model.soldiers[0].active = false;
         assert_eq!(

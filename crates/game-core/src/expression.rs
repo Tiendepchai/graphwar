@@ -363,6 +363,7 @@ impl<'a> Normalizer<'a> {
                     return Err(self.error(offset, "unexpected closing delimiter"));
                 }
                 '\\' => self.normalize_command(offset)?,
+                'y' => self.normalize_y(offset)?,
                 '|' => self.normalize_bar(offset, None)?,
                 'π' => self.push("pi", offset)?,
                 '−' => self.push("-", offset)?,
@@ -378,6 +379,25 @@ impl<'a> Normalizer<'a> {
         terminator.map_or(Ok(self.end), |_| {
             Err(self.error(self.end, "expected closing delimiter"))
         })
+    }
+
+    fn normalize_y(&mut self, offset: usize) -> Result<(), ParseError> {
+        self.push("y", offset)?;
+        // ponytail: only MathLive's grouped prime suffix; other powers keep normal parsing.
+        while self.input[self.position..self.end].starts_with("^{\\prime") {
+            let mut end = self.position + 2;
+            while self.input[end..self.end].starts_with("\\prime") {
+                end += "\\prime".len();
+            }
+            if !self.input[end..self.end].starts_with('}') {
+                break;
+            }
+            for prime in (self.position + 2..end).step_by("\\prime".len()) {
+                self.push("'", prime)?;
+            }
+            self.position = end + 1;
+        }
+        Ok(())
     }
 
     fn normalize_group(&mut self, opening_offset: usize, closing: char) -> Result<(), ParseError> {
@@ -444,6 +464,7 @@ impl<'a> Normalizer<'a> {
             "cdot" | "times" => self.push("*", offset),
             "div" => self.push("/", offset),
             "pi" => self.push("pi", offset),
+            "exponentiale" => self.push("e", offset),
             "prime" => self.push("'", offset),
             "frac" | "dfrac" | "tfrac" => self.normalize_fraction(offset),
             "sqrt" => self.normalize_root(offset),
@@ -684,10 +705,11 @@ fn expression_bounds(input: &str) -> Result<(usize, usize), ParseError> {
         }
     }
     if let Some(equals) = equals {
-        let lhs = input[start..equals]
+        let lhs = Normalizer::new(input, start, equals)
+            .finish()?
+            .text
             .chars()
             .filter(|character| !character.is_whitespace())
-            .map(|character| if character == '′' { '\'' } else { character })
             .collect::<String>();
         if !matches!(lhs.as_str(), "y" | "y'" | "y''" | "f(x)") {
             return Err(ParseError {
@@ -1181,6 +1203,59 @@ mod tests {
         assert_near(value(r"\operatorname{max}\left(2,3\right)"), 3.0);
         assert_near(value("y = π×x − 1"), 3.0 * std::f64::consts::PI - 1.0);
         assert_near(value(r"f(x)=\mathrm{e}^{0}+x"), 4.0);
+    }
+
+    #[test]
+    fn mathlive_primes_and_euler_keep_expression_semantics() {
+        assert_near(value(r"y^{\prime}"), 5.0);
+        assert_near(value(r"y^{\prime}=y"), 4.0);
+        assert_near(value(r"y^{\prime\prime}=y+y^{\prime}"), 9.0);
+        assert_near(value(r"y^{\prime}^{\prime}=y^{\prime}"), 5.0);
+        assert_near(value(r"\exponentialE^{x}"), 3.0_f64.exp());
+        assert_near(value(r"\exponentiale^{x}"), 3.0_f64.exp());
+        assert_near(value("y^2"), 16.0);
+        assert_near(value("y^{2}"), 16.0);
+        let derivative = parse(r"y^{\prime}").unwrap();
+        assert!(!derivative.variables_allowed(true, false));
+        assert!(derivative.variables_allowed(true, true));
+    }
+
+    #[test]
+    fn mathlive_primes_reject_unsupported_orders_and_commands() {
+        for input in [
+            r"y^{\prime\prime}",
+            r"y^{\prime}^{\prime}",
+            r"y^{\prime\prime\prime}=0",
+            r"x^{\prime}",
+            r"y^{\prime+1}",
+            r"y^{\prime 2}",
+            r"y^{\primefoo}",
+            r"y^{\unknown}",
+            r"\exponentialExtra^{x}",
+        ] {
+            assert!(parse(input).is_err(), "input should be rejected: {input:?}");
+        }
+    }
+
+    #[test]
+    fn mathlive_normalization_preserves_original_byte_offsets() {
+        let input = r"π+y^{\prime}+\wat{x}";
+        assert_eq!(
+            parse(input).unwrap_err().offset,
+            input.find(r"\wat").unwrap()
+        );
+        let input = r"y^{\prime\prime}";
+        assert_eq!(
+            parse(input).unwrap_err().offset,
+            input.rfind(r"\prime").unwrap()
+        );
+        let input = r"π+y^{\prime}+";
+        assert_eq!(parse(input).unwrap_err().offset, input.len());
+        let input = r"y^{\prime}=π+\exponentialE^{x}+@";
+        assert_eq!(parse(input).unwrap_err().offset, input.find('@').unwrap());
+        let normalized = normalize(r"π+y^{\prime}").unwrap();
+        assert_eq!(normalized.text, "pi+y'");
+        assert_eq!(normalized.offsets, vec![0, 0, 2, 3, 6]);
     }
 
     #[test]

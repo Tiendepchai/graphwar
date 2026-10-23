@@ -1,3 +1,4 @@
+use graphwar_game_core::constants::MAX_PLAYERS;
 use graphwar_protocol::{
     DEFAULT_TURN_DURATION_SECONDS, GameMode, GameSnapshot, Phase, PlayerSnapshot, PracticeSetup,
     RoomKind, RoomSnapshot, RoomVisibility, ServerMessage, ShotMissReason, ShotOutcome,
@@ -190,6 +191,13 @@ impl Model {
     pub fn can_start(&self) -> bool {
         self.local_owner()
             && self.players.len() >= 2
+            && (1..=2).all(|team| {
+                self.players
+                    .iter()
+                    .filter(|player| player.team == team)
+                    .count()
+                    <= MAX_PLAYERS / 2
+            })
             && self.players.iter().all(|player| player.ready)
             && self.players.iter().any(|player| player.team == 1)
             && self.players.iter().any(|player| player.team == 2)
@@ -934,6 +942,72 @@ mod tests {
         assert_eq!(model.room_name, "Current");
         assert_eq!(model.screen, Screen::Room);
         assert_eq!(model.notices, ["keep account notice"]);
+    }
+
+    #[test]
+    fn can_start_requires_both_teams_within_capacity() {
+        let mut model = Model {
+            player_id: Some("owner".into()),
+            players: (0..MAX_PLAYERS)
+                .map(|index| PlayerSummary {
+                    id: if index == 0 {
+                        "owner".into()
+                    } else {
+                        index.to_string()
+                    },
+                    name: "Player".into(),
+                    owner: index == 0,
+                    ready: true,
+                    team: if index < MAX_PLAYERS / 2 { 1 } else { 2 },
+                    soldiers: 2,
+                    is_bot: false,
+                })
+                .collect(),
+            ..Model::default()
+        };
+        assert!(model.can_start());
+        model.players[MAX_PLAYERS / 2].team = 1;
+        assert!(!model.can_start());
+        for player in &mut model.players {
+            player.team = 3 - player.team;
+        }
+        assert!(!model.can_start());
+        model
+            .players
+            .retain(|player| player.owner || player.team == 2);
+        assert!(!model.can_start());
+    }
+
+    #[test]
+    fn start_requires_balanced_legacy_roster() {
+        let mut model = Model {
+            player_id: Some("owner".into()),
+            players: (0..7)
+                .map(|index| PlayerSummary {
+                    id: if index == 0 {
+                        "owner".into()
+                    } else {
+                        index.to_string()
+                    },
+                    name: format!("Player {index}"),
+                    owner: index == 0,
+                    ready: true,
+                    team: if index == 0 { 1 } else { 2 },
+                    soldiers: 1,
+                    is_bot: index != 0,
+                })
+                .collect(),
+            ..Model::default()
+        };
+        assert!(!model.can_start());
+        model.players[1].team = 1;
+        assert!(model.can_start());
+        for player in &mut model.players {
+            player.team = 3 - player.team;
+        }
+        assert!(model.can_start());
+        model.players[1].team = 1;
+        assert!(!model.can_start());
     }
 
     #[test]

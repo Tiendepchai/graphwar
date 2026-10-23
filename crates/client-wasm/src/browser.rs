@@ -3,7 +3,8 @@ use std::{cell::RefCell, rc::Rc};
 use gloo_net::http::Request;
 use gloo_timers::callback::{Interval, Timeout};
 use graphwar_game_core::constants::{
-    MAX_PRACTICE_TERRAIN_CIRCLES, PRACTICE_TERRAIN_RADII, SOLDIER_RADIUS,
+    MAX_PRACTICE_TERRAIN_CIRCLES, MAX_SECOND_ORDER_ANGLE_DEG, PRACTICE_TERRAIN_RADII,
+    SOLDIER_RADIUS,
 };
 use graphwar_protocol::{
     AccountResponse, ClientMessage, GameMode, LoginRequest, MAX_TURN_DURATION_SECONDS,
@@ -16,7 +17,8 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::{
     AbortController, CanvasRenderingContext2d, CloseEvent, Document, ErrorEvent, Event,
     HtmlCanvasElement, HtmlDialogElement, HtmlFormElement, HtmlImageElement, HtmlInputElement,
-    HtmlSelectElement, MessageEvent, PointerEvent, RequestCredentials, WebSocket, Window,
+    HtmlSelectElement, InputEvent, KeyboardEvent, MessageEvent, PointerEvent, RequestCredentials,
+    WebSocket, Window,
 };
 
 const PRESERVED_INPUTS: &[&str] = &[
@@ -51,7 +53,9 @@ struct FormState {
 }
 
 use crate::{
-    animation::visible_points,
+    animation::{frame_delta_ms, visible_points},
+    audio::SoundManager,
+    canvas::{CanvasPalette, VfxManager, canvas_palette, is_dark_theme},
     geometry::{LOGICAL_HEIGHT, LOGICAL_WIDTH, Viewport},
     preview::trace_preview,
     state::{Action, Connection, Model, Screen, apply_pending_game, reduce},
@@ -81,6 +85,9 @@ struct App {
     viewport_handler: Option<Closure<dyn FnMut(Event)>>,
     expired_deadline: Option<i64>,
     shot_animation: Option<ShotAnimation>,
+    animation_generation: u64,
+    animation_frame_pending: bool,
+    animation_timestamp: Option<f64>,
     soldier_sprite: Option<HtmlImageElement>,
     soldier_sprite_loaded: bool,
     soldier_helmet_team_one: Option<HtmlImageElement>,
@@ -89,6 +96,8 @@ struct App {
     soldier_helmet_team_two_loaded: bool,
     soldier_sprite_handlers: Vec<SoldierSpriteHandlers>,
     ws_url: String,
+    sound: SoundManager,
+    vfx: VfxManager,
 }
 
 #[derive(Clone, Copy)]
@@ -127,7 +136,7 @@ impl Drop for EventHandler {
 
 struct ShotAnimation {
     sequence: u64,
-    started_at: f64,
+    elapsed_ms: f64,
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -148,22 +157,6 @@ struct PracticeSave {
     room_id: String,
     base_revision: u64,
     submitted: PracticeSetup,
-}
-
-#[derive(Clone, Copy)]
-struct CanvasPalette {
-    background: &'static str,
-    grid: &'static str,
-    axis: &'static str,
-    terrain: &'static str,
-    terrain_stroke: &'static str,
-    path: &'static str,
-    preview: &'static str,
-    team_one: &'static str,
-    team_two: &'static str,
-    dead: &'static str,
-    soldier_stroke: &'static str,
-    hit: &'static str,
 }
 
 #[derive(Clone, Copy)]
@@ -199,7 +192,7 @@ pub fn start() -> Result<(), JsValue> {
     let document = window.document().ok_or("document unavailable")?;
     let ws_url = websocket_url(&window)?;
     let app = Rc::new(RefCell::new(App {
-        window,
+        window: window.clone(),
         document,
         model: Model::default(),
         practice_tool: PracticeTool::Move,
@@ -222,6 +215,9 @@ pub fn start() -> Result<(), JsValue> {
         viewport_handler: None,
         expired_deadline: None,
         shot_animation: None,
+        animation_generation: 0,
+        animation_frame_pending: false,
+        animation_timestamp: None,
         soldier_sprite: None,
         soldier_sprite_loaded: false,
         soldier_helmet_team_one: None,
@@ -230,6 +226,8 @@ pub fn start() -> Result<(), JsValue> {
         soldier_helmet_team_two_loaded: false,
         soldier_sprite_handlers: Vec::new(),
         ws_url,
+        sound: SoundManager::new(&window),
+        vfx: VfxManager::default(),
     }));
 
     load_soldier_sprites(&app)?;
@@ -535,12 +533,13 @@ fn connect(app: &SharedApp) -> Result<(), JsValue> {
             Ok(message) => {
                 announce_server_message(&message_app, &message);
                 let mut scope = render_scope(&message);
-                let (previous_screen, prior_sequence, prior_notice) = {
+                let (previous_screen, prior_sequence, prior_notice, prior_room) = {
                     let app_ref = message_app.borrow();
                     (
                         app_ref.model.screen.clone(),
                         app_ref.model.shot_sequence,
                         app_ref.model.notices.last().cloned(),
+                        app_ref.model.room_id.clone(),
                     )
                 };
                 let server_error_notice = matches!(&message, ServerMessage::Error { .. });
@@ -595,8 +594,20 @@ fn connect(app: &SharedApp) -> Result<(), JsValue> {
                     announce(&message_app, message);
                     schedule_notice_timeout(&message_app, message.to_owned());
                 }
-                let sequence = message_app.borrow().model.shot_sequence;
-                if sequence != prior_sequence {
+                let sequence = {
+                    let mut app = message_app.borrow_mut();
+                    if app.model.screen != Screen::Game
+                        || app.model.room_id != prior_room
+                        || (app.model.shot_sequence == 0 && prior_sequence != 0)
+                    {
+                        reset_animation(&mut app);
+                    }
+                    (app.model.screen == Screen::Game
+                        && app.model.shot_sequence != prior_sequence
+                        && !app.model.authoritative_path.is_empty())
+                    .then_some(app.model.shot_sequence)
+                };
+                if let Some(sequence) = sequence {
                     start_shot_animation(&message_app, sequence);
                 }
                 redraw_scope(&message_app, previous_screen, scope);
@@ -1166,10 +1177,7 @@ fn refresh_current_dom(app: &SharedApp) -> Result<(), JsValue> {
     let screen = { app.borrow().model.screen.clone() };
     match screen {
         Screen::Login => refresh_notices_dom(app),
-        Screen::Lobby => {
-            refresh_lobby_rooms_dom(app)?;
-            refresh_notices_dom(app)
-        }
+        Screen::Lobby => refresh_lobby_rooms_dom(app),
         Screen::Room => refresh_room_dom(app),
         Screen::Game => refresh_game_dom(app),
     }
@@ -1331,11 +1339,16 @@ fn refresh_room_dom(app: &SharedApp) -> Result<(), JsValue> {
 
         let owner = model.local_owner();
         sync_turn_duration_control(document, model, owner)?;
-        room_element(document, "#ready-button")?.set_text_content(Some(if model.local_ready() {
+        let ready_button = room_element(document, "#ready-button")?;
+        ready_button.set_text_content(Some(if model.local_ready() {
             "Not ready"
         } else {
             "I’m ready"
         }));
+        let _ = ready_button.set_attribute(
+            "data-ready",
+            if model.local_ready() { "true" } else { "false" },
+        );
         let add_bot = room_element(document, "#add-bot")?;
         set_boolean_attribute(&add_bot, "hidden", !owner)?;
         set_boolean_attribute(
@@ -1345,7 +1358,10 @@ fn refresh_room_dom(app: &SharedApp) -> Result<(), JsValue> {
         )?;
         let start_game = room_element(document, "#start-game")?;
         set_boolean_attribute(&start_game, "hidden", !owner)?;
-        set_boolean_attribute(&start_game, "disabled", !owner || !model.can_start())?;
+        let can_start = model.can_start();
+        set_boolean_attribute(&start_game, "disabled", !owner || !can_start)?;
+        let _ =
+            start_game.set_attribute("data-can-start", if can_start { "true" } else { "false" });
         document.clone()
     };
     refresh_notices_dom(app)?;
@@ -1451,11 +1467,10 @@ fn refresh_game_dom(app: &SharedApp) -> Result<(), JsValue> {
         )?;
 
         let local_turn = local_turn(model);
-        let function_input =
-            game_element(document, "#function-input")?.dyn_into::<HtmlInputElement>()?;
-        let start_preview =
-            function_input.disabled() && local_turn && model.preview_path.is_empty();
-        function_input.set_disabled(!local_turn);
+        let function_input = game_element(document, "#function-input")?;
+        let disabled = is_element_disabled(&function_input);
+        let start_preview = disabled && local_turn && model.preview_path.is_empty();
+        set_element_disabled(&function_input, !local_turn);
 
         let second_order = model.game_mode == Some(GameMode::SecondOrder);
         set_boolean_attribute(
@@ -1467,6 +1482,7 @@ fn refresh_game_dom(app: &SharedApp) -> Result<(), JsValue> {
             .dyn_into::<HtmlInputElement>()?
             .set_disabled(!second_order || !local_turn);
         let fire_button = game_element(document, ".fire-button")?;
+        set_boolean_attribute(&fire_button, "hidden", finished)?;
         set_boolean_attribute(&fire_button, "disabled", !local_turn)?;
         set_turn_progress(&fire_button, timer.progress)?;
         game_element(document, ".fire-button-label")?
@@ -1480,6 +1496,45 @@ fn refresh_game_dom(app: &SharedApp) -> Result<(), JsValue> {
         Ok(())
     } else {
         render_canvas(app)
+    }
+}
+
+fn element_value(element: &web_sys::Element) -> String {
+    if let Ok(input) = element.clone().dyn_into::<HtmlInputElement>() {
+        input.value()
+    } else {
+        js_sys::Reflect::get(element, &wasm_bindgen::JsValue::from_str("value"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default()
+    }
+}
+
+fn set_element_disabled(element: &web_sys::Element, disabled: bool) {
+    if let Ok(input) = element.clone().dyn_into::<HtmlInputElement>() {
+        input.set_disabled(disabled);
+    } else {
+        let _ = js_sys::Reflect::set(
+            element,
+            &wasm_bindgen::JsValue::from_str("disabled"),
+            &wasm_bindgen::JsValue::from_bool(disabled),
+        );
+        let _ = if disabled {
+            element.set_attribute("disabled", "")
+        } else {
+            element.remove_attribute("disabled")
+        };
+    }
+}
+
+fn is_element_disabled(element: &web_sys::Element) -> bool {
+    if let Ok(input) = element.clone().dyn_into::<HtmlInputElement>() {
+        input.disabled()
+    } else {
+        js_sys::Reflect::get(element, &wasm_bindgen::JsValue::from_str("disabled"))
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or_else(|| element.has_attribute("disabled"))
     }
 }
 
@@ -1506,11 +1561,9 @@ fn capture_form_state(app: &SharedApp) -> FormState {
     let inputs = PRESERVED_INPUTS
         .iter()
         .filter_map(|id| {
-            app.document
-                .get_element_by_id(id)?
-                .dyn_into::<HtmlInputElement>()
-                .ok()
-                .map(|input| ((*id).to_owned(), input.value()))
+            let element = app.document.get_element_by_id(id)?;
+            let value = element_value(&element);
+            Some(((*id).to_owned(), value))
         })
         .collect();
     let selects = PRESERVED_SELECTS
@@ -1525,13 +1578,32 @@ fn capture_form_state(app: &SharedApp) -> FormState {
         .collect();
     let focus = app.document.active_element().and_then(|element| {
         let selector = focus_selector(&element)?;
-        let input = element.dyn_ref::<HtmlInputElement>();
-        Some((
-            selector,
-            input.and_then(|input| input.selection_start().ok().flatten()),
-            input.and_then(|input| input.selection_end().ok().flatten()),
-            input.and_then(|input| input.selection_direction().ok().flatten()),
-        ))
+        let (start, end, direction) = if let Some(input) = element.dyn_ref::<HtmlInputElement>() {
+            (
+                input.selection_start().ok().flatten(),
+                input.selection_end().ok().flatten(),
+                input.selection_direction().ok().flatten(),
+            )
+        } else {
+            let start =
+                js_sys::Reflect::get(&element, &wasm_bindgen::JsValue::from_str("selectionStart"))
+                    .ok()
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as u32);
+            let end =
+                js_sys::Reflect::get(&element, &wasm_bindgen::JsValue::from_str("selectionEnd"))
+                    .ok()
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as u32);
+            let dir = js_sys::Reflect::get(
+                &element,
+                &wasm_bindgen::JsValue::from_str("selectionDirection"),
+            )
+            .ok()
+            .and_then(|v| v.as_string());
+            (start, end, dir)
+        };
+        Some((selector, start, end, direction))
     });
     FormState {
         inputs,
@@ -1565,11 +1637,16 @@ fn focus_selector(element: &web_sys::Element) -> Option<String> {
 fn restore_form_state(app: &SharedApp, state: FormState) {
     let document = app.borrow().document.clone();
     for (id, value) in state.inputs {
-        if let Some(input) = document
-            .get_element_by_id(&id)
-            .and_then(|element| element.dyn_into::<HtmlInputElement>().ok())
-        {
-            input.set_value(&value);
+        if let Some(element) = document.get_element_by_id(&id) {
+            if let Ok(input) = element.clone().dyn_into::<HtmlInputElement>() {
+                input.set_value(&value);
+            } else {
+                let _ = js_sys::Reflect::set(
+                    &element,
+                    &wasm_bindgen::JsValue::from_str("value"),
+                    &wasm_bindgen::JsValue::from_str(&value),
+                );
+            }
         }
     }
     for (id, value) in state.selects {
@@ -1597,8 +1674,25 @@ fn restore_form_state(app: &SharedApp, state: FormState) {
                     direction.as_deref().unwrap_or("none"),
                 );
             }
-        } else if let Ok(element) = element.dyn_into::<web_sys::HtmlElement>() {
-            let _ = element.focus();
+        } else if let Ok(el) = element.dyn_into::<web_sys::HtmlElement>() {
+            let _ = el.focus();
+            if let (Some(start), Some(end)) = (start, end) {
+                let dir = direction.as_deref().unwrap_or("none");
+                let _ = js_sys::Reflect::get(
+                    &el,
+                    &wasm_bindgen::JsValue::from_str("setSelectionRange"),
+                )
+                .ok()
+                .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+                .map(|f| {
+                    let _ = f.call3(
+                        &el,
+                        &wasm_bindgen::JsValue::from_f64(start as f64),
+                        &wasm_bindgen::JsValue::from_f64(end as f64),
+                        &wasm_bindgen::JsValue::from_str(dir),
+                    );
+                });
+            }
         }
     }
 }
@@ -1619,12 +1713,18 @@ fn render(app: &SharedApp) -> Result<(), JsValue> {
         Screen::Room => room_html(&app_ref.model),
         Screen::Game => game_html(&app_ref.model),
     };
-    let notices = (app_ref.model.screen != Screen::Game)
-        .then(|| notices_html(&app_ref.model))
-        .unwrap_or_default();
+    let notices = if app_ref.model.screen != Screen::Game {
+        notices_html(&app_ref.model)
+    } else {
+        String::new()
+    };
     root.set_inner_html(&format!(
         "<div class=\"app-frame\">{}<main id=\"screen\" class=\"{screen_class}\">{}</main>{}</div>",
-        header_html(&app_ref.model),
+        header_html(
+            &app_ref.model,
+            is_dark_theme(&app_ref.document),
+            app_ref.sound.is_muted(),
+        ),
         screen,
         notices
     ));
@@ -1641,7 +1741,59 @@ fn render(app: &SharedApp) -> Result<(), JsValue> {
     Ok(())
 }
 
-fn header_html(model: &Model) -> String {
+fn icon_sun() -> &'static str {
+    "<svg class=\"theme-svg svg-icon\" viewBox=\"0 0 24 24\" width=\"14\" height=\"14\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"5\"/><line x1=\"12\" y1=\"1\" x2=\"12\" y2=\"3\"/><line x1=\"12\" y1=\"21\" x2=\"12\" y2=\"23\"/><line x1=\"4.22\" y1=\"4.22\" x2=\"5.64\" y2=\"5.64\"/><line x1=\"18.36\" y1=\"18.36\" x2=\"19.78\" y2=\"19.78\"/><line x1=\"1\" y1=\"12\" x2=\"3\" y2=\"12\"/><line x1=\"21\" y1=\"12\" x2=\"23\" y2=\"12\"/><line x1=\"4.22\" y1=\"19.78\" x2=\"5.64\" y2=\"18.36\"/><line x1=\"18.36\" y1=\"5.64\" x2=\"19.78\" y2=\"4.22\"/></svg>"
+}
+
+fn icon_moon() -> &'static str {
+    "<svg class=\"theme-svg svg-icon\" viewBox=\"0 0 24 24\" width=\"14\" height=\"14\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z\"/></svg>"
+}
+
+fn icon_volume_on() -> &'static str {
+    "<svg class=\"theme-svg svg-icon\" viewBox=\"0 0 24 24\" width=\"14\" height=\"14\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><polygon points=\"11 5 6 9 2 9 2 15 6 15 11 19 11 5\"/><path d=\"M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07\"/></svg>"
+}
+
+fn icon_volume_muted() -> &'static str {
+    "<svg class=\"theme-svg svg-icon\" viewBox=\"0 0 24 24\" width=\"14\" height=\"14\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><polygon points=\"11 5 6 9 2 9 2 15 6 15 11 19 11 5\"/><line x1=\"23\" y1=\"9\" x2=\"17\" y2=\"15\"/><line x1=\"17\" y1=\"9\" x2=\"23\" y2=\"15\"/></svg>"
+}
+
+fn icon_bolt() -> &'static str {
+    "<svg class=\"btn-icon svg-icon\" viewBox=\"0 0 24 24\" width=\"15\" height=\"15\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><polygon points=\"13 2 3 14 12 14 11 22 21 10 12 10 13 2\"/></svg>"
+}
+
+fn icon_plus() -> &'static str {
+    "<svg class=\"btn-icon svg-icon\" viewBox=\"0 0 24 24\" width=\"14\" height=\"14\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><line x1=\"12\" y1=\"5\" x2=\"12\" y2=\"19\"/><line x1=\"5\" y1=\"12\" x2=\"19\" y2=\"12\"/></svg>"
+}
+
+fn icon_refresh() -> &'static str {
+    "<svg class=\"btn-icon refresh-icon svg-icon\" viewBox=\"0 0 24 24\" width=\"14\" height=\"14\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><polyline points=\"23 4 23 10 17 10\"/><polyline points=\"1 20 1 14 7 14\"/><path d=\"M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15\"/></svg>"
+}
+
+fn icon_radar() -> &'static str {
+    "<svg class=\"stat-icon svg-icon\" viewBox=\"0 0 24 24\" width=\"20\" height=\"20\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M4 11a9 9 0 0 1 9 9\"/><path d=\"M4 4a16 16 0 0 1 16 16\"/><circle cx=\"5\" cy=\"19\" r=\"2\"/></svg>"
+}
+
+fn icon_swords() -> &'static str {
+    "<svg class=\"stat-icon svg-icon\" viewBox=\"0 0 24 24\" width=\"20\" height=\"20\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><polyline points=\"14.5 17.5 3 6 3 3 6 3 17.5 14.5\"/><line x1=\"13\" y1=\"19\" x2=\"19\" y2=\"13\"/><line x1=\"16\" y1=\"16\" x2=\"20\" y2=\"20\"/><polyline points=\"9.5 17.5 21 6 21 3 18 3 6.5 14.5\"/><line x1=\"11\" y1=\"19\" x2=\"5\" y2=\"13\"/><line x1=\"8\" y1=\"16\" x2=\"4\" y2=\"20\"/></svg>"
+}
+
+fn icon_target() -> &'static str {
+    "<svg class=\"stat-icon svg-icon\" viewBox=\"0 0 24 24\" width=\"20\" height=\"20\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"9\"/><line x1=\"12\" y1=\"2\" x2=\"12\" y2=\"6\"/><line x1=\"12\" y1=\"18\" x2=\"12\" y2=\"22\"/><line x1=\"2\" y1=\"12\" x2=\"6\" y2=\"12\"/><line x1=\"18\" y1=\"12\" x2=\"22\" y2=\"12\"/><circle cx=\"12\" cy=\"12\" r=\"3\"/></svg>"
+}
+
+fn icon_search() -> &'static str {
+    "<svg class=\"search-icon svg-icon\" viewBox=\"0 0 24 24\" width=\"16\" height=\"16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><circle cx=\"11\" cy=\"11\" r=\"8\"/><line x1=\"21\" y1=\"21\" x2=\"16.65\" y2=\"16.65\"/></svg>"
+}
+
+fn icon_dice() -> &'static str {
+    "<svg class=\"btn-icon svg-icon\" viewBox=\"0 0 24 24\" width=\"13\" height=\"13\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3\" y=\"3\" width=\"18\" height=\"18\" rx=\"3\" ry=\"3\"/><circle cx=\"8.5\" cy=\"8.5\" r=\"1.5\" fill=\"currentColor\"/><circle cx=\"15.5\" cy=\"8.5\" r=\"1.5\" fill=\"currentColor\"/><circle cx=\"12\" cy=\"12\" r=\"1.5\" fill=\"currentColor\"/><circle cx=\"8.5\" cy=\"15.5\" r=\"1.5\" fill=\"currentColor\"/><circle cx=\"15.5\" cy=\"15.5\" r=\"1.5\" fill=\"currentColor\"/></svg>"
+}
+
+fn icon_close() -> &'static str {
+    "<svg class=\"svg-icon\" viewBox=\"0 0 24 24\" width=\"14\" height=\"14\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><line x1=\"18\" y1=\"6\" x2=\"6\" y2=\"18\"/><line x1=\"6\" y1=\"6\" x2=\"18\" y2=\"18\"/></svg>"
+}
+
+fn header_html(model: &Model, dark: bool, muted: bool) -> String {
     let account_action = model
         .player_id
         .as_ref()
@@ -1651,8 +1803,22 @@ fn header_html(model: &Model) -> String {
     let reconnect_hidden = (!matches!(model.connection, Connection::Offline))
         .then_some(" hidden")
         .unwrap_or("");
+    let (theme_icon, theme_label) = if dark {
+        (icon_sun(), "Light")
+    } else {
+        (icon_moon(), "Dark")
+    };
+    let (audio_icon, audio_label) = if muted {
+        (icon_volume_muted(), "Muted")
+    } else {
+        (icon_volume_on(), "Sound")
+    };
     format!(
-        "<header class=\"masthead\"><a class=\"wordmark\" href=\"/\" aria-label=\"Graphwar home\"><span>GRAPH</span><strong>WAR</strong></a><div class=\"masthead-status\"><p class=\"connection {class}\" role=\"status\"><i></i>{}</p><button id=\"reconnect-now\" class=\"text-button\" type=\"button\"{reconnect_hidden}>Reconnect</button>{account_action}</div></header>",
+        "<header class=\"masthead\"><a class=\"wordmark\" href=\"/\" aria-label=\"Graphwar home\"><span>GRAPH</span><strong>WAR</strong></a><div class=\"masthead-status\"><button id=\"audio-toggle\" class=\"theme-toggle-btn\" type=\"button\" aria-label=\"Toggle sound\"><span class=\"theme-icon\">{}</span> <span class=\"theme-label\">{}</span></button><button id=\"theme-toggle\" class=\"theme-toggle-btn\" type=\"button\" aria-label=\"Toggle dark mode\"><span class=\"theme-icon\">{}</span> <span class=\"theme-label\">{}</span></button><p class=\"connection {class}\" role=\"status\"><i></i>{}</p><button id=\"reconnect-now\" class=\"text-button\" type=\"button\"{reconnect_hidden}>Reconnect</button>{account_action}</div></header>",
+        audio_icon,
+        audio_label,
+        theme_icon,
+        theme_label,
         escape(&label)
     )
 }
@@ -1690,37 +1856,52 @@ fn lobby_html(model: &Model) -> String {
             <div class=\"section-heading lobby-hero\">\
                 <div class=\"lobby-hero-left\">\
                     <div class=\"player-badge-wrap\">\
-                        <span class=\"player-avatar-box\" aria-hidden=\"true\">{avatar_initial}</span>\
+                        <div class=\"player-avatar-wrapper\">\
+                            <span class=\"player-avatar-box\" aria-hidden=\"true\">{avatar_initial}</span>\
+                            <span class=\"player-status-dot\" title=\"Tactical Link Active\" aria-hidden=\"true\"></span>\
+                        </div>\
                         <div class=\"player-meta\">\
-                            <p class=\"eyebrow\">Welcome, {player_name}</p>\
+                            <p class=\"eyebrow\"><span class=\"badge-dot\"></span> Commander HQ · {player_name}</p>\
                             <h1 id=\"lobby-title\">Rooms</h1>\
                         </div>\
                     </div>\
-                    <p class=\"lobby-subtitle\">Tactical Command · Real-time artillery engagements across coordinate fields.</p>\
+                    <p class=\"lobby-subtitle\"><span class=\"telemetry-label\">[SEC-01]</span> Real-time coordinate artillery engagements across mathematical space.</p>\
                 </div>\
                 <div class=\"lobby-actions\">\
-                    <button id=\"quick-join-room\" class=\"secondary quick-join-btn\" type=\"button\"><span class=\"btn-icon\" aria-hidden=\"true\">⚡</span> Quick Join</button>\
-                    <button id=\"create-room-open\" class=\"primary\" type=\"button\" aria-haspopup=\"dialog\" aria-controls=\"create-room-dialog\"><span class=\"btn-icon\" aria-hidden=\"true\">+</span> Create room</button>\
-                    <button id=\"refresh-lobby-rooms\" class=\"secondary refresh-btn\" type=\"button\" aria-label=\"Refresh room list\" title=\"Refresh rooms\"><span class=\"btn-icon refresh-icon\" aria-hidden=\"true\">↻</span></button>\
+                    <button id=\"quick-join-room\" class=\"secondary quick-join-btn\" type=\"button\">{bolt_icon} Quick Join</button>\
+                    <button id=\"create-room-open\" class=\"primary\" type=\"button\" aria-haspopup=\"dialog\" aria-controls=\"create-room-dialog\">{plus_icon} Create room</button>\
+                    <button id=\"refresh-lobby-rooms\" class=\"secondary refresh-btn\" type=\"button\" aria-label=\"Refresh room list\" title=\"Refresh rooms\">{refresh_icon}</button>\
                 </div>\
             </div>\
             <div class=\"lobby-stats-grid\" aria-label=\"Lobby Overview\">\
-                <div class=\"stat-card\">\
+                <div class=\"stat-card stat-theaters\">\
+                    <div class=\"stat-header\">\
+                        {radar_icon}\
+                        <span class=\"stat-badge\">LIVE</span>\
+                    </div>\
                     <span class=\"stat-num\" id=\"stat-active-rooms\">{total_rooms}</span>\
-                    <span class=\"stat-desc\">Active Rooms</span>\
+                    <span class=\"stat-desc\">Active Theaters</span>\
                 </div>\
-                <div class=\"stat-card\">\
+                <div class=\"stat-card stat-warriors\">\
+                    <div class=\"stat-header\">\
+                        {swords_icon}\
+                        <span class=\"stat-badge\">COMBAT</span>\
+                    </div>\
                     <span class=\"stat-num\" id=\"stat-active-players\">{total_players}</span>\
                     <span class=\"stat-desc\">Warriors in Lobby</span>\
                 </div>\
-                <div class=\"stat-card highlight\">\
+                <div class=\"stat-card highlight stat-slots\">\
+                    <div class=\"stat-header\">\
+                        {target_icon}\
+                        <span class=\"stat-badge\">READY</span>\
+                    </div>\
                     <span class=\"stat-num\" id=\"stat-open-slots\">{open_slots}</span>\
                     <span class=\"stat-desc\">Open Slots Ready</span>\
                 </div>\
             </div>\
             <div class=\"lobby-filter-strip\" role=\"search\">\
                 <div class=\"search-box\">\
-                    <span class=\"search-icon\" aria-hidden=\"true\">🔍</span>\
+                    {search_icon}\
                     <input id=\"room-search-input\" type=\"search\" placeholder=\"Search room by name...\" autocomplete=\"off\" aria-label=\"Search rooms by name\">\
                 </div>\
                 <div class=\"filter-pills\" role=\"group\" aria-label=\"Filter rooms by category\">\
@@ -1737,12 +1918,12 @@ fn lobby_html(model: &Model) -> String {
                             <p class=\"eyebrow\">Deployment Slip</p>\
                             <h2 id=\"create-room-title\">Create room</h2>\
                         </div>\
-                        <button type=\"button\" class=\"modal-close-icon\" id=\"create-room-close-btn\" aria-label=\"Close dialog\">✕</button>\
+                        <button type=\"button\" class=\"modal-close-icon\" id=\"create-room-close-btn\" aria-label=\"Close dialog\">{close_icon}</button>\
                     </div>\
                     <div class=\"form-group\">\
                         <div class=\"label-with-action\">\
                             <label for=\"room-name\">Room name</label>\
-                            <button type=\"button\" id=\"suggest-room-name\" class=\"text-button mini-btn\" title=\"Generate tactical name\">🎲 Suggest name</button>\
+                            <button type=\"button\" id=\"suggest-room-name\" class=\"text-button mini-btn\" title=\"Generate tactical name\">{dice_icon} Suggest name</button>\
                         </div>\
                         <input id=\"room-name\" maxlength=\"32\" required autocomplete=\"off\" placeholder=\"e.g. Gauss Sector\">\
                     </div>\
@@ -1779,6 +1960,15 @@ fn lobby_html(model: &Model) -> String {
                 <span>Try changing your search query or switching filter tabs.</span>\
             </div>\
         </section>",
+        bolt_icon = icon_bolt(),
+        plus_icon = icon_plus(),
+        refresh_icon = icon_refresh(),
+        radar_icon = icon_radar(),
+        swords_icon = icon_swords(),
+        target_icon = icon_target(),
+        search_icon = icon_search(),
+        close_icon = icon_close(),
+        dice_icon = icon_dice(),
         player_name = escape(&model.player_name),
         room_items = lobby_room_items_html(model)
     )
@@ -1786,24 +1976,29 @@ fn lobby_html(model: &Model) -> String {
 
 fn lobby_room_items_html(model: &Model) -> String {
     if model.rooms.is_empty() {
-        return "<li class=\"empty empty-state-box\">\
-            <div class=\"radar-container\" aria-hidden=\"true\">\
-                <svg class=\"radar-svg\" viewBox=\"0 0 100 100\" width=\"72\" height=\"72\">\
-                    <circle cx=\"50\" cy=\"50\" r=\"45\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-dasharray=\"3 3\" opacity=\"0.3\"/>\
-                    <circle cx=\"50\" cy=\"50\" r=\"30\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" opacity=\"0.5\"/>\
-                    <circle cx=\"50\" cy=\"50\" r=\"15\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" opacity=\"0.7\"/>\
-                    <line x1=\"50\" y1=\"5\" x2=\"50\" y2=\"95\" stroke=\"currentColor\" stroke-width=\"1.2\" opacity=\"0.3\"/>\
-                    <line x1=\"5\" y1=\"50\" x2=\"95\" y2=\"50\" stroke=\"currentColor\" stroke-width=\"1.2\" opacity=\"0.3\"/>\
-                    <circle cx=\"50\" cy=\"50\" r=\"4\" fill=\"var(--acid)\"/>\
-                    <line class=\"radar-sweep\" x1=\"50\" y1=\"50\" x2=\"85\" y2=\"20\" stroke=\"var(--coral)\" stroke-width=\"2\" stroke-linecap=\"round\"/>\
-                </svg>\
-            </div>\
-            <div class=\"empty-content\">\
-                <strong>No open rooms.</strong>\
-                <span>Start the first skirmish and deploy a battlefield.</span>\
-            </div>\
-            <button id=\"empty-create-room\" class=\"primary empty-cta\" type=\"button\">Deploy First Room +</button>\
-        </li>".into();
+        let plus = icon_plus();
+        return format!(
+            "<li class=\"empty empty-state-box\">\
+                <div class=\"radar-container\" aria-hidden=\"true\">\
+                    <svg class=\"radar-svg\" viewBox=\"0 0 100 100\" width=\"80\" height=\"80\">\
+                        <circle cx=\"50\" cy=\"50\" r=\"45\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-dasharray=\"3 3\" opacity=\"0.35\"/>\
+                        <circle cx=\"50\" cy=\"50\" r=\"30\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" opacity=\"0.55\"/>\
+                        <circle cx=\"50\" cy=\"50\" r=\"15\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" opacity=\"0.75\"/>\
+                        <line x1=\"50\" y1=\"5\" x2=\"50\" y2=\"95\" stroke=\"currentColor\" stroke-width=\"1.2\" opacity=\"0.35\"/>\
+                        <line x1=\"5\" y1=\"50\" x2=\"95\" y2=\"50\" stroke=\"currentColor\" stroke-width=\"1.2\" opacity=\"0.35\"/>\
+                        <circle cx=\"50\" cy=\"50\" r=\"4\" fill=\"var(--acid)\"/>\
+                        <line class=\"radar-sweep\" x1=\"50\" y1=\"50\" x2=\"85\" y2=\"20\" stroke=\"var(--coral)\" stroke-width=\"2.5\" stroke-linecap=\"round\"/>\
+                        <circle class=\"radar-blip blip-1\" cx=\"68\" cy=\"35\" r=\"3\" fill=\"var(--acid)\"/>\
+                        <circle class=\"radar-blip blip-2\" cx=\"35\" cy=\"62\" r=\"2.5\" fill=\"var(--coral)\"/>\
+                    </svg>\
+                </div>\
+                <div class=\"empty-content\">\
+                    <strong>No Active Theaters Detected</strong>\
+                    <span>All sectors quiet. Deploy the first skirmish and mobilize your squad.</span>\
+                </div>\
+                <button id=\"empty-create-room\" class=\"primary empty-cta\" type=\"button\">{plus} Deploy First Room</button>\
+            </li>"
+        );
     }
     model
         .rooms
@@ -1812,12 +2007,12 @@ fn lobby_room_items_html(model: &Model) -> String {
             let is_full = room.players >= room.capacity;
             let is_practice = room.kind == RoomKind::Practice;
             let lock = if room.protected {
-                "<span class=\"room-lock\" title=\"Protected room\"><svg aria-hidden=\"true\" viewBox=\"0 0 24 24\" width=\"15\" height=\"15\"><path d=\"M7 10V7a5 5 0 0 1 10 0v3m-11 0h12v10H6z\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg><span class=\"sr-only\">Protected room</span><span class=\"badge-text\">Private</span></span>"
+                "<span class=\"room-lock\" title=\"Protected room\"><svg aria-hidden=\"true\" viewBox=\"0 0 24 24\" width=\"14\" height=\"14\"><path d=\"M7 10V7a5 5 0 0 1 10 0v3m-11 0h12v10H6z\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg><span class=\"badge-text\">Private</span><span class=\"sr-only\">Protected room</span></span>"
             } else {
                 ""
             };
             let practice = if is_practice {
-                "<span class=\"room-kind\">Practice</span>"
+                "<span class=\"room-kind room-kind-practice\">Practice</span>"
             } else {
                 "<span class=\"room-kind room-kind-standard\">Standard</span>"
             };
@@ -1828,9 +2023,9 @@ fn lobby_room_items_html(model: &Model) -> String {
             };
             let mode_badge = format!("<span class=\"room-mode-tag\">{mode_label}</span>");
             let status_badge = if is_full {
-                "<span class=\"room-status is-full\">● Full</span>"
+                "<span class=\"room-status is-full\"><span class=\"status-dot\" aria-hidden=\"true\"></span>Full</span>"
             } else {
-                "<span class=\"room-status is-open\">● Open</span>"
+                "<span class=\"room-status is-open\"><span class=\"status-dot\" aria-hidden=\"true\"></span>Open</span>"
             };
             let protected = if room.protected { "true" } else { "false" };
             let kind_attr = if is_practice { "practice" } else { "standard" };
@@ -1848,22 +2043,28 @@ fn lobby_room_items_html(model: &Model) -> String {
             let (join_text, disabled_attr) = if is_full {
                 ("Full", " disabled")
             } else {
-                ("Join <span aria-hidden=\"true\">→</span>", "")
+                ("Join <span class=\"btn-arrow\" aria-hidden=\"true\">→</span>", "")
             };
 
             format!(
                 "<li class=\"room-card\" data-room-kind=\"{kind_attr}\" data-room-full=\"{full_attr}\" data-room-name=\"{room_name_attr}\">\
                     <div class=\"room-card-content\">\
                         <div class=\"room-card-header\">\
-                            <span class=\"room-card-title\"><strong>{escaped_name}</strong>{lock}{practice}{mode_badge}</span>\
+                            <div class=\"room-card-title\">\
+                                <strong>{escaped_name}</strong>\
+                                <div class=\"room-badge-row\">{lock}{practice}{mode_badge}</div>\
+                            </div>\
                             <div class=\"room-status-wrapper\">{status_badge}</div>\
                         </div>\
                         <div class=\"room-card-body\">\
                             <div class=\"capacity-block\">\
+                                <div class=\"capacity-meta\">\
+                                    <span class=\"capacity-label\">Operators</span>\
+                                    <span class=\"capacity-fraction\">{players} / {capacity}</span>\
+                                </div>\
                                 <div class=\"capacity-bar-track\" aria-hidden=\"true\">\
                                     <div class=\"capacity-bar-fill\" style=\"width: {fill_percent}%;\"></div>\
                                 </div>\
-                                <span class=\"capacity-label\">{players} / {capacity} players</span>\
                             </div>\
                             <button class=\"join-room secondary\" data-room-id=\"{room_id_attr}\" data-room-protected=\"{protected}\" aria-label=\"{join_label_attr}\"{disabled_attr}>{join_text}</button>\
                         </div>\
@@ -1884,24 +2085,36 @@ const ROOM_CAPACITY: usize = 10;
 const TEAM_SLOTS: usize = ROOM_CAPACITY / 2;
 
 fn room_html(model: &Model) -> String {
-    let ready_label = if model.local_ready() {
+    let local_ready = model.local_ready();
+    let ready_label = if local_ready {
         "Not ready"
     } else {
         "I’m ready"
+    };
+    let ready_attr = if local_ready {
+        " data-ready=\"true\""
+    } else {
+        " data-ready=\"false\""
     };
     let owner_controls = model.local_owner();
     let owner_hidden = (!owner_controls).then_some(" hidden").unwrap_or("");
     let owner_disabled = (!owner_controls || model.players.len() >= ROOM_CAPACITY)
         .then_some(" disabled")
         .unwrap_or("");
-    let start_disabled = (!model.can_start() || !owner_controls)
+    let can_start = model.can_start();
+    let start_disabled = (!can_start || !owner_controls)
         .then_some(" disabled")
         .unwrap_or("");
+    let can_start_attr = if can_start {
+        " data-can-start=\"true\""
+    } else {
+        " data-can-start=\"false\""
+    };
     let practice = (model.room_kind == Some(RoomKind::Practice))
         .then(|| practice_editor_html(model))
         .unwrap_or_default();
     format!(
-        "<section class=\"room-shell reveal\" aria-labelledby=\"room-title\"><header class=\"room-header\"><div class=\"room-title-block\"><p class=\"eyebrow\">Staging area</p><div class=\"room-title-line\"><span>Room:</span><h1 id=\"room-title\">{}</h1></div></div><button id=\"leave-room\" class=\"text-button danger\" type=\"button\">Leave room</button></header><div class=\"room-grid\"><section class=\"paper-card roster room-main\" aria-labelledby=\"players-title\"><div class=\"roster-heading\"><h2 id=\"players-title\">Players <span>{}</span></h2><p>Switch sends a request; the server moves the card after confirmation.</p></div><div class=\"team-rosters\">{}</div><div class=\"roster-footer\"><p>Bots auto-balance to the smaller side.</p><button id=\"add-bot\" class=\"secondary roster-bot-button\" type=\"button\"{owner_hidden}{owner_disabled}>Add computer · auto-balance</button></div><p id=\"roster-move-status\" class=\"sr-only\" aria-live=\"polite\"></p></section><aside class=\"paper-card room-command\" aria-label=\"Room controls\"><section class=\"match-settings\" aria-labelledby=\"settings-title\"><h2 id=\"settings-title\">Match settings</h2><dl><div><dt>Mode</dt><dd>{}</dd></div><div><dt>Room type</dt><dd>{}</dd></div><div><dt>Start rule</dt><dd>All ready · both teams occupied</dd></div></dl>{}</section>{}<div class=\"room-actions\" aria-label=\"Room actions\"><button id=\"ready-button\" class=\"primary wide\" type=\"button\">{ready_label}</button><button id=\"start-game\" class=\"secondary wide\" type=\"button\"{owner_hidden}{start_disabled}>Start match</button></div></aside></div>{practice}</section>",
+        "<section class=\"room-shell reveal\" aria-labelledby=\"room-title\"><header class=\"room-header\"><div class=\"room-title-block\"><p class=\"eyebrow\"><span class=\"room-status-dot\"></span> Staging Area</p><div class=\"room-title-line\"><span>Room:</span><h1 id=\"room-title\">{}</h1></div></div><button id=\"leave-room\" class=\"text-button danger room-exit-btn\" type=\"button\">Leave room</button></header><div class=\"room-grid\"><section class=\"paper-card roster room-main\" aria-labelledby=\"players-title\"><div class=\"roster-heading\"><h2 id=\"players-title\">Players <span>{}</span></h2><p>Switch sends a request; the server moves the card after confirmation.</p></div><div class=\"team-rosters\">{}</div><div class=\"roster-footer\"><p>Bots auto-balance to the smaller side.</p><button id=\"add-bot\" class=\"secondary roster-bot-button\" type=\"button\"{owner_hidden}{owner_disabled}>Add computer · auto-balance</button></div><p id=\"roster-move-status\" class=\"sr-only\" aria-live=\"polite\"></p></section><aside class=\"paper-card room-command\" aria-label=\"Room controls\"><section class=\"match-settings\" aria-labelledby=\"settings-title\"><h2 id=\"settings-title\">Match settings</h2><dl><div><dt>Mode</dt><dd>{}</dd></div><div><dt>Room type</dt><dd>{}</dd></div><div><dt>Start rule</dt><dd>All ready · both teams occupied</dd></div></dl>{}</section>{}<div class=\"room-actions\" aria-label=\"Room actions\"><button id=\"ready-button\" class=\"primary wide\" type=\"button\"{ready_attr}>{ready_label}</button><button id=\"start-game\" class=\"secondary wide\" type=\"button\"{owner_hidden}{start_disabled}{can_start_attr}>Start match</button></div></aside></div>{practice}</section>",
         escape(&model.room_name),
         player_count_label(model),
         room_team_rosters_html(model),
@@ -2131,8 +2344,9 @@ fn room_player_item_html(model: &Model, player: &crate::state::PlayerSummary) ->
         .unwrap_or("");
     let remove = (owner_controls && !local)
         .then(|| {
+            let close = icon_close();
             format!(
-                "<button type=\"button\" class=\"remove-player\" data-player-id=\"{}\" data-is-bot=\"{}\" aria-label=\"Remove {} from room\">✕ Delete</button>",
+                "<button type=\"button\" class=\"remove-player\" data-player-id=\"{}\" data-is-bot=\"{}\" aria-label=\"Remove {} from room\">{close} Delete</button>",
                 attr(&player.id),
                 player.is_bot,
                 attr(&player.name),
@@ -2141,14 +2355,14 @@ fn room_player_item_html(model: &Model, player: &crate::state::PlayerSummary) ->
         .unwrap_or_default();
     let owner_badge = player
         .owner
-        .then_some("<span class=\"player-badge\">Host</span>")
+        .then_some("<span class=\"player-badge badge-host\">Host</span>")
         .unwrap_or("");
     let bot_badge = player
         .is_bot
-        .then_some("<span class=\"player-badge\">Bot</span>")
+        .then_some("<span class=\"player-badge badge-bot\">Bot</span>")
         .unwrap_or("");
     format!(
-        "<li class=\"player-slot\" data-player-id=\"{}\" data-player-team=\"{}\"{ready}><div class=\"player-identity\"><div class=\"player-name-line\"><strong>{}</strong>{owner_badge}{bot_badge}</div><span class=\"ready-state\">{ready_label}</span></div><div class=\"player-controls\">{move_control}<label class=\"soldier-count-control\"><span>⚔ Soldiers</span><select class=\"player-soldiers\" data-player-id=\"{}\"{}>{}</select></label>{remove}</div></li>",
+        "<li class=\"player-slot\" data-player-id=\"{}\" data-player-team=\"{}\"{ready}><div class=\"player-identity\"><div class=\"player-name-line\"><strong>{}</strong>{owner_badge}{bot_badge}</div><span class=\"ready-state\">{ready_label}</span></div><div class=\"player-controls\">{move_control}<label class=\"soldier-count-control\"><span>Soldiers</span><select class=\"player-soldiers\" data-player-id=\"{}\"{}>{}</select></label>{remove}</div></li>",
         attr(&player.id),
         player.team,
         escape(&player.name),
@@ -2173,9 +2387,9 @@ fn game_html(model: &Model) -> String {
     let angle_disabled = (!second_order).then_some(" disabled").unwrap_or(disabled);
     let timer = timer_view(model);
     let fire_label = fire_label(model, local_turn);
-    let finished_hidden = (model.room_phase != Some(Phase::Finished))
-        .then_some(" hidden")
-        .unwrap_or("");
+    let is_finished = model.room_phase == Some(Phase::Finished);
+    let fire_hidden = is_finished.then_some(" hidden").unwrap_or("");
+    let finished_hidden = (!is_finished).then_some(" hidden").unwrap_or("");
     let return_disabled = (!model.local_owner()).then_some(" disabled").unwrap_or("");
     let finished_hint = if model.local_owner() {
         "Return everyone to the staging area."
@@ -2183,12 +2397,12 @@ fn game_html(model: &Model) -> String {
         "Waiting for the room owner to return to the staging area."
     };
     format!(
-        "<section class=\"game-shell reveal\" aria-label=\"Active match\"><div class=\"war-room\"><section class=\"map-panel field-map\" aria-labelledby=\"battlefield-label\"><div class=\"map-heading\"><div><p class=\"eyebrow\">Coordinate field / 01</p><h2 id=\"battlefield-label\">Battlefield</h2></div><button id=\"leave-room\" class=\"text-button\">Retreat</button></div><div class=\"battlefield\"><canvas id=\"game-canvas\" width=\"770\" height=\"450\" aria-label=\"Graphwar battlefield\" aria-describedby=\"battlefield-summary\"></canvas>{}<div class=\"preview-key\"><i></i> Provisional</div><div class=\"axis-label x-label\">x</div><div class=\"axis-label y-label\">y</div></div><p id=\"shot-status\" class=\"shot-status\" role=\"status\" aria-live=\"polite\">{}</p><p id=\"battlefield-summary\" class=\"sr-only\">{}</p></section><aside class=\"command-stack\" aria-label=\"Command stack\"><section class=\"paper-card function-panel\" aria-labelledby=\"function-panel-title\"><h2 id=\"function-panel-title\">Function</h2><form id=\"fire-form\" class=\"fire-console\"><div class=\"equation-field\"><label for=\"function-input\">Function</label><div><span aria-hidden=\"true\">y =</span><input id=\"function-input\" spellcheck=\"false\" autocomplete=\"off\" maxlength=\"256\" required value=\"{}\" aria-describedby=\"function-hint function-error\"{disabled}></div><small id=\"function-hint\">Plain: sin, atan2, min, log. LaTeX paste supported, e.g. \\frac{{\\sin(x)}}{{\\sqrt{{2}}}}.</small><p id=\"function-error\" class=\"function-error\" aria-live=\"polite\"></p></div><div class=\"angle-field\"{angle_hidden}><div class=\"angle-label\"><label for=\"angle-input\">Launch angle</label><output id=\"angle-output\" for=\"angle-input\">{:.1}°</output></div><input id=\"angle-input\" type=\"range\" min=\"-90\" max=\"90\" value=\"{:.1}\" step=\"0.1\" aria-describedby=\"angle-hint angle-output\"{angle_disabled}><small id=\"angle-hint\">Focus the slider, then use Arrow Up/Down.</small></div><button class=\"fire-button\" type=\"submit\" style=\"--turn-progress: {}%;\" aria-describedby=\"turn-timer\"{disabled}><span class=\"fire-button-label\">{}</span><span id=\"turn-timer\" class=\"fire-button-timer\" role=\"timer\">{}</span><small>Enter ↵</small></button></form><div class=\"finished-actions\"{finished_hidden}><button id=\"return-to-lobby\" class=\"primary wide\" type=\"button\"{return_disabled}>Return to lobby</button><p>{}</p></div></section>{}</aside></div></section>",
+        "<section class=\"game-shell reveal\" aria-label=\"Active match\"><div class=\"war-room\"><section class=\"map-panel field-map\" aria-labelledby=\"battlefield-label\"><div class=\"map-heading\"><div><p class=\"eyebrow\">Coordinate field / 01</p><h2 id=\"battlefield-label\">Battlefield</h2></div><button id=\"leave-room\" class=\"text-button\">Retreat</button></div><div class=\"battlefield\"><canvas id=\"game-canvas\" width=\"770\" height=\"450\" aria-label=\"Graphwar battlefield\" aria-describedby=\"battlefield-summary\"></canvas>{}<div class=\"axis-label x-label\">x</div><div class=\"axis-label y-label\">y</div></div><p id=\"shot-status\" class=\"shot-status\" role=\"status\" aria-live=\"polite\">{}</p><p id=\"battlefield-summary\" class=\"sr-only\">{}</p></section><aside class=\"command-stack\" aria-label=\"Command stack\"><section class=\"paper-card function-panel\" aria-labelledby=\"function-panel-title\"><h2 id=\"function-panel-title\">Function</h2><form id=\"fire-form\" class=\"fire-console\"><div class=\"equation-field\"><label for=\"function-input\" class=\"sr-only\">Function</label><div class=\"equation-box\"><span class=\"equation-prefix\" aria-hidden=\"true\">y =</span><math-field id=\"function-input\" spellcheck=\"false\" autocomplete=\"off\" aria-describedby=\"function-hint function-error\"{disabled}>{}</math-field></div><small id=\"function-hint\">Desmos mode: Type / for fractions, ^ for powers, sqrt for roots, sin/cos/tan/ln/log.</small><p id=\"function-error\" class=\"function-error\" aria-live=\"polite\"></p></div><div class=\"angle-field\"{angle_hidden}><div class=\"angle-label\"><label for=\"angle-input\">Launch angle</label><output id=\"angle-output\" for=\"angle-input\">{:.1}°</output></div><input id=\"angle-input\" type=\"range\" min=\"-{MAX_SECOND_ORDER_ANGLE_DEG}\" max=\"{MAX_SECOND_ORDER_ANGLE_DEG}\" value=\"{:.1}\" step=\"0.1\" aria-describedby=\"angle-hint angle-output\"{angle_disabled}><small id=\"angle-hint\">Focus the slider, then use Arrow Up/Down.</small></div><button class=\"fire-button\" type=\"submit\" style=\"--turn-progress: {}%;\" aria-describedby=\"turn-timer\"{disabled}{fire_hidden}><span class=\"fire-button-label\">{}</span><span id=\"turn-timer\" class=\"fire-button-timer\" role=\"timer\">{}</span><small>Enter ↵</small></button></form><div class=\"finished-actions\"{finished_hidden}><button id=\"return-to-lobby\" class=\"primary wide return-to-lobby-btn\" type=\"button\"{return_disabled}><span class=\"fire-button-label\">Return to lobby ↗</span><small>Staging area</small></button><p>{}</p></div></section>{}</aside></div></section>",
         soldier_name_labels_html(model),
         escape(model.shot_status.as_deref().unwrap_or("")),
         escape(&battlefield_summary(model)),
         escape(if model.draft_function.is_empty() {
-            "sin(x)"
+            "\\sin(x)"
         } else {
             &model.draft_function
         }),
@@ -2474,6 +2688,14 @@ fn notice_items_html(model: &Model) -> String {
 
 fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
     let document = app.borrow().document.clone();
+    if let Some(button) = document.get_element_by_id("audio-toggle") {
+        let app = Rc::clone(app);
+        bind_click(&app.clone(), &button, move || toggle_audio(&app));
+    }
+    if let Some(button) = document.get_element_by_id("theme-toggle") {
+        let app = Rc::clone(app);
+        bind_click(&app.clone(), &button, move || toggle_theme(&app));
+    }
     if let Some(button) = document.get_element_by_id("reconnect-now") {
         let app = Rc::clone(app);
         bind_click(&app.clone(), &button, move || {
@@ -2545,6 +2767,18 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
             {
                 let _ = button.focus();
             }
+        })?;
+        let dialog_for_esc = dialog.clone();
+        bind_event(app, &dialog, "keydown", move |event| {
+            if let Some(kb) = event.dyn_ref::<web_sys::KeyboardEvent>()
+                && kb.key() == "Escape"
+            {
+                dialog_for_esc.close();
+            }
+        })?;
+        let dialog_for_cancel = dialog.clone();
+        bind_event(app, &dialog, "cancel", move |_| {
+            dialog_for_cancel.close();
         })?;
     }
     if let Some(button) = document.get_element_by_id("create-room-cancel")
@@ -2794,15 +3028,14 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
         let app = Rc::clone(app);
         let listener_app = Rc::clone(&app);
         let closure = Closure::<dyn FnMut(Event)>::new(move |_| {
-            let value = listener_input.value_as_number().clamp(-90.0, 90.0);
+            let value = listener_input
+                .value_as_number()
+                .clamp(-MAX_SECOND_ORDER_ANGLE_DEG, MAX_SECOND_ORDER_ANGLE_DEG);
             listener_app.borrow_mut().model.aim_angle_deg = value;
             if let Some(output) = angle_document.get_element_by_id("angle-output") {
                 output.set_text_content(Some(&format!("{value:.1}°")));
             }
-            if let Some(function) = angle_document
-                .get_element_by_id("function-input")
-                .and_then(|input| input.dyn_into::<HtmlInputElement>().ok())
-            {
+            if let Some(function) = angle_document.get_element_by_id("function-input") {
                 update_preview(&listener_app, &function);
             }
         });
@@ -2819,17 +3052,19 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
     if let Some(form) = document.get_element_by_id("fire-form") {
         let app = Rc::clone(app);
         bind_submit(&app.clone(), form.unchecked_into(), move |form| {
-            let Some(function) = input_value(&form, "function-input") else {
+            if !local_turn(&app.borrow().model) {
+                return;
+            }
+            let Some(input) = form.query_selector("#function-input").ok().flatten() else {
                 return;
             };
+            let function = element_value(&input);
             let angle_deg = input_value(&form, "angle-input")
                 .and_then(|value| value.parse::<f64>().ok())
-                .unwrap_or_default()
-                .clamp(-90.0, 90.0);
-            {
-                let mut app_ref = app.borrow_mut();
-                app_ref.model.draft_function.clone_from(&function);
-                app_ref.model.aim_angle_deg = angle_deg;
+                .unwrap_or_default();
+            app.borrow_mut().model.aim_angle_deg = angle_deg;
+            if !update_preview(&app, &input) {
+                return;
             }
             send(
                 &app,
@@ -2841,7 +3076,6 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
         });
     }
     if let Some(input) = document.get_element_by_id("function-input") {
-        let input = input.unchecked_into::<HtmlInputElement>();
         let preview_app = Rc::clone(app);
         let listener_input = input.clone();
         let closure = Closure::<dyn FnMut(Event)>::new(move |_| {
@@ -2849,8 +3083,44 @@ fn bind_events(app: &SharedApp) -> Result<(), JsValue> {
         });
         let target = input.clone().unchecked_into::<web_sys::EventTarget>();
         target.add_event_listener_with_callback("input", closure.as_ref().unchecked_ref())?;
-        retain_event_handler(&app, target, "input", closure);
-        if app.borrow().model.preview_path.is_empty() && !input.disabled() {
+        retain_event_handler(app, target.clone(), "input", closure);
+
+        let commit_input = input.clone();
+        let commit_closure = Closure::<dyn FnMut(Event)>::new(move |event: Event| {
+            if let Ok(event) = event.dyn_into::<InputEvent>()
+                && event.input_type() == "insertLineBreak"
+                && !event.is_composing()
+            {
+                event.prevent_default();
+                if let Some(form) = commit_input
+                    .closest("form")
+                    .ok()
+                    .flatten()
+                    .and_then(|form| form.dyn_into::<HtmlFormElement>().ok())
+                    && let Err(error) = form.request_submit()
+                {
+                    log_error(&format!("submit failed: {error:?}"));
+                }
+            }
+        });
+        target.add_event_listener_with_callback(
+            "beforeinput",
+            commit_closure.as_ref().unchecked_ref(),
+        )?;
+        retain_event_handler(app, target.clone(), "beforeinput", commit_closure);
+        let key_closure = Closure::<dyn FnMut(Event)>::new(move |event: Event| {
+            if let Ok(event) = event.dyn_into::<KeyboardEvent>()
+                && event.key() == "Enter"
+                && !event.shift_key()
+                && !event.is_composing()
+            {
+                event.prevent_default();
+            }
+        });
+        target.add_event_listener_with_callback("keydown", key_closure.as_ref().unchecked_ref())?;
+        retain_event_handler(app, target, "keydown", key_closure);
+
+        if app.borrow().model.preview_path.is_empty() && !is_element_disabled(&input) {
             update_preview(app, &input);
         }
     }
@@ -3492,8 +3762,8 @@ fn send_team_change(app: &SharedApp, player_id: Uuid, target_team: u8) {
     );
 }
 
-fn update_preview(app: &SharedApp, function: &HtmlInputElement) {
-    let function_text = function.value();
+fn update_preview(app: &SharedApp, function: &web_sys::Element) -> bool {
+    let function_text = element_value(function);
     let preview_model = {
         let mut app_ref = app.borrow_mut();
         app_ref.model.draft_function.clone_from(&function_text);
@@ -3507,77 +3777,146 @@ fn update_preview(app: &SharedApp, function: &HtmlInputElement) {
     };
 
     let error = preview.err();
-    function.set_custom_validity(error.as_deref().unwrap_or(""));
+    let _ = function.set_attribute(
+        "aria-invalid",
+        if error.is_some() { "true" } else { "false" },
+    );
     if let Some(message) = document.get_element_by_id("function-error") {
         message.set_text_content(error.as_deref());
     }
     if let Err(error) = render_canvas(app) {
         log_error(&format!("preview render failed: {error:?}"));
     }
+    error.is_none()
 }
 
-fn start_shot_animation(app: &SharedApp, sequence: u64) {
-    let reduced_motion = app
-        .borrow()
-        .window
+fn reset_animation(app: &mut App) {
+    app.animation_generation = app.animation_generation.wrapping_add(1);
+    app.animation_timestamp = None;
+    app.shot_animation = None;
+    app.vfx.clear();
+}
+
+fn reduced_motion(app: &App) -> bool {
+    app.window
         .match_media("(prefers-reduced-motion: reduce)")
         .ok()
         .flatten()
-        .is_some_and(|query| query.matches());
-    if reduced_motion {
-        let mut app_ref = app.borrow_mut();
-        app_ref.shot_animation = None;
+        .is_some_and(|query| query.matches())
+}
+
+fn start_shot_animation(app: &SharedApp, sequence: u64) {
+    let mut app_ref = app.borrow_mut();
+    reset_animation(&mut app_ref);
+    if reduced_motion(&app_ref) {
         apply_pending_game(&mut app_ref.model);
         drop(app_ref);
         refresh_game(app);
         return;
     }
-    let started_at = js_sys::Date::now();
-    app.borrow_mut().shot_animation = Some(ShotAnimation {
+    app_ref.sound.play_shot();
+    app_ref.shot_animation = Some(ShotAnimation {
         sequence,
-        started_at,
+        elapsed_ms: 0.0,
     });
-    schedule_shot_frame(app, sequence);
+    drop(app_ref);
+    schedule_shot_frame(app);
 }
 
-fn schedule_shot_frame(app: &SharedApp, sequence: u64) {
-    let frame_app = Rc::clone(app);
-    let callback = Closure::once_into_js(move |_: f64| {
-        let app_ref = frame_app.borrow();
-        let path_len = app_ref.model.authoritative_path.len();
-        let Some(animation) = app_ref.shot_animation.as_ref() else {
-            return;
-        };
-        if animation.sequence != sequence {
+fn schedule_shot_frame(app: &SharedApp) {
+    let generation = {
+        let mut app_ref = app.borrow_mut();
+        if app_ref.animation_frame_pending
+            || (app_ref.shot_animation.is_none() && !app_ref.vfx.has_active())
+        {
             return;
         }
-        let complete =
-            visible_points(path_len, js_sys::Date::now() - animation.started_at) == path_len;
+        app_ref.animation_frame_pending = true;
+        app_ref.animation_generation
+    };
+    let frame_app = Rc::clone(app);
+    let callback = Closure::once(move |timestamp: f64| {
+        let mut app_ref = frame_app.borrow_mut();
+        app_ref.animation_frame_pending = false;
+        if app_ref.animation_generation != generation {
+            drop(app_ref);
+            schedule_shot_frame(&frame_app);
+            return;
+        }
+        if app_ref.model.screen != Screen::Game || reduced_motion(&app_ref) {
+            reset_animation(&mut app_ref);
+            apply_pending_game(&mut app_ref.model);
+            let in_game = app_ref.model.screen == Screen::Game;
+            drop(app_ref);
+            if in_game {
+                refresh_game(&frame_app);
+            }
+            return;
+        }
+        let dt = frame_delta_ms(app_ref.animation_timestamp, timestamp);
+        app_ref.animation_timestamp = Some(timestamp);
+        app_ref.vfx.update(dt / 1_000.0);
+        let path_len = app_ref.model.authoritative_path.len();
+        let complete = app_ref.shot_animation.as_mut().is_some_and(|animation| {
+            animation.elapsed_ms += dt;
+            visible_points(path_len, animation.elapsed_ms) == path_len
+        });
+        if complete {
+            app_ref.shot_animation = None;
+            let last_point = app_ref.model.authoritative_path.last().copied();
+            let is_dark = is_dark_theme(&app_ref.document);
+            let has_hits = !app_ref.model.shot_hits.is_empty();
+            let game_finished = app_ref.model.winner_team.is_some()
+                || app_ref
+                    .model
+                    .pending_game
+                    .as_ref()
+                    .and_then(|game| game.winner_team)
+                    .is_some();
+            if let Some((x, y)) = last_point {
+                app_ref.vfx.spawn_explosion(x, y, is_dark);
+            }
+            if has_hits {
+                app_ref.sound.play_hit();
+            } else {
+                app_ref.sound.play_explosion();
+            }
+            if game_finished {
+                app_ref.sound.play_victory();
+            }
+            apply_pending_game(&mut app_ref.model);
+        }
+        let active = app_ref.shot_animation.is_some() || app_ref.vfx.has_active();
+        if !active {
+            app_ref.animation_timestamp = None;
+        }
         drop(app_ref);
         if complete {
-            let mut app_ref = frame_app.borrow_mut();
-            app_ref.shot_animation = None;
-            apply_pending_game(&mut app_ref.model);
-            drop(app_ref);
             refresh_game(&frame_app);
-        } else {
-            if let Err(error) = render_canvas(&frame_app) {
-                log_error(&format!("shot render failed: {error:?}"));
-            }
-            schedule_shot_frame(&frame_app, sequence);
+        } else if let Err(error) = render_canvas(&frame_app) {
+            log_error(&format!("shot render failed: {error:?}"));
+        }
+        if active {
+            schedule_shot_frame(&frame_app);
         }
     });
     let result = app
         .borrow()
         .window
-        .request_animation_frame(callback.unchecked_ref());
-    if let Err(error) = result {
-        log_error(&format!("animation frame failed: {error:?}"));
-        let mut app_ref = app.borrow_mut();
-        app_ref.shot_animation = None;
-        apply_pending_game(&mut app_ref.model);
-        drop(app_ref);
-        refresh_game(app);
+        .request_animation_frame(callback.as_ref().unchecked_ref());
+    match result {
+        Ok(_) => {
+            let _ = callback.into_js_value();
+        }
+        Err(error) => {
+            log_error(&format!("animation frame failed: {error:?}"));
+            let mut app_ref = app.borrow_mut();
+            app_ref.animation_frame_pending = false;
+            reset_animation(&mut app_ref);
+            apply_pending_game(&mut app_ref.model);
+            drop(app_ref);
+            refresh_game(app);
+        }
     }
 }
 
@@ -3704,7 +4043,7 @@ fn set_create_room_password_visibility(document: &Document, private: bool) {
 
 fn input_value(form: &HtmlFormElement, id: &str) -> Option<String> {
     let input = form.query_selector(&format!("#{id}")).ok()??;
-    let value = input.dyn_into::<HtmlInputElement>().ok()?.value();
+    let value = element_value(&input);
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_owned())
 }
@@ -3715,20 +4054,68 @@ fn password_value(form: &HtmlFormElement, id: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
-fn canvas_palette() -> CanvasPalette {
-    CanvasPalette {
-        background: "#f4ecd8",
-        grid: "rgba(16, 37, 31, .12)",
-        axis: "#10251f",
-        terrain: "#244a3b",
-        terrain_stroke: "#1c1f1b",
-        path: "#a33a2b",
-        preview: "#666756",
-        team_one: "#d8a52b",
-        team_two: "#a33a2b",
-        dead: "#6d7168",
-        soldier_stroke: "#10251f",
-        hit: "#a33a2b",
+fn toggle_theme(app: &SharedApp) {
+    let app_ref = app.borrow();
+    let document = app_ref.document.clone();
+    let window = app_ref.window.clone();
+    let Some(doc_el) = document.document_element() else {
+        return;
+    };
+
+    let is_dark = is_dark_theme(&document);
+    let next_theme = if is_dark { "light" } else { "dark" };
+    let _ = doc_el.set_attribute("data-theme", next_theme);
+
+    if let Ok(Some(storage)) = window.local_storage() {
+        let _ = storage.set_item("graphwar_theme", next_theme);
+    }
+
+    if let Some(toggle_btn) = document.get_element_by_id("theme-toggle") {
+        let (icon, label) = if next_theme == "dark" {
+            (icon_sun(), "Light")
+        } else {
+            (icon_moon(), "Dark")
+        };
+        toggle_btn.set_inner_html(&format!(
+            "<span class=\"theme-icon\">{icon}</span> <span class=\"theme-label\">{label}</span>"
+        ));
+    }
+    drop(app_ref);
+
+    let model_screen = {
+        let app_ref = app.borrow();
+        (app_ref.model.screen.clone(), app_ref.model.room_kind)
+    };
+    match model_screen {
+        (Screen::Game, _) => {
+            let _ = render_canvas(app);
+        }
+        (Screen::Room, Some(RoomKind::Practice)) => {
+            let _ = render_practice_canvas(app);
+        }
+        _ => {}
+    }
+}
+
+fn toggle_audio(app: &SharedApp) {
+    let (window, document, muted) = {
+        let mut app_ref = app.borrow_mut();
+        let window = app_ref.window.clone();
+        let document = app_ref.document.clone();
+        let muted = app_ref.sound.toggle_muted(&window);
+        (window, document, muted)
+    };
+    let _ = window;
+
+    if let Some(toggle_btn) = document.get_element_by_id("audio-toggle") {
+        let (icon, label) = if muted {
+            (icon_volume_muted(), "Muted")
+        } else {
+            (icon_volume_on(), "Sound")
+        };
+        toggle_btn.set_inner_html(&format!(
+            "<span class=\"theme-icon\">{icon}</span> <span class=\"theme-label\">{label}</span>"
+        ));
     }
 }
 
@@ -3756,7 +4143,7 @@ fn render_practice_canvas(app: &SharedApp) -> Result<(), JsValue> {
         0.0,
         0.0,
     )?;
-    let palette = canvas_palette();
+    let palette = canvas_palette(&app.document);
     context.set_image_smoothing_enabled(false);
     context.set_fill_style_str(palette.background);
     context.fill_rect(0.0, 0.0, LOGICAL_WIDTH, LOGICAL_HEIGHT);
@@ -3841,15 +4228,16 @@ fn render_canvas(app: &SharedApp) -> Result<(), JsValue> {
         .get_context("2d")?
         .ok_or("2d context unavailable")?
         .dyn_into::<CanvasRenderingContext2d>()?;
+    let (shake_x, shake_y) = app.vfx.get_shake_offset(js_sys::Date::now());
     context.set_transform(
         bitmap_width as f64 / LOGICAL_WIDTH,
         0.0,
         0.0,
         bitmap_height as f64 / LOGICAL_HEIGHT,
-        0.0,
-        0.0,
+        shake_x,
+        shake_y,
     )?;
-    let palette = canvas_palette();
+    let palette = canvas_palette(&app.document);
     context.set_image_smoothing_enabled(false);
     let soldier_sprite = app
         .soldier_sprite_loaded
@@ -3871,12 +4259,7 @@ fn render_canvas(app: &SharedApp) -> Result<(), JsValue> {
         .shot_animation
         .as_ref()
         .filter(|animation| animation.sequence == app.model.shot_sequence)
-        .map(|animation| {
-            visible_points(
-                app.model.authoritative_path.len(),
-                js_sys::Date::now() - animation.started_at,
-            )
-        })
+        .map(|animation| visible_points(app.model.authoritative_path.len(), animation.elapsed_ms))
         .unwrap_or(app.model.authoritative_path.len());
     draw_path(
         &context,
@@ -3905,6 +4288,7 @@ fn render_canvas(app: &SharedApp) -> Result<(), JsValue> {
     if authoritative_len == app.model.authoritative_path.len() {
         draw_shot_effects(&context, &app.model, palette);
     }
+    app.vfx.render(&context);
     Ok(())
 }
 
