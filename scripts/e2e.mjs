@@ -781,17 +781,23 @@ async function launchBrowser(url, {
   try {
     browser.dir = await mkdtemp(path.join(os.tmpdir(), "graphwar-e2e-"));
     const port = 9300 + crypto.randomInt(500);
+    let page;
+    let startupStderr = "";
     browser.child = start(chrome, [
       "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
       ...(BASE.protocol === "https:" && process.env.E2E_TLS_VERIFY === "false" ? ["--ignore-certificate-errors"] : []),
       `--remote-debugging-port=${port}`, `--user-data-dir=${browser.dir}`, "about:blank",
-    ], {stdio: "ignore"});
+    ], {stdio: ["ignore", "ignore", "pipe"]});
+    // Capture only about:blank startup; never log authenticated page diagnostics.
+    browser.child.stderr?.on("data", chunk => {
+      if (!page) startupStderr = (startupStderr + chunk.toString()).slice(-4096);
+    });
     let spawnError;
     browser.child.once("error", error => { spawnError = error; });
-    let page;
     for (let attempt = 0; attempt < 80; attempt++) {
       if (spawnError) throw spawnError;
-      ok(browser.child.exitCode === null && browser.child.signalCode === null, "Chrome exited before DevTools was ready");
+      ok(browser.child.exitCode === null && browser.child.signalCode === null,
+        `Chrome exited before DevTools was ready (code ${browser.child.exitCode}, signal ${browser.child.signalCode}): ${startupStderr.trim()}`);
       const targets = await fetchTargets(`http://127.0.0.1:${port}/json/list`, {signal: AbortSignal.timeout(1_000)})
         .then(response => response.json())
         .catch(() => null);
@@ -2376,7 +2382,7 @@ async function cleanupSelfCheck() {
     };
     return child;
   }
-  for (const stage of ["spawn", "spawn-error", "endpoint", "connect", "Page.enable", "Runtime.enable", "Network.enable", "Page.addScriptToEvaluateOnNewDocument", "Page.navigate", "wait"]) {
+  for (const stage of ["spawn", "spawn-error", "exit", "endpoint", "connect", "Page.enable", "Runtime.enable", "Network.enable", "Page.addScriptToEvaluateOnNewDocument", "Page.navigate", "wait"]) {
     const original = new Error(stage);
     const child = fakeChild();
     let cdpClosed = 0;
@@ -2389,29 +2395,40 @@ async function cleanupSelfCheck() {
     };
     const rm = async dir => {
       assert.equal(dir, "owned-profile");
-      ok(!child.pid || child.signalCode !== null, "profile removed before Chrome terminated");
+      ok(!child.pid || child.exitCode !== null || child.signalCode !== null, "profile removed before Chrome terminated");
       removed++;
     };
     const launch = () => launchBrowser(BASE, {
       findChrome: async () => "fake-chrome",
       mkdtemp: async () => "owned-profile",
-      start: () => {
+      start: (_chrome, args, options) => {
+        ok(!args.includes("--no-sandbox"), "browser sandbox disabled");
+        assert.deepEqual(options.stdio, ["ignore", "ignore", "pipe"]);
+        child.stderr = new EventEmitter();
         if (stage === "spawn") { child.pid = undefined; throw original; }
         if (stage === "spawn-error") {
           child.pid = undefined;
           queueMicrotask(() => child.emit("error", original));
         }
+        if (stage === "exit") queueMicrotask(() => {
+          child.stderr.emit("data", Buffer.from("x".repeat(5000) + "\nNo usable sandbox"));
+          child.exitCode = 1;
+          child.emit("exit", 1, null);
+        });
         return child;
       },
-      fetchTargets: async () => ({json: async () => [{type: "page", ...(stage === "endpoint" ? {} : {webSocketDebuggerUrl: "fake-cdp"})}]}),
+      fetchTargets: async () => ({json: async () => stage === "exit" ? [] : [{type: "page", ...(stage === "endpoint" ? {} : {webSocketDebuggerUrl: "fake-cdp"})}]}),
       createCdp: () => cdp,
       wait: async () => { if (stage === "wait") throw original; },
+      pause: async () => {},
       close: browser => closeBrowser(browser, {rm, shutdownMs: 5}),
     });
     await assert.rejects(launch, error => stage === "endpoint"
-      ? error.message.includes("DevTools endpoint unavailable") : error === original);
+      ? error.message.includes("DevTools endpoint unavailable")
+      : stage === "exit" ? error.message.includes("code 1, signal null") && error.message.endsWith("No usable sandbox") && error.message.length < 4300
+      : error === original);
     assert.equal(removed, 1, `${stage}: owned profile cleanup missing`);
-    assert.equal(cdpClosed, ["spawn", "spawn-error", "endpoint"].includes(stage) ? 0 : 1, `${stage}: CDP cleanup missing`);
+    assert.equal(cdpClosed, ["spawn", "spawn-error", "exit", "endpoint"].includes(stage) ? 0 : 1, `${stage}: CDP cleanup missing`);
     assert.equal(child.listenerCount("exit"), 0, `${stage}: shutdown listener leaked`);
   }
   for (const force of [false, true]) {

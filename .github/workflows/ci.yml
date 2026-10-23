@@ -89,7 +89,7 @@ jobs:
           if-no-files-found: error
 
   browser:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     needs: image
     steps:
@@ -107,12 +107,12 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
-      - uses: browser-actions/setup-chrome@c785b87e244131f27c9f19c1a33e2ead956ab7ce # v1
-        id: chrome
+      - name: Verify runner Chrome
+        run: /usr/bin/google-chrome --version
       - run: node scripts/e2e.mjs --self-check
       - name: Test the release image, restart and restore
         env:
-          CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
+          CHROME_BIN: /usr/bin/google-chrome
           E2E_TIMEOUT_MS: '30000'
         run: node scripts/e2e.mjs --local-image graphwar:ci
 
